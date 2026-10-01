@@ -263,6 +263,11 @@ type archiveData struct {
 	// rule versions existed; such archives run the built-in rules.
 	Versions       []RuleVersion `json:"versions,omitempty"`
 	EnabledVersion string        `json:"enabledVersion,omitempty"`
+	// Suppressions and Alerts are absent in archives written before the
+	// offline alerting feature existed; such archives simply have no
+	// processing history yet.
+	Suppressions []Suppression `json:"suppressions,omitempty"`
+	Alerts       []AlertRecord `json:"alerts,omitempty"`
 }
 
 func readArchive(dir string) (archiveData, error) {
