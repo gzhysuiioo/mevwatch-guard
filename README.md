@@ -74,6 +74,29 @@ go run ./cmd/mevwatch suppressions list <归档目录>
 
 一次生成的全部新记录在同一次原子提交中要么全部保存、要么全部不保存；对同一归档的并发生成通过文件锁串行化，不会重复告警或丢失记录，归档被其他写操作占用时返回忙碌错误。空名称、未知类型、越界门槛、无效高度及损坏归档都会明确报错且不改变已有数据。没有告警数据的旧归档可直接使用本功能；`replay`、`report`、`rules`、`compare` 入口行为保持不变。
 
+## 人工复核与规则误报分析
+
+人工复核在归档结论之上追加判定，不重新检测、不自动撤销或补发告警。复核对象由「链、区块哈希、受害交易哈希、结论类型」共同确定，不随告警通道改变；同高度不同区块分别处理。
+
+```bash
+go run ./cmd/mevwatch review submit <归档目录> <规格文件>   # '-' 从标准输入读
+go run ./cmd/mevwatch review history <归档目录> <chainId> <blockHash> <txHash> <kind>
+go run ./cmd/mevwatch review evaluate <归档目录> <chainId> <起始高度> <终止高度> <版本标识>
+```
+
+提交规格示例：`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","commitId":"c1","operator":"alice","reason":"真实受害者","expectedVersion":0,"status":"real-risk"}`。字段含义：
+
+- `chainId`/`blockHash`/`txHash`/`kind` 确定复核对象，结论必须已在归档中存在；`kind` 仅支持 `sandwich` 与 `displacement`。
+- `commitId` 为归档内唯一的提交标识，非空；`operator`/`reason` 非空。
+- `status` 为 `real-risk`（真实风险）、`false-positive`（误报）或 `unreviewed`（未复核/撤回）。
+- `expectedVersion` 为预期复核版本号，非负整数；首次提交必须为 0。
+
+提交采用乐观并发：新提交标识仅在预期版本等于对象当前版本时成功，成功后对象版本加 1；改判和撤回都新增修订，旧记录保留。相同提交标识与字段值重试返回原修订（即使后来已改判也不追加）；相同标识内容不同或预期版本过期时报冲突。并发提交通过文件锁串行化，不会覆盖他人修改。任何失败不改变已有数据；写入为原子提交，重启后历史与重试结果一致。
+
+`review history` 返回对象当前状态、版本及按版本升序排列的全部修订，每版保留提交内容，并附原结论、检测版本参数与原始交换证据。没有复核数据的对象状态为 `unreviewed`、版本为 `0`、修订为 `[]`；不存在的结论或修订用 `null` 表示。
+
+`review evaluate` 用指定已登记规则版本对包含两端高度范围内的各区块重新判定，整次评估采用一致的归档与最新复核状态。只对标为 `real-risk` 或 `false-positive` 的原结论统计：真实风险分为「保留」（候选仍命中）与「漏掉」（候选未命中），误报分为「仍命中」与「已消除」。同一交易且类型相同才算匹配，严重度变化不影响；类型改变时原类型算未命中，新类型按未复核结论列出。候选版本命中但没有有效复核的结论单列「待复核」，不计入四项；撤回后的对象按未复核处理。输出四项数量、待复核数量及对应明细，明细带区块身份、采用的复核修订、原结论与候选结论、各自规则参数及交换证据，按高度、区块哈希、交易哈希、类型升序排列。范围内没有区块时各项为 0、明细为 `[]`。评估不修改报告、启用版本或告警记录；旧归档可直接使用本功能。
+
 ## 技术方向
 
 mev, mev-detection, sandwich-attack, anomaly-detection, transaction-monitoring, risk-engine, onchain-analytics

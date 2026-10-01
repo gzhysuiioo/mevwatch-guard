@@ -268,6 +268,9 @@ type archiveData struct {
 	// conditions and no processing history.
 	Suppressions []Suppression      `json:"suppressions,omitempty"`
 	AlertRecords []ProcessingRecord `json:"alerts,omitempty"`
+	// Reviews is absent in archives written before human review existed;
+	// such archives simply have no review data.
+	Reviews []ReviewState `json:"reviews,omitempty"`
 }
 
 func readArchive(dir string) (archiveData, error) {
@@ -280,6 +283,9 @@ func readArchive(dir string) (archiveData, error) {
 	}
 	var data archiveData
 	if err := json.Unmarshal(raw, &data); err != nil {
+		return archiveData{}, fmt.Errorf("archive is corrupted: %w", err)
+	}
+	if err := validateReviewStates(data.Reviews); err != nil {
 		return archiveData{}, fmt.Errorf("archive is corrupted: %w", err)
 	}
 	return data, nil
