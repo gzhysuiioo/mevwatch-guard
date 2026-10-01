@@ -268,6 +268,9 @@ type archiveData struct {
 	// conditions and no processing history.
 	Suppressions []Suppression      `json:"suppressions,omitempty"`
 	AlertRecords []ProcessingRecord `json:"alerts,omitempty"`
+	// Reviews is absent in archives written before manual reviews existed;
+	// every conclusion then behaves as unreviewed.
+	Reviews []ReviewObject `json:"reviews,omitempty"`
 }
 
 func readArchive(dir string) (archiveData, error) {

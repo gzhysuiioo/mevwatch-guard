@@ -41,6 +41,8 @@ func main() {
 		runAlerts(os.Args[2:])
 	case "suppressions":
 		runSuppressions(os.Args[2:])
+	case "reviews":
+		runReviews(os.Args[2:])
 	case "compare":
 		if len(os.Args) != 6 {
 			fmt.Fprintln(os.Stderr, "usage: mevwatch compare <archive-dir> <chainId> <blockHash> <version-id>")
@@ -80,6 +82,11 @@ func usage() {
 	fmt.Println("  suppressions list <archive-dir>          list registered suppression conditions")
 	fmt.Println("  suppressions register <archive-dir> <spec-file>")
 	fmt.Println("                                           register a suppression condition ('-' reads stdin)")
+	fmt.Println("  reviews submit <archive-dir> <spec-file> submit a manual review ('-' reads stdin)")
+	fmt.Println("  reviews history <archive-dir> <chainId> <blockHash> <txHash> <kind>")
+	fmt.Println("                                           query a conclusion's current review and revisions")
+	fmt.Println("  reviews evaluate <archive-dir> <chainId> <startHeight> <endHeight> <version-id>")
+	fmt.Println("                                           false-positive analysis over a height range")
 }
 
 func runReplay(args []string) {
@@ -302,6 +309,78 @@ func runSuppressions(args []string) {
 		}{Created: created, Suppression: cond})
 	default:
 		fmt.Fprintf(os.Stderr, "unknown suppressions subcommand %q\n", args[0])
+		usage()
+		os.Exit(2)
+	}
+}
+
+func runReviews(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: mevwatch reviews <submit|history|evaluate> ...")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "submit":
+		if len(args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch reviews submit <archive-dir> <spec-file>")
+			os.Exit(2)
+		}
+		var raw []byte
+		var err error
+		if args[2] == "-" {
+			raw, err = io.ReadAll(os.Stdin)
+		} else {
+			raw, err = os.ReadFile(args[2])
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reviews submit: %v\n", err)
+			os.Exit(1)
+		}
+		sub, err := mevwatch.ParseReviewSubmission(raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reviews submit: %v\n", err)
+			os.Exit(1)
+		}
+		result, err := mevwatch.SubmitReview(args[1], sub)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reviews submit: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(result)
+	case "history":
+		if len(args) != 6 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch reviews history <archive-dir> <chainId> <blockHash> <txHash> <kind>")
+			os.Exit(2)
+		}
+		history, err := mevwatch.ReviewHistoryQuery(args[1], args[2], args[3], args[4], args[5])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reviews history: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(history)
+	case "evaluate":
+		if len(args) != 6 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch reviews evaluate <archive-dir> <chainId> <startHeight> <endHeight> <version-id>")
+			os.Exit(2)
+		}
+		start, err := mevwatch.ParseHeight(args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reviews evaluate: %v\n", err)
+			os.Exit(2)
+		}
+		end, err := mevwatch.ParseHeight(args[4])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reviews evaluate: %v\n", err)
+			os.Exit(2)
+		}
+		evaluation, err := mevwatch.EvaluateReviews(args[1], args[2], start, end, args[5])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reviews evaluate: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(evaluation)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown reviews subcommand %q\n", args[0])
 		usage()
 		os.Exit(2)
 	}

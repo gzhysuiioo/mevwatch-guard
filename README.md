@@ -74,6 +74,41 @@ go run ./cmd/mevwatch suppressions list <归档目录>
 
 一次生成的全部新记录在同一次原子提交中要么全部保存、要么全部不保存；对同一归档的并发生成通过文件锁串行化，不会重复告警或丢失记录，归档被其他写操作占用时返回忙碌错误。空名称、未知类型、越界门槛、无效高度及损坏归档都会明确报错且不改变已有数据。没有告警数据的旧归档可直接使用本功能；`replay`、`report`、`rules`、`compare` 入口行为保持不变。
 
+## 人工复核与规则误报分析
+
+人工复核与误报分析只消费已归档结论与归档内交换证据，**不需要原始输入文件，也不联网**；提交复核、查询历史与区间评估都不修改报告、启用版本或告警记录，复核也不会自动撤销或补发告警。
+
+复核对象由「链、区块哈希、受害交易哈希、结论类型」共同确定，与告警通道无关；同高度不同区块哈希分别处理。状态分三档：`real`（真实风险）、`false_positive`（误报）、`unreviewed`（未复核，用于撤回既有判断）。
+
+```bash
+go run ./cmd/mevwatch reviews submit <归档目录> <规格文件>     # '-' 从标准输入读
+go run ./cmd/mevwatch reviews history <归档目录> <chainId> <blockHash> <txHash> <kind>
+go run ./cmd/mevwatch reviews evaluate <归档目录> <chainId> <起始高度> <终止高度> <版本标识>
+```
+
+提交规格示例：`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"confirmed bot war","status":"real","expectedVersion":0}`。
+
+- 提交必须带归档内唯一的 `submissionId`、`operator`、`reason`、`status` 与非负整数 `expectedVersion`；`kind` 仅支持 `sandwich` 与 `displacement`，空标识、空白操作者/原因、非法状态、版本号或不存在的原结论一律拒绝。
+- 首次提交预期版本为 0，成功后对象版本加 1；改判与撤回（`unreviewed`）都**新增修订**，旧修订完整保留。
+- 相同 `submissionId` 与字段值重试返回**原修订**（`created:false`），即使对象后来已改判也不追加；相同标识内容不同报冲突（`submission id already used with different content`），预期版本落后报版本冲突（`review version conflict`）。并发提交由文件锁串行化，过期的并发提交只能拿到冲突，不会覆盖他人修订；写入失败不留下半条修订。
+- `reviews history` 返回当前状态、版本及按版本升序排列的全部修订（每版保留提交内容，含预期版本），并附原结论、检测版本完整参数与原始交换证据；没有归档结论时原结论为 `null`。
+
+### 区间评估与五项统计
+
+`reviews evaluate` 在一条共享读锁内对指定链上包含两端的高度区间，按指定**已登记规则版本**重新判定，整次评估采用一致的归档快照与最新复核状态；只对标为真实风险或误报的原结论统计：
+
+| 复核状态 | 候选版本同交易同类型仍命中 | 候选版本不再命中（含类型改变） |
+| --- | --- | --- |
+| 真实风险 `real` | **保留 retained** | **漏掉 missed** |
+| 误报 `false_positive` | **仍命中 stillHit** | **已消除 eliminated** |
+
+- 同一交易且类型相同才算保留/仍命中，严重度变化不影响匹配；候选严重度、双方规则参数与交换证据都在明细中。
+- 类型改变时：原类型按「漏掉/已消除」处理，新类型作为**待复核 pending**（无有效复核的候选命中）单列；候选命中但没有有效复核的结论同样计入 pending，**不计入**上述四项。撤回后的对象按未复核处理。
+- 输出 `retained`/`missed`/`stillHit`/`eliminated`/`pending` 五项数量及统一的 `details` 明细；每条明细带区块身份、采用的复核修订（无有效复核时为 `null`）、原结论与候选结论（缺失一侧为 `null`）、各自规则参数及交换证据，按高度、区块哈希、交易哈希、类型升序排列。不存在的结论或修订用 `null` 表示。
+- 范围内没有区块时五项均为 0、`details` 为 `[]`；倒置或非法高度范围、未知规则版本、损坏归档明确报错。未知版本即使在空归档上也报错。
+
+没有复核数据的对象状态为 `unreviewed`、版本为 0、历史为 `[]`；没有复核字段的旧归档可直接使用本功能，`replay`、`report`、`rules`、`compare`、`alerts`、`suppressions` 入口行为保持不变。
+
 ## 技术方向
 
 mev, mev-detection, sandwich-attack, anomaly-detection, transaction-monitoring, risk-engine, onchain-analytics
