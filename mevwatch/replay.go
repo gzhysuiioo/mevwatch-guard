@@ -32,13 +32,15 @@ type ReportFinding struct {
 	Evidence []Swap `json:"evidence"`
 }
 
-// Report is the archived per-block risk report.
+// Report is the archived per-block risk report. Version carries the full
+// parameters used to produce it, so the report is self-contained.
 type Report struct {
 	ChainID     string          `json:"chainId"`
 	BlockHash   string          `json:"blockHash"`
 	BlockNumber int64           `json:"blockNumber"`
 	SwapCount   int             `json:"swapCount"`
 	Findings    []ReportFinding `json:"findings"`
+	Version     RuleVersion     `json:"version"`
 }
 
 // LineError pins a replay failure to a 1-based input line.
@@ -152,17 +154,32 @@ func sameContent(blockNumber int64, swaps []Swap, b Block) bool {
 	return blockNumber == b.BlockNumber && swapsEqual(swaps, b.Swaps)
 }
 
-// gasDominates reports whether front strictly exceeds twice victim,
-// staying correct when victim is zero or math.MaxInt64.
-func gasDominates(front, victim int64) bool {
-	return victim <= math.MaxInt64/2 && front > victim*2
+// gasDominates reports whether front strictly exceeds victim times the
+// multiplier, staying correct when victim is zero or math.MaxInt64.
+func gasDominates(front, victim int64, multiplier int) bool {
+	if victim <= 0 {
+		return front > 0
+	}
+	if int64(multiplier) > math.MaxInt64/victim {
+		return false
+	}
+	return front > victim*int64(multiplier)
 }
 
 // DetectBlock checks every swap against its adjacent neighbours within its
-// pool: a sandwich when the same trader brackets the victim with higher gas
-// on both sides, otherwise a displacement when the previous swap's gas
-// strictly doubles the victim's. The last swap of a pool is checked too.
+// pool using the built-in rules: a sandwich when the same trader brackets
+// the victim with higher gas on both sides, otherwise a displacement when
+// the previous swap's gas strictly doubles the victim's. It is kept for
+// backward compatibility; DetectBlockWithVersion is the version-aware form.
 func DetectBlock(swaps []Swap) []ReportFinding {
+	return DetectBlockWithVersion(swaps, BuiltinVersion)
+}
+
+// DetectBlockWithVersion is DetectBlock parameterized by a rule version.
+// When the sandwich rule is enabled and its condition holds it takes
+// priority; otherwise the victim can still be judged for displacement when
+// that rule is enabled. With both rules disabled the result is empty.
+func DetectBlockWithVersion(swaps []Swap, v RuleVersion) []ReportFinding {
 	pools := make(map[string][]Swap)
 	for _, s := range swaps {
 		pools[s.Pool] = append(pools[s.Pool], s)
@@ -179,16 +196,17 @@ func DetectBlock(swaps []Swap) []ReportFinding {
 				back = &pool[i+1]
 			}
 			switch {
-			case front != nil && back != nil &&
+			case v.Sandwich.Enabled && front != nil && back != nil &&
 				front.Trader == back.Trader && front.Trader != victim.Trader &&
 				front.GasPrice > victim.GasPrice && back.GasPrice > victim.GasPrice:
 				findings = append(findings, ReportFinding{
-					Kind: "sandwich", Severity: 3, TxHash: victim.TxHash,
+					Kind: "sandwich", Severity: v.Sandwich.Severity, TxHash: victim.TxHash,
 					Evidence: []Swap{*front, victim, *back},
 				})
-			case front != nil && gasDominates(front.GasPrice, victim.GasPrice):
+			case v.Displacement.Enabled && front != nil &&
+				gasDominates(front.GasPrice, victim.GasPrice, v.Displacement.Multiplier):
 				findings = append(findings, ReportFinding{
-					Kind: "displacement", Severity: 2, TxHash: victim.TxHash,
+					Kind: "displacement", Severity: v.Displacement.Severity, TxHash: victim.TxHash,
 					Evidence: []Swap{*front, victim},
 				})
 			}
@@ -204,16 +222,29 @@ func DetectBlock(swaps []Swap) []ReportFinding {
 }
 
 // record is the archived form of a block: the report plus the canonical
-// swaps, so a later import can detect content conflicts.
+// swaps, so a later import can detect content conflicts. VersionID and
+// Version snapshot the rules used to produce the findings; records written
+// before versioning have neither and are interpreted as the built-in.
 type record struct {
 	ChainID     string          `json:"chainId"`
 	BlockHash   string          `json:"blockHash"`
 	BlockNumber int64           `json:"blockNumber"`
 	Swaps       []Swap          `json:"swaps"`
 	Findings    []ReportFinding `json:"findings"`
+	VersionID   string          `json:"versionId,omitempty"`
+	Version     *RuleVersion    `json:"version,omitempty"`
 }
 
 func (r record) id() blockID { return blockID{r.ChainID, r.BlockHash} }
+
+// versionSnapshot returns the rules archived with the record, falling back
+// to the built-in version for old-format records.
+func (r record) versionSnapshot() RuleVersion {
+	if r.Version != nil {
+		return *r.Version
+	}
+	return BuiltinVersion
+}
 
 func (r record) report() Report {
 	return Report{
@@ -222,6 +253,7 @@ func (r record) report() Report {
 		BlockNumber: r.BlockNumber,
 		SwapCount:   len(r.Swaps),
 		Findings:    r.Findings,
+		Version:     r.versionSnapshot(),
 	}
 }
 
@@ -231,7 +263,9 @@ const (
 )
 
 type archiveData struct {
-	Records []record `json:"records"`
+	Records        []record      `json:"records"`
+	Versions       []RuleVersion `json:"versions,omitempty"`
+	EnabledVersion string        `json:"enabledVersion,omitempty"`
 }
 
 func readArchive(dir string) (archiveData, error) {
@@ -336,20 +370,33 @@ func parseBlocks(r io.Reader) ([]parsedBlock, error) {
 
 // ReplayFile imports the line-delimited blocks in inputPath into the
 // archive at dir and returns one report per distinct block, in order of
-// first appearance.
+// first appearance. It uses the archive's currently enabled version.
 func ReplayFile(inputPath, dir string) ([]Report, error) {
+	return ReplayFileWithVersion(inputPath, dir, "")
+}
+
+// ReplayFileWithVersion is ReplayFile with an explicit rule version.
+func ReplayFileWithVersion(inputPath, dir, versionID string) ([]Report, error) {
 	f, err := os.Open(inputPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return Replay(f, dir)
+	return ReplayWithVersion(f, dir, versionID)
 }
 
-// Replay parses, validates and archives blocks from r. Every line is
-// checked before anything is written; any failure leaves the archive
-// untouched. New reports are committed together in a single atomic write.
+// Replay parses, validates and archives blocks from r using the archive's
+// currently enabled version. Every line is checked before anything is
+// written; any failure leaves the archive untouched. New reports are
+// committed together in a single atomic write.
 func Replay(input io.Reader, dir string) ([]Report, error) {
+	return ReplayWithVersion(input, dir, "")
+}
+
+// ReplayWithVersion is Replay with an explicit rule version. All new blocks
+// in this replay use the same version; re-imports return the originally
+// archived report.
+func ReplayWithVersion(input io.Reader, dir, versionID string) ([]Report, error) {
 	parsed, err := parseBlocks(input)
 	if err != nil {
 		return nil, err
@@ -389,6 +436,10 @@ func Replay(input io.Reader, dir string) ([]Report, error) {
 	if err != nil {
 		return nil, err
 	}
+	version, err := resolveVersion(data, versionID)
+	if err != nil {
+		return nil, err
+	}
 	archived := make(map[blockID]int, len(data.Records))
 	for i, rec := range data.Records {
 		archived[rec.id()] = i
@@ -413,7 +464,9 @@ func Replay(input io.Reader, dir string) ([]Report, error) {
 			BlockHash:   occ.block.BlockHash,
 			BlockNumber: occ.block.BlockNumber,
 			Swaps:       occ.block.Swaps,
-			Findings:    DetectBlock(occ.block.Swaps),
+			Findings:    DetectBlockWithVersion(occ.block.Swaps, version),
+			VersionID:   version.ID,
+			Version:     &version,
 		}
 		archived[id] = len(data.Records)
 		data.Records = append(data.Records, rec)
@@ -437,7 +490,7 @@ func Query(dir, chainID, blockHash string) (Report, error) {
 		}
 		return Report{}, err
 	}
-	lock, err := lockArchive(dir, syscall.LOCK_SH)
+	lock, err := lockArchive(dir, syscall.LOCK_SH|syscall.LOCK_NB)
 	if err != nil {
 		return Report{}, err
 	}
