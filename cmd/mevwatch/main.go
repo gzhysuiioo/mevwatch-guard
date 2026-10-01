@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/gzhysuiioo/mevwatch-guard/mevwatch"
@@ -36,6 +37,10 @@ func main() {
 		writeJSON(report)
 	case "rules":
 		runRules(os.Args[2:])
+	case "alerts":
+		runAlerts(os.Args[2:])
+	case "suppressions":
+		runSuppressions(os.Args[2:])
 	case "compare":
 		if len(os.Args) != 6 {
 			fmt.Fprintln(os.Stderr, "usage: mevwatch compare <archive-dir> <chainId> <blockHash> <version-id>")
@@ -68,6 +73,13 @@ func usage() {
 	fmt.Println("  rules enable <archive-dir> <version-id>  enable a registered version for later replays")
 	fmt.Println("  compare <archive-dir> <chainId> <hash> <version-id>")
 	fmt.Println("                                           re-judge an archived block under a version and diff")
+	fmt.Println("  alerts generate <archive-dir> <chainId> <startHeight> <endHeight> <minSeverity> <channel>")
+	fmt.Println("                                           generate offline alerts from archived conclusions")
+	fmt.Println("  alerts history <archive-dir> <chainId> <channel> <startHeight> <endHeight>")
+	fmt.Println("                                           query stored alert/suppression records")
+	fmt.Println("  suppressions list <archive-dir>          list registered suppression conditions")
+	fmt.Println("  suppressions register <archive-dir> <spec-file>")
+	fmt.Println("                                           register a suppression condition ('-' reads stdin)")
 }
 
 func runReplay(args []string) {
@@ -181,6 +193,118 @@ func writeJSON(v any) {
 		os.Exit(1)
 	}
 	fmt.Println(string(raw))
+}
+
+func runAlerts(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: mevwatch alerts <generate|history> ...")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "generate":
+		if len(args) != 7 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch alerts generate <archive-dir> <chainId> <startHeight> <endHeight> <minSeverity> <channel>")
+			os.Exit(2)
+		}
+		dir, chainID := args[1], args[2]
+		start, err := mevwatch.ParseHeight(args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "alerts generate: %v\n", err)
+			os.Exit(2)
+		}
+		end, err := mevwatch.ParseHeight(args[4])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "alerts generate: %v\n", err)
+			os.Exit(2)
+		}
+		severity, err := strconv.Atoi(args[5])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "alerts generate: invalid minSeverity %q: %v\n", args[5], err)
+			os.Exit(2)
+		}
+		channel := args[6]
+		records, err := mevwatch.GenerateAlerts(dir, chainID, channel, start, end, severity)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "alerts generate: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(records)
+	case "history":
+		if len(args) != 6 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch alerts history <archive-dir> <chainId> <channel> <startHeight> <endHeight>")
+			os.Exit(2)
+		}
+		dir, chainID, channel := args[1], args[2], args[3]
+		start, err := mevwatch.ParseHeight(args[4])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "alerts history: %v\n", err)
+			os.Exit(2)
+		}
+		end, err := mevwatch.ParseHeight(args[5])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "alerts history: %v\n", err)
+			os.Exit(2)
+		}
+		records, err := mevwatch.AlertHistory(dir, chainID, channel, start, end)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "alerts history: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(records)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown alerts subcommand %q\n", args[0])
+		usage()
+		os.Exit(2)
+	}
+}
+
+func runSuppressions(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: mevwatch suppressions <list|register> ...")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "list":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch suppressions list <archive-dir>")
+			os.Exit(2)
+		}
+		conds, err := mevwatch.ListSuppressions(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "suppressions list: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(conds)
+	case "register":
+		if len(args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch suppressions register <archive-dir> <spec-file>")
+			os.Exit(2)
+		}
+		var raw []byte
+		var err error
+		if args[2] == "-" {
+			raw, err = io.ReadAll(os.Stdin)
+		} else {
+			raw, err = os.ReadFile(args[2])
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "suppressions register: %v\n", err)
+			os.Exit(1)
+		}
+		cond, created, err := mevwatch.RegisterSuppression(args[1], raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "suppressions register: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(struct {
+			Created     bool                 `json:"created"`
+			Suppression mevwatch.Suppression `json:"suppression"`
+		}{Created: created, Suppression: cond})
+	default:
+		fmt.Fprintf(os.Stderr, "unknown suppressions subcommand %q\n", args[0])
+		usage()
+		os.Exit(2)
+	}
 }
 
 func runDemo() {
