@@ -2,7 +2,10 @@
 // 领导者发来的 AppendEntries 请求。本文件只做纯逻辑处理，不连接网络。
 package mevwatch
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // LogEntry 是一条日志：Index 从 1 开始连续编号，Term 为该条目写入时的任期，
 // Command 为字符串命令。
@@ -46,6 +49,36 @@ type AppendResult struct {
 	Term int `json:"term"`
 	// CommittedIndex 是处理后节点的已提交索引。
 	CommittedIndex int `json:"committedIndex"`
+	// AppliedIndex / ApplyError 仅在启用键值应用（ReplicateOptions.ApplyKV）
+	// 时填充：处理本请求后已应用的最高日志索引与首个应用错误。
+	// 复制是否被接受与命令应用是否失败相互独立表达。
+	AppliedIndex *int        `json:"appliedIndex,omitempty"`
+	ApplyError   *ApplyError `json:"applyError,omitempty"`
+	// applyFields 为 true 时 JSON 输出总是带上 appliedIndex 与 applyError
+	// （无错误时 applyError 为 null）；为 false 时两个字段完全不出现。
+	applyFields bool
+}
+
+// MarshalJSON 在未启用键值应用时保持原有输出形状；启用时强制输出
+// appliedIndex 与 applyError（错误为空输出 null）。
+func (r AppendResult) MarshalJSON() ([]byte, error) {
+	type alias AppendResult
+	if !r.applyFields {
+		return json.Marshal(alias(r))
+	}
+	applied := 0
+	if r.AppliedIndex != nil {
+		applied = *r.AppliedIndex
+	}
+	return json.Marshal(struct {
+		alias
+		AppliedIndex int         `json:"appliedIndex"`
+		ApplyError   *ApplyError `json:"applyError"`
+	}{
+		alias:        alias(r),
+		AppliedIndex: applied,
+		ApplyError:   r.ApplyError,
+	})
 }
 
 // ReplicateOutput 是整次调用的结果。
@@ -57,6 +90,42 @@ type ReplicateOutput struct {
 	FinalCommittedIndex int `json:"finalCommittedIndex"`
 	// FinalLog 是处理完所有请求后的完整日志。
 	FinalLog []LogEntry `json:"finalLog"`
+	// FinalAppliedIndex / FinalKV / FinalApplyError 仅在启用键值应用时填充：
+	// 最终已应用的最高日志索引、最终键值表与首个应用错误。没有请求时同样
+	// 反映初始已提交前缀的应用结果。
+	FinalAppliedIndex *int              `json:"finalAppliedIndex,omitempty"`
+	FinalKV           map[string]string `json:"finalKV,omitempty"`
+	FinalApplyError   *ApplyError       `json:"finalApplyError,omitempty"`
+	// applyFields 含义同 AppendResult.applyFields。
+	applyFields bool
+}
+
+// MarshalJSON 在未启用键值应用时保持原有输出形状；启用时强制输出
+// finalAppliedIndex、finalKV（空表为 {}）与 finalApplyError（无错误为 null）。
+func (o ReplicateOutput) MarshalJSON() ([]byte, error) {
+	type alias ReplicateOutput
+	if !o.applyFields {
+		return json.Marshal(alias(o))
+	}
+	applied := 0
+	if o.FinalAppliedIndex != nil {
+		applied = *o.FinalAppliedIndex
+	}
+	kv := o.FinalKV
+	if kv == nil {
+		kv = map[string]string{}
+	}
+	return json.Marshal(struct {
+		alias
+		FinalAppliedIndex int               `json:"finalAppliedIndex"`
+		FinalKV           map[string]string `json:"finalKV"`
+		FinalApplyError   *ApplyError       `json:"finalApplyError"`
+	}{
+		alias:             alias(o),
+		FinalAppliedIndex: applied,
+		FinalKV:           kv,
+		FinalApplyError:   o.FinalApplyError,
+	})
 }
 
 // 拒绝原因（稳定标识符，帮助文档中有说明）。
@@ -82,29 +151,68 @@ type replicateState struct {
 	log            []LogEntry // log[i].Index == i+1
 }
 
+// ReplicateOptions 控制 Replicate 的可选行为。零值保持原有处理与输出。
+type ReplicateOptions struct {
+	// ApplyKV 为 true 时把已提交命令解释为键值操作（set/delete），在本次
+	// 调用内从空键值表开始，随提交位置推进按日志次序逐条应用；为 false
+	// 时命令仍是不加解释的任意字符串。
+	ApplyKV bool
+}
+
 // Replicate 校验初始状态并顺序应用全部复制请求，返回逐次结果与最终状态。
 // 初始状态非法时返回错误（调用方应以非零退出码结束）。单条请求违反字段规则
 // 时只记录一次拒绝、不改变任何状态，随后继续处理下一条请求。
 func Replicate(initial InitialState, requests []AppendRequest) (ReplicateOutput, error) {
+	return ReplicateWithOptions(initial, requests, ReplicateOptions{})
+}
+
+// ReplicateWithOptions 与 Replicate 相同，但可通过 ReplicateOptions 启用
+// 可选行为（如键值应用）。
+func ReplicateWithOptions(initial InitialState, requests []AppendRequest, opts ReplicateOptions) (ReplicateOutput, error) {
 	state, err := newReplicateState(initial)
 	if err != nil {
 		return ReplicateOutput{}, err
 	}
 
+	var applier *kvApplier
+	if opts.ApplyKV {
+		applier = newKVApplier()
+		// 先按索引顺序应用初始日志中已提交的前缀，再顺序处理复制请求。
+		applier.applyUpTo(state.log, state.committedIndex)
+	}
+
 	results := make([]AppendResult, 0, len(requests))
 	for _, request := range requests {
-		results = append(results, state.apply(request))
+		result := state.apply(request)
+		if applier != nil {
+			// 每条请求处理结束后，只应用新提交且尚未应用的日志；应用失败
+			// 不改变复制的接受与否、提交位置或拒绝原因。
+			applier.applyUpTo(state.log, state.committedIndex)
+			applied := applier.appliedIndex
+			result.AppliedIndex = &applied
+			result.ApplyError = applier.err
+			result.applyFields = true
+		}
+		results = append(results, result)
 	}
 	finalLog := append([]LogEntry{}, state.log...)
 	if finalLog == nil {
 		finalLog = []LogEntry{}
 	}
-	return ReplicateOutput{
+	output := ReplicateOutput{
 		Results:             results,
 		FinalTerm:           state.currentTerm,
 		FinalCommittedIndex: state.committedIndex,
 		FinalLog:            finalLog,
-	}, nil
+	}
+	if applier != nil {
+		applied := applier.appliedIndex
+		output.FinalAppliedIndex = &applied
+		output.FinalKV = applier.kv
+		output.FinalApplyError = applier.err
+		output.applyFields = true
+	}
+	return output, nil
 }
 
 func newReplicateState(initial InitialState) (replicateState, error) {

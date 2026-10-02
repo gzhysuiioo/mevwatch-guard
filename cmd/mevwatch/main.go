@@ -68,6 +68,9 @@ Input fields:
   currentTerm     number  follower's current term (non-negative)
   committedIndex  number  highest committed log index (0..len(log))
   log             array   entries with consecutive indexes starting at 1
+  applyKV         boolean optional; when true, committed commands are applied
+                          to a key/value table (default false, commands stay
+                          uninterpreted strings)
   requests        array   replication requests applied in order
 
 Log entry fields:
@@ -101,6 +104,29 @@ Processing rules:
   - On success committedIndex advances to min(leaderCommit, last acknowledged
     index = prevLogIndex + len(entries)) but never moves backward.
 
+Key/value application (only when applyKV is true):
+  - The table starts empty for this invocation. The committed prefix of the
+    initial log is applied first in index order; after each request only newly
+    committed, not-yet-applied entries are applied, so unchanged commit
+    positions, empty-entry heartbeats and repeated requests never re-apply.
+  - Commands are case-sensitive with exactly one ordinary space after the
+    command name; neither end of the command is trimmed:
+      set <key>=<value>   write or overwrite a key; the first '=' after the
+                          key separates the value, which is kept verbatim and
+                          may be empty or contain spaces, CJK text and '='
+      delete <key>        delete a key; deleting a missing key still succeeds
+                          and the position counts as applied
+  - Keys must be non-empty and contain no whitespace or '='. Every other
+    command shape is a format error.
+  - Uncommitted entries are never applied: their format errors stay invisible
+    and a replaced uncommitted suffix leaves no trace in the table.
+  - On the first format error in a committed command, previously applied
+    results are kept, the applied index stops before the failing entry, and
+    no later entry is applied for the rest of the invocation. Replication
+    itself is unaffected: later requests still change log, term and commit
+    position, and apply failure never turns an accepted replication into a
+    rejection nor alters a rejection reason.
+
 Output fields:
   results              array of per-request results, in input order
     results[].accepted        boolean success/rejection
@@ -110,6 +136,15 @@ Output fields:
   finalTerm            final current term
   finalCommittedIndex  final committed index
   finalLog             complete log after all requests
+
+Extra output fields when applyKV is true:
+  results[].appliedIndex  highest applied log index after the request
+                          (0 = nothing applied)
+  results[].applyError    null, or {"index", "reason"} for the first
+                          malformed committed command
+  finalAppliedIndex       highest applied log index at the end
+  finalKV                 final key/value table ({} when empty)
+  finalApplyError         null, or {"index", "reason"}
 
 A request violating a field rule is recorded as one rejection without changing
 any state (including its higher term), and processing continues with the next

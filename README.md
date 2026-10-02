@@ -35,6 +35,12 @@ echo '{
 
 字段含义与全部处理规则见 `go run ./cmd/mevwatch help replicate`。
 
+可选的键值应用：输入增加 `"applyKV": true` 后，已提交命令会被解释为
+`set <key>=<value>` / `delete <key>` 键值操作，在本次调用内从空表开始随
+提交位置推进逐条应用；输出增加每条请求的 `appliedIndex`/`applyError` 与
+最终的 `finalAppliedIndex`/`finalKV`/`finalApplyError`。省略或为 `false`
+时输出与处理行为保持不变。
+
 ## 技术方向
 
 mev, mev-detection, sandwich-attack, anomaly-detection, transaction-monitoring, risk-engine, onchain-analytics

@@ -53,6 +53,102 @@ func TestCLIEmptyInput(t *testing.T) {
 	}
 }
 
+func TestCLIApplyKV(t *testing.T) {
+	input := `{
+	  "currentTerm": 1,
+	  "committedIndex": 1,
+	  "log": [{"index": 1, "term": 1, "command": "set x=1"}],
+	  "applyKV": true,
+	  "requests": [
+	    {"term": 1, "prevLogIndex": 1, "prevLogTerm": 1, "entries": [
+	      {"index": 2, "term": 1, "command": "set y=a b=c"},
+	      {"index": 3, "term": 1, "command": "delete x"}
+	    ], "leaderCommit": 3}
+	  ]
+	}`
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	body := stdout.String()
+	for _, fragment := range []string{
+		`"appliedIndex": 3`,
+		`"applyError": null`,
+		`"finalAppliedIndex": 3`,
+		`"finalApplyError": null`,
+		`"y": "a b=c"`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("output missing %s:\n%s", fragment, body)
+		}
+	}
+	if strings.Contains(body, `"x"`) {
+		t.Fatalf("deleted key must not appear in finalKV:\n%s", body)
+	}
+
+	// 相同输入必须得到相同输出。
+	var again bytes.Buffer
+	if code := runReplicateIO(strings.NewReader(input), &again, &stderr); code != 0 {
+		t.Fatalf("second run exit code = %d", code)
+	}
+	if again.String() != body {
+		t.Fatalf("non-deterministic output:\n%s\n%s", body, again.String())
+	}
+}
+
+func TestCLIApplyKVFormatError(t *testing.T) {
+	input := `{
+	  "currentTerm": 1,
+	  "committedIndex": 0,
+	  "log": [],
+	  "applyKV": true,
+	  "requests": [
+	    {"term": 1, "prevLogIndex": 0, "prevLogTerm": 0, "entries": [
+	      {"index": 1, "term": 1, "command": "set ok=1"},
+	      {"index": 2, "term": 1, "command": "set broken"}
+	    ], "leaderCommit": 2}
+	  ]
+	}`
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	body := stdout.String()
+	for _, fragment := range []string{
+		`"accepted": true`,
+		`"appliedIndex": 1`,
+		`"index": 2`,
+		`"finalAppliedIndex": 1`,
+		`"ok": "1"`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("output missing %s:\n%s", fragment, body)
+		}
+	}
+}
+
+func TestCLIApplyKVOmittedKeepsOutputShape(t *testing.T) {
+	input := `{
+	  "currentTerm": 1,
+	  "committedIndex": 1,
+	  "log": [{"index": 1, "term": 1, "command": "set x=1"}],
+	  "requests": []
+	}`
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	body := stdout.String()
+	for _, field := range []string{"appliedIndex", "applyError", "finalAppliedIndex", "finalKV", "finalApplyError"} {
+		if strings.Contains(body, field) {
+			t.Fatalf("applyKV omitted: output must not contain %q:\n%s", field, body)
+		}
+	}
+}
+
 func TestCLIErrors(t *testing.T) {
 	cases := []string{
 		`not json`,

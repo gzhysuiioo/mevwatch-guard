@@ -14,6 +14,7 @@ type replicateInput struct {
 	CurrentTerm    int                      `json:"currentTerm"`
 	CommittedIndex int                      `json:"committedIndex"`
 	Log            []mevwatch.LogEntry      `json:"log"`
+	ApplyKV        bool                     `json:"applyKV"`
 	Requests       []mevwatch.AppendRequest `json:"requests"`
 }
 
@@ -35,11 +36,11 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "replicate: parse input JSON: %v\n", err)
 		return 1
 	}
-	output, err := mevwatch.Replicate(mevwatch.InitialState{
+	output, err := mevwatch.ReplicateWithOptions(mevwatch.InitialState{
 		CurrentTerm:    input.CurrentTerm,
 		CommittedIndex: input.CommittedIndex,
 		Log:            input.Log,
-	}, input.Requests)
+	}, input.Requests, mevwatch.ReplicateOptions{ApplyKV: input.ApplyKV})
 	if err != nil {
 		fmt.Fprintf(stderr, "replicate: %v\n", err)
 		return 1
