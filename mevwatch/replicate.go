@@ -2,7 +2,12 @@
 // 领导者发来的 AppendEntries 请求。本文件只做纯逻辑处理，不连接网络。
 package mevwatch
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"unicode"
+)
 
 // LogEntry 是一条日志：Index 从 1 开始连续编号，Term 为该条目写入时的任期，
 // Command 为字符串命令。
@@ -20,6 +25,9 @@ type InitialState struct {
 	CommittedIndex int `json:"committedIndex"`
 	// Log 是从索引 1 开始的连续日志。
 	Log []LogEntry `json:"log"`
+	// ApplyKV 为 true 时把已提交命令解释为 set/delete 键值操作；
+	// 为 false（默认）时命令是任意字符串，输出也不包含键值相关字段。
+	ApplyKV bool `json:"applyKV"`
 }
 
 // AppendRequest 是顺序到达的一次日志复制请求。
@@ -46,6 +54,50 @@ type AppendResult struct {
 	Term int `json:"term"`
 	// CommittedIndex 是处理后节点的已提交索引。
 	CommittedIndex int `json:"committedIndex"`
+	// AppliedIndex 仅在启用 applyKV 时出现：处理后已应用键值命令的最高日志索引。
+	AppliedIndex int `json:"appliedIndex"`
+	// ApplyError 仅在启用 applyKV 时出现：null 或第一条已提交的格式错误。
+	ApplyError *ApplyError `json:"applyError"`
+
+	// kvEnabled 控制 JSON 是否包含键值字段，不对外暴露。
+	kvEnabled bool
+}
+
+// ApplyError 描述键值应用过程中遇到的第一条已提交格式错误。
+type ApplyError struct {
+	// Index 是出错日志条目的索引。
+	Index int `json:"index"`
+	// Reason 是具体的格式问题。
+	Reason string `json:"reason"`
+}
+
+// MarshalJSON 按是否启用 applyKV 输出不同字段集：未启用时与旧输出完全一致。
+func (r AppendResult) MarshalJSON() ([]byte, error) {
+	if !r.kvEnabled {
+		type plain struct {
+			Accepted       bool   `json:"accepted"`
+			Reason         string `json:"reason"`
+			Term           int    `json:"term"`
+			CommittedIndex int    `json:"committedIndex"`
+		}
+		return json.Marshal(plain{r.Accepted, r.Reason, r.Term, r.CommittedIndex})
+	}
+	type enabled struct {
+		Accepted       bool        `json:"accepted"`
+		Reason         string      `json:"reason"`
+		Term           int         `json:"term"`
+		CommittedIndex int         `json:"committedIndex"`
+		AppliedIndex   int         `json:"appliedIndex"`
+		ApplyError     *ApplyError `json:"applyError"`
+	}
+	return json.Marshal(enabled{
+		Accepted:       r.Accepted,
+		Reason:         r.Reason,
+		Term:           r.Term,
+		CommittedIndex: r.CommittedIndex,
+		AppliedIndex:   r.AppliedIndex,
+		ApplyError:     r.ApplyError,
+	})
 }
 
 // ReplicateOutput 是整次调用的结果。
@@ -57,6 +109,46 @@ type ReplicateOutput struct {
 	FinalCommittedIndex int `json:"finalCommittedIndex"`
 	// FinalLog 是处理完所有请求后的完整日志。
 	FinalLog []LogEntry `json:"finalLog"`
+	// FinalAppliedIndex 仅在启用 applyKV 时出现：最终已应用的最高日志索引。
+	FinalAppliedIndex int `json:"finalAppliedIndex"`
+	// FinalKV 仅在启用 applyKV 时出现：最终键值表，空表输出 {}。
+	FinalKV map[string]string `json:"finalKV"`
+	// FinalApplyError 仅在启用 applyKV 时出现：null 或第一条已提交的格式错误。
+	FinalApplyError *ApplyError `json:"finalApplyError"`
+
+	// kvEnabled 控制 JSON 是否包含键值字段，不对外暴露。
+	kvEnabled bool
+}
+
+// MarshalJSON 按是否启用 applyKV 输出不同字段集：未启用时与旧输出完全一致。
+func (o ReplicateOutput) MarshalJSON() ([]byte, error) {
+	if !o.kvEnabled {
+		type plain struct {
+			Results             []AppendResult `json:"results"`
+			FinalTerm           int            `json:"finalTerm"`
+			FinalCommittedIndex int            `json:"finalCommittedIndex"`
+			FinalLog            []LogEntry     `json:"finalLog"`
+		}
+		return json.Marshal(plain{o.Results, o.FinalTerm, o.FinalCommittedIndex, o.FinalLog})
+	}
+	type enabled struct {
+		Results             []AppendResult    `json:"results"`
+		FinalTerm           int               `json:"finalTerm"`
+		FinalCommittedIndex int               `json:"finalCommittedIndex"`
+		FinalLog            []LogEntry        `json:"finalLog"`
+		FinalAppliedIndex   int               `json:"finalAppliedIndex"`
+		FinalKV             map[string]string `json:"finalKV"`
+		FinalApplyError     *ApplyError       `json:"finalApplyError"`
+	}
+	return json.Marshal(enabled{
+		Results:             o.Results,
+		FinalTerm:           o.FinalTerm,
+		FinalCommittedIndex: o.FinalCommittedIndex,
+		FinalLog:            o.FinalLog,
+		FinalAppliedIndex:   o.FinalAppliedIndex,
+		FinalKV:             o.FinalKV,
+		FinalApplyError:     o.FinalApplyError,
+	})
 }
 
 // 拒绝原因（稳定标识符，帮助文档中有说明）。
@@ -85,26 +177,124 @@ type replicateState struct {
 // Replicate 校验初始状态并顺序应用全部复制请求，返回逐次结果与最终状态。
 // 初始状态非法时返回错误（调用方应以非零退出码结束）。单条请求违反字段规则
 // 时只记录一次拒绝、不改变任何状态，随后继续处理下一条请求。
+//
+// 当初始状态启用 ApplyKV 时，已提交的命令会被解释为 set/delete 键值操作：
+// 先应用初始日志中已提交的前缀，再在每条请求处理结束后应用新提交且尚未应用
+// 的条目。已提交命令出现格式错误时，应用停在出错条目之前且本次调用不再继续；
+// 未提交条目的格式错误不会提前报错。
 func Replicate(initial InitialState, requests []AppendRequest) (ReplicateOutput, error) {
 	state, err := newReplicateState(initial)
 	if err != nil {
 		return ReplicateOutput{}, err
 	}
 
-	results := make([]AppendResult, 0, len(requests))
+	output := ReplicateOutput{
+		Results:  make([]AppendResult, 0, len(requests)),
+		FinalLog: []LogEntry{},
+	}
+	if initial.ApplyKV {
+		output.kvEnabled = true
+		output.FinalKV = map[string]string{}
+		// 先按索引顺序应用初始日志中已提交的前缀。
+		output.FinalAppliedIndex, output.FinalApplyError =
+			applyCommitted(state.log, state.committedIndex, output.FinalKV, 0)
+	}
+
 	for _, request := range requests {
-		results = append(results, state.apply(request))
+		result := state.apply(request)
+		if initial.ApplyKV {
+			result.kvEnabled = true
+			// 每条请求处理结束后，只应用新提交且尚未应用的日志；
+			// 一旦出错，本次调用的应用状态保持停住。
+			if output.FinalApplyError == nil {
+				output.FinalAppliedIndex, output.FinalApplyError = applyCommitted(
+					state.log, state.committedIndex, output.FinalKV, output.FinalAppliedIndex)
+			}
+			result.AppliedIndex = output.FinalAppliedIndex
+			result.ApplyError = output.FinalApplyError
+		}
+		output.Results = append(output.Results, result)
 	}
-	finalLog := append([]LogEntry{}, state.log...)
-	if finalLog == nil {
-		finalLog = []LogEntry{}
+
+	output.FinalTerm = state.currentTerm
+	output.FinalCommittedIndex = state.committedIndex
+	output.FinalLog = append([]LogEntry{}, state.log...)
+	if output.FinalLog == nil {
+		output.FinalLog = []LogEntry{}
 	}
-	return ReplicateOutput{
-		Results:             results,
-		FinalTerm:           state.currentTerm,
-		FinalCommittedIndex: state.committedIndex,
-		FinalLog:            finalLog,
-	}, nil
+	return output, nil
+}
+
+// applyCommitted 顺序应用索引在 (appliedIndex, committedIndex] 内的已提交日志。
+// 出错时保留此前成功应用的结果，appliedIndex 停在出错条目之前，出错条目及其后
+// 所有条目都不执行。返回新的已应用最高索引与第一条格式错误（无错误时为 nil）。
+func applyCommitted(log []LogEntry, committedIndex int, kv map[string]string, appliedIndex int) (int, *ApplyError) {
+	for idx := appliedIndex + 1; idx <= committedIndex; idx++ {
+		if reason, ok := applyCommand(log[idx-1].Command, kv); !ok {
+			return idx - 1, &ApplyError{Index: idx, Reason: reason}
+		}
+		appliedIndex = idx
+	}
+	return appliedIndex, nil
+}
+
+// applyCommand 解析并执行一条键值命令。命令区分大小写，只接受两种形式：
+//
+//	set <key>=<value>   写入或覆盖一个键，值以原文保留（可为空、含空格或额外等号）
+//	delete <key>        删除一个键，删除不存在的键也算成功
+//
+// 命令名后必须恰好有一个普通空格；键不能为空，不能含空白或等号；命令两端的
+// 空白不会被自动去掉。返回的 ok 为 false 时，reason 描述具体的格式问题。
+func applyCommand(command string, kv map[string]string) (reason string, ok bool) {
+	switch {
+	case strings.HasPrefix(command, "set"):
+		if len(command) == 3 || command[3] != ' ' {
+			return `malformed command: "set" must be followed by exactly one space`, false
+		}
+		rest := command[4:]
+		end := keyEnd(rest)
+		if end == 0 {
+			return "malformed command: empty key", false
+		}
+		if end == len(rest) || rest[end] != '=' {
+			if end < len(rest) && rest[end] != '=' {
+				return "malformed command: key contains whitespace", false
+			}
+			return `malformed command: "set" requires "=" after key`, false
+		}
+		kv[rest[:end]] = rest[end+1:]
+		return "", true
+	case strings.HasPrefix(command, "delete"):
+		if len(command) == 6 || command[6] != ' ' {
+			return `malformed command: "delete" must be followed by exactly one space`, false
+		}
+		rest := command[7:]
+		end := keyEnd(rest)
+		if end == 0 {
+			return "malformed command: empty key", false
+		}
+		if end < len(rest) {
+			if rest[end] == '=' {
+				return `malformed command: key contains "="`, false
+			}
+			return "malformed command: key contains whitespace", false
+		}
+		delete(kv, rest)
+		return "", true
+	default:
+		return `malformed command: expected "set <key>=<value>" or "delete <key>"`, false
+	}
+}
+
+// keyEnd 返回键的结束位置（字节偏移）：第一个 '=' 或空白的位置，
+// 或整个字符串长度（二者皆无）。
+func keyEnd(s string) int {
+	for i, r := range s {
+		if r == '=' || unicode.IsSpace(r) {
+			return i
+		}
+	}
+	return len(s)
 }
 
 func newReplicateState(initial InitialState) (replicateState, error) {

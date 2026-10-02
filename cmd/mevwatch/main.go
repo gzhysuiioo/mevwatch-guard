@@ -69,6 +69,9 @@ Input fields:
   committedIndex  number  highest committed log index (0..len(log))
   log             array   entries with consecutive indexes starting at 1
   requests        array   replication requests applied in order
+  applyKV         bool    when true, interpret committed commands as key-value
+                  operations (default false: commands are opaque strings and
+                  no key-value fields appear in the output)
 
 Log entry fields:
   index   number  1-based consecutive index
@@ -101,15 +104,46 @@ Processing rules:
   - On success committedIndex advances to min(leaderCommit, last acknowledged
     index = prevLogIndex + len(entries)) but never moves backward.
 
+Key-value application (applyKV: true):
+  Commands are interpreted as case-sensitive key-value operations, starting
+  from an empty table for this invocation. Two commands exist:
+
+    set <key>=<value>  writes or overwrites a key; the value is kept verbatim,
+                       may be empty and may contain spaces and extra '='
+    delete <key>       removes a key; deleting a missing key still succeeds
+                       and marks the position as applied
+
+  The command name must be followed by exactly one plain space. The key must
+  be non-empty and contain neither whitespace nor '='; "set" splits the value
+  at the first '=' after the key. No whitespace is trimmed from either end of
+  the command, so any leading or trailing whitespace is a format error. Any
+  other command is malformed.
+
+  The already-committed prefix of the initial log is applied first, in index
+  order; after each request only newly committed, not-yet-applied entries are
+  applied. A malformed committed entry stops application at the entry before
+  it: later entries are not executed and application stays halted for the rest
+  of the call, while replication itself continues and keeps its own results.
+  Malformed entries that are not yet committed do not error early. When an
+  uncommitted suffix is replaced, discarded commands never affect the table.
+  Repeated operations on one key take effect in log order.
+
 Output fields:
   results              array of per-request results, in input order
     results[].accepted        boolean success/rejection
     results[].reason          "ok" or a specific rejection reason
     results[].term            current term after handling the request
     results[].committedIndex  committed index after handling the request
+    results[].appliedIndex    only with applyKV: highest applied index after
+                              the request (0-based)
+    results[].applyError      only with applyKV: null or {index, reason} for
+                              the first malformed committed command
   finalTerm            final current term
   finalCommittedIndex  final committed index
   finalLog             complete log after all requests
+  finalAppliedIndex    only with applyKV: highest applied index overall
+  finalKV              only with applyKV: final key-value table ({} when empty)
+  finalApplyError      only with applyKV: null or {index, reason}
 
 A request violating a field rule is recorded as one rejection without changing
 any state (including its higher term), and processing continues with the next

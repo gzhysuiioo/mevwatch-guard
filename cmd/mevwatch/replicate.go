@@ -15,6 +15,7 @@ type replicateInput struct {
 	CommittedIndex int                      `json:"committedIndex"`
 	Log            []mevwatch.LogEntry      `json:"log"`
 	Requests       []mevwatch.AppendRequest `json:"requests"`
+	ApplyKV        bool                     `json:"applyKV"`
 }
 
 // runReplicate 从标准输入读取一份 JSON（初始状态 + 顺序到达的复制请求），
@@ -39,6 +40,7 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 		CurrentTerm:    input.CurrentTerm,
 		CommittedIndex: input.CommittedIndex,
 		Log:            input.Log,
+		ApplyKV:        input.ApplyKV,
 	}, input.Requests)
 	if err != nil {
 		fmt.Fprintf(stderr, "replicate: %v\n", err)
