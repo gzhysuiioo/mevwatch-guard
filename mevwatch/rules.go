@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
+	"strings"
 	"syscall"
 )
 
@@ -103,18 +105,130 @@ func parseSeverity(name string, v *int) (int, error) {
 	return *v, nil
 }
 
+// validateVersionSpec enforces the registration document grammar: the
+// input is exactly one JSON object (whitespace allowed around it), with no
+// trailing content of any kind and no duplicate keys in any object. Keys
+// are compared by their decoded, case-folded name, so escapes
+// ("sand\\u0077ich") and case variants ("Enabled" vs "enabled") cannot
+// shadow each other. A duplicate rule object therefore cannot merge with
+// its earlier sibling to piece together a complete declaration.
+func validateVersionSpec(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err == io.EOF {
+		return errors.New("invalid version spec: empty input")
+	}
+	if err != nil {
+		return fmt.Errorf("invalid version spec: %w", err)
+	}
+	d, ok := tok.(json.Delim)
+	if !ok || d != '{' {
+		return errors.New("invalid version spec: top-level value must be a JSON object")
+	}
+	if err := validateSpecObject(dec, ""); err != nil {
+		return err
+	}
+	// Exactly one object: anything left over is trailing content, even a
+	// lone extra closing brace.
+	if _, err := dec.Token(); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("invalid version spec: unexpected trailing data: %w", err)
+		}
+		return errors.New("invalid version spec: unexpected trailing data")
+	}
+	return nil
+}
+
+// validateSpecObject reads one object body (the opening '{' has already
+// been consumed) and rejects duplicate keys. path locates the object in
+// error messages ("" for the top-level object).
+func validateSpecObject(dec *json.Decoder, path string) error {
+	seen := make(map[string]bool)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("invalid version spec: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("invalid version spec: expected field name in %s", specObjectLabel(path))
+		}
+		folded := strings.ToLower(key)
+		if seen[folded] {
+			return fmt.Errorf("invalid version spec: duplicate field %q in %s", key, specObjectLabel(path))
+		}
+		seen[folded] = true
+		if err := validateSpecValue(dec, joinSpecPath(path, key)); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return fmt.Errorf("invalid version spec: %w", err)
+	}
+	return nil
+}
+
+// validateSpecValue consumes one value. Nested objects are checked for
+// duplicate keys; arrays are skipped (the version grammar has none, and
+// the struct decode rejects them) so the trailing check stays aligned.
+func validateSpecValue(dec *json.Decoder, path string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("invalid version spec: %w", err)
+	}
+	switch t := tok.(type) {
+	case json.Delim:
+		switch t {
+		case '{':
+			return validateSpecObject(dec, path)
+		case '[':
+			return skipSpecArray(dec)
+		default:
+			return fmt.Errorf("invalid version spec: unexpected %q in %s", t, specObjectLabel(path))
+		}
+	default:
+		return nil
+	}
+}
+
+func skipSpecArray(dec *json.Decoder) error {
+	for dec.More() {
+		if err := validateSpecValue(dec, ""); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return fmt.Errorf("invalid version spec: %w", err)
+	}
+	return nil
+}
+
+func specObjectLabel(path string) string {
+	if path == "" {
+		return "top-level object"
+	}
+	return path
+}
+
+func joinSpecPath(parent, key string) string {
+	if parent == "" {
+		return key
+	}
+	return parent + "." + key
+}
+
 // ParseRuleVersion validates a registration document. Missing fields,
-// wrong types, out-of-range values and unknown rules or fields all fail
-// with a reason.
+// wrong types, out-of-range values, unknown rules or fields, duplicate
+// fields and trailing content all fail with a reason.
 func ParseRuleVersion(raw []byte) (RuleVersion, error) {
+	if err := validateVersionSpec(raw); err != nil {
+		return RuleVersion{}, err
+	}
 	var spec versionSpec
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&spec); err != nil {
 		return RuleVersion{}, fmt.Errorf("invalid version spec: %w", err)
-	}
-	if dec.More() {
-		return RuleVersion{}, errors.New("invalid version spec: unexpected trailing data")
 	}
 	if spec.ID == nil || *spec.ID == "" {
 		return RuleVersion{}, errors.New("id must be a non-empty string")

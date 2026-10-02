@@ -66,6 +66,144 @@ func TestParseRuleVersionValidation(t *testing.T) {
 	}
 }
 
+func TestParseRuleVersionRejectsTrailingContent(t *testing.T) {
+	valid := strictSpec
+	cases := []struct {
+		name string
+		spec string
+	}{
+		{"empty input", ""},
+		{"whitespace only", "   \n\t "},
+		{"null", `null`},
+		{"array", `[{"id":"strict"}]`},
+		{"number", `42`},
+		{"string", `"strict"`},
+		{"second object", valid + valid},
+		{"extra closing brace", valid + "}"},
+		{"extra closing bracket", valid + "]"},
+		{"trailing null", valid + " null"},
+		{"trailing number", valid + " 42"},
+		{"trailing garbage", valid + " extra"},
+		{"leading garbage", "x" + valid},
+		{"two top-level values", valid + `{"id":"other"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseRuleVersion([]byte(tc.spec)); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+	// Whitespace around the single object is legal.
+	if _, err := ParseRuleVersion([]byte("   \n\t " + valid + "  \n")); err != nil {
+		t.Fatalf("whitespace around the object must be allowed: %v", err)
+	}
+}
+
+func TestParseRuleVersionRejectsDuplicateFields(t *testing.T) {
+	cases := []struct {
+		name       string
+		spec       string
+		wantObject string
+		wantField  string
+	}{
+		{"duplicate id", `{"id":"v","id":"w","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`, "top-level object", "id"},
+		{"duplicate id case-folded", `{"id":"v","Id":"w","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`, "top-level object", "Id"},
+		{"duplicate rules", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}},"rules":{}}`, "top-level object", "rules"},
+		{"duplicate sandwich", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"sandwich":{"enabled":false},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`, "rules", "sandwich"},
+		{"duplicate sandwich case-folded", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"Sandwich":{"enabled":false},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`, "rules", "Sandwich"},
+		{"duplicate displacement", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2},"displacement":{"enabled":false}}}`, "rules", "displacement"},
+		{"duplicate enabled in sandwich", `{"id":"v","rules":{"sandwich":{"enabled":true,"enabled":false,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`, "rules.sandwich", "enabled"},
+		{"duplicate severity in sandwich", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`, "rules.sandwich", "severity"},
+		{"duplicate enabled in displacement", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"enabled":false,"severity":2,"multiplier":2}}}`, "rules.displacement", "enabled"},
+		{"duplicate severity in displacement", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"severity":2,"multiplier":2}}}`, "rules.displacement", "severity"},
+		{"duplicate multiplier", `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2,"multiplier":3}}}`, "rules.displacement", "multiplier"},
+		{"escaped duplicate key", "{\"id\":\"v\",\"rules\":{\"sandwich\":{\"enabled\":true,\"severity\":3},\"s\\u0061ndwich\":{\"enabled\":true,\"severity\":3},\"displacement\":{\"enabled\":true,\"severity\":2,\"multiplier\":2}}}", "rules", "sandwich"},
+		{"escaped duplicate severity", "{\"id\":\"v\",\"rules\":{\"sandwich\":{\"enabled\":true,\"severity\":3,\"s\\u0065verity\":4},\"displacement\":{\"enabled\":true,\"severity\":2,\"multiplier\":2}}}", "rules.sandwich", "severity"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseRuleVersion([]byte(tc.spec))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "duplicate field") {
+				t.Fatalf("error %q must distinguish duplicate fields from trailing content", msg)
+			}
+			if !strings.Contains(msg, tc.wantObject) {
+				t.Fatalf("error %q must name the object %q", msg, tc.wantObject)
+			}
+			if !strings.Contains(msg, tc.wantField) {
+				t.Fatalf("error %q must name the field %q", msg, tc.wantField)
+			}
+		})
+	}
+	// A duplicate rule object must not merge with its sibling to piece
+	// together a complete declaration: the second "sandwich" provides
+	// nothing, yet the merged document would be complete.
+	dup := `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"sandwich":{},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`
+	if _, err := ParseRuleVersion([]byte(dup)); err == nil {
+		t.Fatal("duplicate rule object must be rejected even when the merge would be complete")
+	}
+	// Escaped keys that decode to the same field are still that field once.
+	escaped := "{\"id\":\"v\",\"rules\":{\"s\\u0061ndwich\":{\"enabled\":true,\"severity\":3},\"displacement\":{\"enabled\":true,\"severity\":2,\"multiplier\":2}}}"
+	if _, err := ParseRuleVersion([]byte(escaped)); err != nil {
+		t.Fatalf("escaped key must be accepted: %v", err)
+	}
+}
+
+func TestParseRuleVersionCaseCompatibility(t *testing.T) {
+	// Case variants of known fields keep working: Go's decoder matches
+	// them case-insensitively, and string values are stored verbatim.
+	spec := `{"Id":" v ","rules":{"sandwich":{"Enabled":true,"Severity":3},"displacement":{"Enabled":true,"Severity":2,"Multiplier":2}}}`
+	v, err := ParseRuleVersion([]byte(spec))
+	if err != nil {
+		t.Fatalf("case variants must remain accepted: %v", err)
+	}
+	if v.ID != " v " {
+		t.Fatalf("id must be stored verbatim, got %q", v.ID)
+	}
+	if !v.Rules.Sandwich.Enabled || v.Rules.Sandwich.Severity != 3 ||
+		!v.Rules.Displacement.Enabled || v.Rules.Displacement.Severity != 2 || v.Rules.Displacement.Multiplier != 2 {
+		t.Fatalf("case-folded fields decoded wrong: %+v", v)
+	}
+}
+
+func TestRegisterRejectedSpecLeavesArchiveUntouched(t *testing.T) {
+	dir := t.TempDir()
+	// Register a legitimate version first, then attempt registrations that
+	// must all be refused without touching the archive.
+	register(t, dir, strictSpec)
+	dup := `{"id":"strict","rules":{"sandwich":{"enabled":true,"severity":5},"sandwich":{"enabled":true,"severity":5},"displacement":{"enabled":true,"severity":4,"multiplier":5}}}`
+	for _, spec := range []string{
+		dup,
+		strictSpec + "}",
+		`{"id":"strict","rules":{"sandwich":{"enabled":true,"severity":5},"displacement":{"enabled":true,"severity":4,"multiplier":2}}}{"id":"strict"}`,
+		``,
+		`null`,
+	} {
+		if _, _, err := RegisterVersion(dir, []byte(spec)); err == nil {
+			t.Fatalf("spec %q must be rejected", spec)
+		}
+	}
+	versions, enabled, err := ListVersions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 2 || versions[0].ID != BuiltinVersionID || versions[1].ID != "strict" {
+		t.Fatalf("versions after rejected registrations: %+v", versions)
+	}
+	if enabled != BuiltinVersionID {
+		t.Fatalf("enabled version changed after rejected registration: %q", enabled)
+	}
+	// The stored version is byte-for-byte the original.
+	got, err := GetVersion(dir, "strict")
+	if err != nil || got.ID != "strict" || got.Rules.Sandwich.Severity != 5 || got.Rules.Displacement.Multiplier != 5 {
+		t.Fatalf("staged version damaged: %+v, %v", got, err)
+	}
+}
+
 func TestRegisterVersionLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	v, created := register(t, dir, strictSpec)
