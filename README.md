@@ -9,8 +9,31 @@
 ```bash
 go run ./cmd/mevwatch demo
 go run ./cmd/mevwatch version
+go run ./cmd/mevwatch help replicate
 go test ./...
 ```
+
+## replicate 子命令
+
+在单次进程内模拟一个 Raft 跟随者：标准输入接收一份 JSON（当前任期、已提交
+索引、日志，以及顺序到达的复制请求），标准输出返回一份 JSON（每条请求的
+接收结果、处理后的任期与已提交索引，以及最终完整日志）。状态只在本次调用内
+保留，仅使用标准库，不连接网络。
+
+```bash
+echo '{
+  "currentTerm": 1,
+  "committedIndex": 0,
+  "log": [],
+  "requests": [
+    {"term": 1, "prevLogIndex": 0, "prevLogTerm": 0,
+     "entries": [{"index": 1, "term": 1, "command": "set x=1"}],
+     "leaderCommit": 0}
+  ]
+}' | go run ./cmd/mevwatch replicate
+```
+
+字段含义与全部处理规则见 `go run ./cmd/mevwatch help replicate`。
 
 ## 技术方向
 
