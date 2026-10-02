@@ -66,6 +66,253 @@ func TestParseRuleVersionValidation(t *testing.T) {
 	}
 }
 
+const validVersionSpec = `{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`
+
+func TestParseRuleVersionRejectsNonObjects(t *testing.T) {
+	nonObjects := []struct {
+		name string
+		spec string
+	}{
+		{"empty", ``},
+		{"whitespace only", " \n\t\r"},
+		{"null", `null`},
+		{"array", `[{"id":"v"}]`},
+		{"string", `"v"`},
+		{"number", `42`},
+		{"boolean", `true`},
+	}
+	for _, tc := range nonObjects {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseRuleVersion([]byte(tc.spec))
+			if err == nil {
+				t.Fatal("non-object spec accepted")
+			}
+			// A non-object is neither a duplicate-field problem nor trailing data.
+			if errors.Is(err, ErrDuplicateField) {
+				t.Fatalf("non-object reported as duplicate field: %v", err)
+			}
+			if errors.Is(err, ErrTrailingData) {
+				t.Fatalf("non-object reported as trailing data: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseRuleVersionAllowsSurroundingWhitespace(t *testing.T) {
+	for _, spec := range []string{
+		validVersionSpec,
+		" " + validVersionSpec,
+		"\n\t" + validVersionSpec + " \r\n",
+		"\t\n " + validVersionSpec + "\t",
+	} {
+		if _, err := ParseRuleVersion([]byte(spec)); err != nil {
+			t.Fatalf("whitespace-padded spec rejected: %v", err)
+		}
+	}
+}
+
+func TestParseRuleVersionRejectsTrailingData(t *testing.T) {
+	trailing := []struct {
+		name string
+		spec string
+	}{
+		{"second object", validVersionSpec + `{"id":"w"}`},
+		{"second null", validVersionSpec + ` null`},
+		{"second array", validVersionSpec + ` []`},
+		{"second number", validVersionSpec + ` 5`},
+		{"second string", validVersionSpec + `"x"`},
+		{"second boolean", validVersionSpec + ` true`},
+		{"extra closing brace", validVersionSpec + `}`},
+		{"extra closing bracket", validVersionSpec + `]`},
+		{"junk word", validVersionSpec + ` extra`},
+	}
+	for _, tc := range trailing {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseRuleVersion([]byte(tc.spec))
+			if !errors.Is(err, ErrTrailingData) {
+				t.Fatalf("got %v, want ErrTrailingData", err)
+			}
+			if errors.Is(err, ErrDuplicateField) {
+				t.Fatalf("trailing data misreported as a duplicate field: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseRuleVersionRejectsDuplicateFields(t *testing.T) {
+	dups := []struct {
+		name   string
+		spec   string
+		object string
+		field  string
+	}{
+		{
+			"duplicate id",
+			`{"id":"v","id":"v2","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"version spec", "id",
+		},
+		{
+			"duplicate id with identical value",
+			`{"id":"v","id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"version spec", "id",
+		},
+		{
+			"duplicate rules",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}},"rules":{"sandwich":{"enabled":false,"severity":1},"displacement":{"enabled":false,"severity":1,"multiplier":2}}}`,
+			"version spec", "rules",
+		},
+		{
+			"duplicate sandwich rule",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules object", "sandwich",
+		},
+		{
+			"duplicate displacement rule",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules object", "displacement",
+		},
+		{
+			"duplicate enabled in sandwich",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"enabled":false,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "enabled",
+		},
+		{
+			"duplicate severity identical value",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"duplicate multiplier",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2,"multiplier":3}}}`,
+			"rules.displacement", "multiplier",
+		},
+		{
+			"case-only severity variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"SEVERITY":3,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"case-only enabled variant",
+			`{"id":"v","rules":{"sandwich":{"Enabled":true,"ENABLED":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "enabled",
+		},
+		{
+			"case-only id variant at top level",
+			`{"ID":"v","id":"v2","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"version spec", "id",
+		},
+		{
+			"escaped duplicate id",
+			"{\"id\":\"v\",\"\\u0069d\":\"v2\",\"rules\":{\"sandwich\":{\"enabled\":true,\"severity\":3},\"displacement\":{\"enabled\":true,\"severity\":2,\"multiplier\":2}}}",
+			"version spec", "id",
+		},
+		{
+			"escaped duplicate severity",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"sev\u0065rity":3,"severity":4},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"split sandwich objects cannot complete each other",
+			`{"id":"v","rules":{"sandwich":{"enabled":true},"sandwich":{"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules object", "sandwich",
+		},
+	}
+	for _, tc := range dups {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseRuleVersion([]byte(tc.spec))
+			if !errors.Is(err, ErrDuplicateField) {
+				t.Fatalf("got %v, want ErrDuplicateField", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.object) {
+				t.Fatalf("error %q does not name the object %q", msg, tc.object)
+			}
+			if !strings.Contains(msg, tc.field) {
+				t.Fatalf("error %q does not name the field %q", msg, tc.field)
+			}
+			if errors.Is(err, ErrTrailingData) {
+				t.Fatalf("duplicate field misreported as trailing data: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseRuleVersionIndependentRulesShareNoFields(t *testing.T) {
+	// enabled/severity appearing in both rules is normal, not a duplicate.
+	spec := `{"id":"twin","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":false,"severity":2,"multiplier":2}}}`
+	v, err := ParseRuleVersion([]byte(spec))
+	if err != nil {
+		t.Fatalf("independent rules must each own enabled/severity: %v", err)
+	}
+	if v.ID != "twin" || !v.Rules.Sandwich.Enabled || v.Rules.Displacement.Enabled {
+		t.Fatalf("parsed version wrong: %+v", v)
+	}
+}
+
+func TestParseRuleVersionCaseCompatibilityPreserved(t *testing.T) {
+	spec := `{"ID":"Caps","RULES":{"SANDWICH":{"ENABLED":true,"SEVERITY":3},"Displacement":{"eNaBlEd":false,"SeVeRiTy":4,"MuLtIpLiEr":7}}}`
+	v, err := ParseRuleVersion([]byte(spec))
+	if err != nil {
+		t.Fatalf("case-variant fields must still decode: %v", err)
+	}
+	// String values are not case-folded or trimmed.
+	if v.ID != "Caps" {
+		t.Fatalf("id altered: %q", v.ID)
+	}
+	if !v.Rules.Sandwich.Enabled || v.Rules.Sandwich.Severity != 3 ||
+		v.Rules.Displacement.Enabled || v.Rules.Displacement.Severity != 4 || v.Rules.Displacement.Multiplier != 7 {
+		t.Fatalf("case-variant parameters wrong: %+v", v)
+	}
+	spaced, err := ParseRuleVersion([]byte(`{"id":" StRiCt ","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spaced.ID != " StRiCt " {
+		t.Fatalf("id value must be preserved verbatim, got %q", spaced.ID)
+	}
+}
+
+func TestRejectedSpecLeavesArchiveUntouched(t *testing.T) {
+	dir := t.TempDir()
+	original, created := register(t, dir, strictSpec)
+	if !created {
+		t.Fatal("setup registration must create")
+	}
+	rejected := []string{
+		// Existing ID cannot bypass validation into a created:false success.
+		`{"id":"strict","id":"strict2","rules":{"sandwich":{"enabled":true,"severity":5},"displacement":{"enabled":true,"severity":4,"multiplier":5}}}`,
+		`{"id":"strict","rules":{"sandwich":{"enabled":true,"severity":5},"displacement":{"enabled":true,"severity":4,"multiplier":5}}}extra`,
+		`null`,
+		`[]`,
+		``,
+		strictSpec + `{"id":"other"}`,
+		`{"id":"z","rules":{"sandwich":{"enabled":true,"severity":3,"severity":4},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+	}
+	for i, spec := range rejected {
+		if v, _, err := RegisterVersion(dir, []byte(spec)); err == nil {
+			t.Fatalf("rejected case %d was accepted: %+v", i, v)
+		}
+	}
+	versions, enabled, err := ListVersions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 2 || versions[1] != original {
+		t.Fatalf("archive versions changed after rejections: %+v", versions)
+	}
+	if enabled != BuiltinVersionID {
+		t.Fatalf("enabled version changed to %q", enabled)
+	}
+	got, err := GetVersion(dir, "strict")
+	if err != nil || got != original {
+		t.Fatalf("stored version changed: %+v, %v", got, err)
+	}
+	// The legitimate identical retry path still reports created:false.
+	if retry, created, err := RegisterVersion(dir, []byte(strictSpec)); err != nil || created || retry != original {
+		t.Fatalf("identical retry: v=%+v created=%v err=%v", retry, created, err)
+	}
+}
+
 func TestRegisterVersionLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	v, created := register(t, dir, strictSpec)
