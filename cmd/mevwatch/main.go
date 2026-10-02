@@ -82,6 +82,7 @@ func usage() {
 	fmt.Println("  suppressions list <archive-dir>          list registered suppression conditions")
 	fmt.Println("  suppressions register <archive-dir> <spec-file>")
 	fmt.Println("                                           register a suppression condition ('-' reads stdin)")
+	fmt.Println("  suppressions revoke <archive-dir> <id>   revoke a registered suppression condition")
 	fmt.Println("  reviews submit <archive-dir> <spec-file> submit a manual review ('-' reads stdin)")
 	fmt.Println("  reviews history <archive-dir> <chainId> <blockHash> <txHash> <kind>")
 	fmt.Println("                                           query a conclusion's current review and revisions")
@@ -267,7 +268,7 @@ func runAlerts(args []string) {
 
 func runSuppressions(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: mevwatch suppressions <list|register> ...")
+		fmt.Fprintln(os.Stderr, "usage: mevwatch suppressions <list|register|revoke> ...")
 		os.Exit(2)
 	}
 	switch args[0] {
@@ -307,6 +308,20 @@ func runSuppressions(args []string) {
 			Created     bool                 `json:"created"`
 			Suppression mevwatch.Suppression `json:"suppression"`
 		}{Created: created, Suppression: cond})
+	case "revoke":
+		if len(args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: mevwatch suppressions revoke <archive-dir> <condition-id>")
+			os.Exit(2)
+		}
+		cond, changed, err := mevwatch.RevokeSuppression(args[1], args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "suppressions revoke: %v\n", err)
+			os.Exit(1)
+		}
+		writeJSON(struct {
+			Changed     bool                 `json:"changed"`
+			Suppression mevwatch.Suppression `json:"suppression"`
+		}{Changed: changed, Suppression: cond})
 	default:
 		fmt.Fprintf(os.Stderr, "unknown suppressions subcommand %q\n", args[0])
 		usage()

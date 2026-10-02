@@ -39,6 +39,10 @@ var ErrUnknownKind = errors.New("unknown kind")
 // with different content.
 var ErrSuppressionConflict = errors.New("suppression already registered with different content")
 
+// ErrUnknownSuppression reports revoking a condition ID that is not
+// registered in the archive (including the empty archive).
+var ErrUnknownSuppression = errors.New("unknown suppression condition")
+
 // SuppressionHit records one suppression condition that matched an event.
 type SuppressionHit struct {
 	ID     string `json:"id"`
@@ -79,6 +83,13 @@ func (r ProcessingRecord) identity() alertKey {
 // exactly (the pool is matched against the pool of the victim swap's
 // original exchange record), and an event at height h is covered when
 // StartHeight <= h <= EndHeight.
+//
+// Revoked marks a condition whose user has withdrawn it. A revoked
+// condition is kept for audit but never matches later processing; the
+// field is always serialized (an absent value in an old archive decodes
+// to false, i.e. not revoked) and cannot be set through a registration
+// document. Revocation applies to findings processed afterwards only —
+// event height never decides when it takes effect.
 type Suppression struct {
 	ID          string `json:"id"`
 	ChainID     string `json:"chainId"`
@@ -88,6 +99,7 @@ type Suppression struct {
 	StartHeight uint64 `json:"startHeight"`
 	EndHeight   uint64 `json:"endHeight"`
 	Reason      string `json:"reason"`
+	Revoked     bool   `json:"revoked"`
 }
 
 // covers reports whether the suppression applies to an event on chain at
@@ -216,17 +228,31 @@ func ValidateSeverity(severity int) error {
 	return nil
 }
 
-// suppressionEqual reports whether two conditions carry identical content.
+// suppressionEqual reports whether two conditions carry identical
+// registration content. Revoked state is intentionally excluded: retrying
+// the same document is idempotent even after the condition was revoked
+// (and never re-enables it), while differing content still conflicts.
 func suppressionEqual(a, b Suppression) bool {
-	return a == b
+	return a.ID == b.ID &&
+		a.ChainID == b.ChainID &&
+		a.Pool == b.Pool &&
+		a.Kind == b.Kind &&
+		a.Channel == b.Channel &&
+		a.StartHeight == b.StartHeight &&
+		a.EndHeight == b.EndHeight &&
+		a.Reason == b.Reason
 }
 
-// matchSuppressions returns every condition covering the event, sorted by ID
-// in lexicographic order so overlapping conditions are reported
-// deterministically.
+// matchSuppressions returns every active condition covering the event,
+// sorted by ID in lexicographic order so overlapping conditions are
+// reported deterministically. Revoked conditions are skipped: they no
+// longer apply to conclusions processed after the revocation.
 func matchSuppressions(conds []Suppression, chainID, pool, kind, channel string, height uint64) []SuppressionHit {
 	hits := []SuppressionHit{}
 	for _, s := range conds {
+		if s.Revoked {
+			continue
+		}
 		if s.covers(chainID, pool, kind, channel, height) {
 			hits = append(hits, SuppressionHit{ID: s.ID, Reason: s.Reason})
 		}
@@ -419,10 +445,12 @@ func AlertHistory(dir, chainID, channel string, startHeight, endHeight uint64) (
 
 // RegisterSuppression validates raw and stores one suppression condition in
 // the archive. Re-registering the same ID with identical content succeeds
-// without adding anything (created is false); the same ID with different
+// without adding anything (created is false) — this stays true after the
+// condition was revoked and never re-enables it; the same ID with different
 // content is rejected. New conditions only affect conclusions that have not
 // been processed yet: historical alerts are never rewritten as suppressed,
 // and suppressed records are not re-alerted when a condition's range ends.
+// The registration document cannot set revoked state.
 func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, err error) {
 	s, err = ParseSuppression(raw)
 	if err != nil {
@@ -454,6 +482,52 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 		return Suppression{}, false, err
 	}
 	return s, true, nil
+}
+
+// RevokeSuppression withdraws the condition with the given exact ID. The
+// first successful revocation returns changed=true and the full condition
+// with Revoked set; revoking the same ID again succeeds with changed=false.
+// A blank ID is rejected, and an ID that was never registered — including
+// any ID in an empty archive — returns ErrUnknownSuppression. The revoked
+// condition is retained (still listed) but stops matching conclusions
+// processed from now on; it cannot be revived, a fresh ID is required to
+// suppress again.
+//
+// The revocation is committed atomically under the archive lock: a busy
+// archive, a corrupted one or a failed save leaves every condition, report
+// and processing record untouched. One generation run always sees either
+// the pre- or the post-revocation condition set in full.
+func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) {
+	if strings.TrimSpace(id) == "" {
+		return Suppression{}, false, errors.New("suppression id must be a non-empty string")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return Suppression{}, false, err
+	}
+	lock, lerr := lockArchive(dir, syscall.LOCK_EX|syscall.LOCK_NB)
+	if lerr != nil {
+		return Suppression{}, false, lerr
+	}
+	defer lock.Close()
+
+	data, err := readArchive(dir)
+	if err != nil {
+		return Suppression{}, false, err
+	}
+	for i := range data.Suppressions {
+		if data.Suppressions[i].ID != id {
+			continue
+		}
+		if data.Suppressions[i].Revoked {
+			return data.Suppressions[i], false, nil
+		}
+		data.Suppressions[i].Revoked = true
+		if err := writeArchiveAtomic(dir, data); err != nil {
+			return Suppression{}, false, err
+		}
+		return data.Suppressions[i], true, nil
+	}
+	return Suppression{}, false, fmt.Errorf("%w: %s", ErrUnknownSuppression, id)
 }
 
 // ListSuppressions returns every suppression condition stored in the

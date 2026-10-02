@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // twoBlockInput holds one sandwich (severity 3, pool p1, victim 0xv) and
@@ -786,5 +787,505 @@ func TestGenerateOnlyReturnsNewRecords(t *testing.T) {
 	}
 	if statuses["sandwich"] != AlertStatusSuppressed || statuses["displacement"] != AlertStatusAlert {
 		t.Fatalf("same call must distinguish alert and suppressed: %+v", statuses)
+	}
+}
+
+const revocationSpec = `{"id":"s1","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":100,"endHeight":200,"reason":"known bot war"}`
+
+func registerRevocationSpec(t *testing.T, dir string) Suppression {
+	t.Helper()
+	cond, created, err := RegisterSuppression(dir, []byte(revocationSpec))
+	if err != nil || !created {
+		t.Fatalf("RegisterSuppression: created=%v err=%v", created, err)
+	}
+	if cond.Revoked {
+		t.Fatalf("newly registered condition must report revoked:false, got %+v", cond)
+	}
+	return cond
+}
+
+func TestRevokeSuppressionFirstAndIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	original := registerRevocationSpec(t, dir)
+
+	first, changed, err := RevokeSuppression(dir, "s1")
+	if err != nil || !changed {
+		t.Fatalf("first revoke: changed=%v err=%v", changed, err)
+	}
+	if !first.Revoked {
+		t.Fatalf("revoked condition must carry revoked:true, got %+v", first)
+	}
+	// Every original field is preserved.
+	first.Revoked = false
+	if !reflect.DeepEqual(first, original) {
+		t.Fatalf("revocation lost fields: got %+v, want %+v", first, original)
+	}
+	// Revoking the same condition again succeeds with changed=false.
+	again, changed, err := RevokeSuppression(dir, "s1")
+	if err != nil || changed {
+		t.Fatalf("second revoke: changed=%v err=%v", changed, err)
+	}
+	if !again.Revoked {
+		t.Fatalf("second revoke must still report revoked:true, got %+v", again)
+	}
+}
+
+func TestRevokeSuppressionBlankAndUnknown(t *testing.T) {
+	dir := t.TempDir()
+	registerRevocationSpec(t, dir)
+	for _, id := range []string{"", "   ", "\t\n"} {
+		if _, _, err := RevokeSuppression(dir, id); err == nil {
+			t.Fatalf("blank id %q must error", id)
+		}
+	}
+	// Exact matching: lookalikes do not revoke s1.
+	for _, id := range []string{"S1", "s1 ", " s1", "s1\n", "s10", "s"} {
+		if _, _, err := RevokeSuppression(dir, id); !errors.Is(err, ErrUnknownSuppression) {
+			t.Fatalf("id %q: got %v, want ErrUnknownSuppression", id, err)
+		}
+	}
+	conds, err := ListSuppressions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conds) != 1 || conds[0].Revoked {
+		t.Fatalf("failed revokes must not alter the condition: %+v", conds)
+	}
+	// An unknown id on an empty archive reports unknown, too.
+	empty := t.TempDir()
+	if _, _, err := RevokeSuppression(empty, "missing"); !errors.Is(err, ErrUnknownSuppression) {
+		t.Fatalf("empty archive revoke: got %v, want ErrUnknownSuppression", err)
+	}
+}
+
+func TestRevokeSuppressionPersistenceAndList(t *testing.T) {
+	dir := t.TempDir()
+	registerRevocationSpec(t, dir)
+	spec2 := `{"id":"a2","chainId":"1","pool":"p2","kind":"displacement","channel":"ops","startHeight":1,"endHeight":2,"reason":"r2"}`
+	if _, _, err := RegisterSuppression(dir, []byte(spec2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RevokeSuppression(dir, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen the archive: revoked state survives; list keeps both entries in
+	// ID order, each carrying a boolean revoked field.
+	conds, err := ListSuppressions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conds) != 2 || conds[0].ID != "a2" || conds[1].ID != "s1" {
+		t.Fatalf("revoked conditions must stay listed in id order: %+v", conds)
+	}
+	byID := map[string]Suppression{}
+	for _, c := range conds {
+		byID[c.ID] = c
+	}
+	if !byID["s1"].Revoked || byID["a2"].Revoked {
+		t.Fatalf("bad revoked flags after reopen: %+v", byID)
+	}
+	// The persisted JSON carries an explicit revoked field on every entry.
+	raw, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"revoked": false`) ||
+		!strings.Contains(string(raw), `"revoked": true`) {
+		t.Fatalf("archive entries must serialize a boolean revoked field:\n%s", raw)
+	}
+}
+
+func TestRevokeSuppressionOldArchiveDefaultsToNotRevoked(t *testing.T) {
+	dir := t.TempDir()
+	data := archiveData{Suppressions: []Suppression{{
+		ID: "old", ChainID: "1", Pool: "p1", Kind: "sandwich", Channel: "ops",
+		StartHeight: 0, EndHeight: 200, Reason: "old-style",
+	}}}
+	if err := writeArchiveAtomic(dir, data); err != nil {
+		t.Fatal(err)
+	}
+	conds, err := ListSuppressions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conds) != 1 || conds[0].Revoked {
+		t.Fatalf("conditions without revoked state are not revoked: %+v", conds)
+	}
+	// And the old condition still matches conclusions in range.
+	mustReplay(t, dir, twoFindingsInput)
+	got, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		if r.Finding.TxHash == "0xv" && r.Status != AlertStatusSuppressed {
+			t.Fatalf("old condition should still suppress, got %+v", r)
+		}
+	}
+}
+
+func TestRevokeSuppressionRegistrationRulesUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	registerRevocationSpec(t, dir)
+	if _, _, err := RevokeSuppression(dir, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	// Same id, same spec is still an idempotent no-op (created:false) and
+	// must not revive the revoked condition.
+	cond, created, err := RegisterSuppression(dir, []byte(revocationSpec))
+	if err != nil || created {
+		t.Fatalf("identical retry after revoke: created=%v err=%v", created, err)
+	}
+	if !cond.Revoked {
+		t.Fatalf("identical retry must not re-enable a revoked condition: %+v", cond)
+	}
+	// Same id, different spec still conflicts.
+	conflict := strings.Replace(revocationSpec, `"pool":"p1"`, `"pool":"p9"`, 1)
+	if _, _, err := RegisterSuppression(dir, []byte(conflict)); !errors.Is(err, ErrSuppressionConflict) {
+		t.Fatalf("got %v, want ErrSuppressionConflict", err)
+	}
+	// revoked is not a registration field.
+	withFlag := strings.TrimSuffix(revocationSpec, "}") + `,"revoked":false}`
+	if _, _, err := RegisterSuppression(dir, []byte(withFlag)); err == nil {
+		t.Fatal("a spec setting revoked must be rejected as an unknown field")
+	}
+	// A fresh id can suppress the same events again.
+	fresh := strings.Replace(revocationSpec, `"id":"s1"`, `"id":"s2"`, 1)
+	c2, created, err := RegisterSuppression(dir, []byte(fresh))
+	if err != nil || !created || c2.Revoked {
+		t.Fatalf("fresh id register: created=%v revoked=%v err=%v", created, c2.Revoked, err)
+	}
+}
+
+func TestRevokeAppliesToProcessingTimeNotHeight(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput) // sandwich on 0xv at height 10, pool p1
+	// Condition covers heights 100..200; the block at height 10 is out of
+	// range either way. Use a covering condition to establish history first.
+	spec := `{"id":"s1","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":0,"endHeight":200,"reason":"r"}`
+	if _, _, err := RegisterSuppression(dir, []byte(spec)); err != nil {
+		t.Fatal(err)
+	}
+	// Before the revocation: block 0xa at height 10 is processed suppressed.
+	first, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var historical *ProcessingRecord
+	for i := range first {
+		if first[i].Finding.TxHash == "0xv" {
+			historical = &first[i]
+		}
+	}
+	if historical == nil || historical.Status != AlertStatusSuppressed ||
+		len(historical.Suppressions) != 1 || historical.Suppressions[0].ID != "s1" {
+		t.Fatalf("precondition: want s1-suppressed record, got %+v", first)
+	}
+	if _, _, err := RevokeSuppression(dir, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	// A different block at the same height, imported long after the archive
+	// contained the original: revocation still applies even though the block
+	// "was already archived" is irrelevant — what matters is processing time.
+	other := strings.Replace(twoFindingsInput, `"blockHash":"0xa"`, `"blockHash":"0xb"`, 1)
+	other = strings.Replace(other, `"0xv"`, `"0xv2"`, -1)
+	mustReplay(t, dir, other)
+	got, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var later *ProcessingRecord
+	for i := range got {
+		if got[i].BlockHash == "0xb" {
+			later = &got[i]
+		}
+	}
+	if later == nil {
+		t.Fatalf("new block produced no records: %+v", got)
+	}
+	for _, r := range got {
+		if r.Status == AlertStatusSuppressed {
+			t.Fatalf("after revocation nothing should be suppressed: %+v", r)
+		}
+	}
+	// The historical record is unchanged and still visible in history.
+	hist, err := AlertHistory(dir, "1", "ops", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen *ProcessingRecord
+	for i := range hist {
+		if hist[i].BlockHash == "0xa" && hist[i].Finding.TxHash == "0xv" {
+			seen = &hist[i]
+		}
+	}
+	if seen == nil || seen.Status != AlertStatusSuppressed ||
+		len(seen.Suppressions) != 1 || seen.Suppressions[0].ID != "s1" {
+		t.Fatalf("historical record altered by revocation: %+v", seen)
+	}
+	// Re-generating over overlapping ranges still skips processed findings.
+	again, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("overlapping generation reprocessed findings: %+v", again)
+	}
+}
+
+func TestRevokeWithOtherActiveConditionStaysSuppressed(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	s1 := `{"id":"s1","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":0,"endHeight":200,"reason":"first"}`
+	s2 := `{"id":"s2","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":0,"endHeight":200,"reason":"second"}`
+	if _, _, err := RegisterSuppression(dir, []byte(s1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RegisterSuppression(dir, []byte(s2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RevokeSuppression(dir, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		if r.Finding.TxHash != "0xv" {
+			continue
+		}
+		if r.Status != AlertStatusSuppressed {
+			t.Fatalf("with s2 active the finding stays suppressed, got %q", r.Status)
+		}
+		if len(r.Suppressions) != 1 || r.Suppressions[0].ID != "s2" {
+			t.Fatalf("only the active condition's id/reason is saved: %+v", r.Suppressions)
+		}
+		return
+	}
+	t.Fatal("sandwich record missing")
+}
+
+func TestRevokeThenImportAndProcessNewBlock(t *testing.T) {
+	dir := t.TempDir()
+	spec := `{"id":"s1","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":0,"endHeight":200,"reason":"r"}`
+	if _, _, err := RegisterSuppression(dir, []byte(spec)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RevokeSuppression(dir, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	// A block imported after the revocation at a height the condition
+	// covered is processed as an alert, not suppressed.
+	mustReplay(t, dir, twoFindingsInput)
+	got, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sandwich *ProcessingRecord
+	for i := range got {
+		if got[i].Finding.TxHash == "0xv" {
+			sandwich = &got[i]
+		}
+	}
+	if sandwich == nil || sandwich.Status != AlertStatusAlert {
+		t.Fatalf("post-revocation import must alert, got %+v", got)
+	}
+	if len(sandwich.Suppressions) != 0 {
+		t.Fatalf("alert must not name the revoked condition: %+v", sandwich.Suppressions)
+	}
+}
+
+func TestRevokeBelowThresholdStillLeavesNoRecord(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	spec := `{"id":"s1","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":0,"endHeight":200,"reason":"r"}`
+	if _, _, err := RegisterSuppression(dir, []byte(spec)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RevokeSuppression(dir, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GenerateAlerts(dir, "1", "ops", 0, 100, 5); err != nil {
+		t.Fatal(err)
+	}
+	data, err := readArchive(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.AlertRecords) != 0 {
+		t.Fatalf("findings below the threshold leave no record even after revoke: %+v", data.AlertRecords)
+	}
+}
+
+func TestRevokeChannelsIndependent(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	for _, ch := range []string{"ops", "oncall"} {
+		spec := fmt.Sprintf(`{"id":"s-%s","chainId":"1","pool":"p1","kind":"sandwich","channel":"%s","startHeight":0,"endHeight":200,"reason":"r"}`, ch, ch)
+		if _, _, err := RegisterSuppression(dir, []byte(spec)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := RevokeSuppression(dir, "s-ops"); err != nil {
+		t.Fatal(err)
+	}
+	ops, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oncall, err := GenerateAlerts(dir, "1", "oncall", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(records []ProcessingRecord) string {
+		for _, r := range records {
+			if r.Finding.TxHash == "0xv" {
+				return r.Status
+			}
+		}
+		return ""
+	}
+	if status(ops) != AlertStatusAlert {
+		t.Fatalf("revoked ops condition: ops status = %q, want alert", status(ops))
+	}
+	if status(oncall) != AlertStatusSuppressed {
+		t.Fatalf("oncall condition untouched: status = %q, want suppressed", status(oncall))
+	}
+}
+
+func TestRevokeSuppressionBusyAndCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	registerRevocationSpec(t, dir)
+	lock, err := os.OpenFile(filepath.Join(dir, lockFileName), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RevokeSuppression(dir, "s1"); !errors.Is(err, ErrBusy) {
+		t.Fatalf("busy: got %v, want ErrBusy", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := []byte("{broken")
+	if err := os.WriteFile(filepath.Join(dir, archiveFileName), corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RevokeSuppression(dir, "s1"); err == nil ||
+		!strings.Contains(err.Error(), "corrupted") {
+		t.Fatalf("corrupt: got %v, want corrupted-archive error", err)
+	}
+	// The failed revocation must not have rewritten the corrupt file.
+	raw, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(raw, corrupt) {
+		t.Fatalf("failed revocation changed the archive: %q", raw)
+	}
+}
+
+func TestRevokeSuppressionConcurrentConsistent(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	spec := `{"id":"s1","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":0,"endHeight":200,"reason":"r"}`
+	if _, _, err := RegisterSuppression(dir, []byte(spec)); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 12
+	var wg sync.WaitGroup
+	genErrs := make([]error, n)
+	statuses := make([]string, n)
+	start := make(chan struct{})
+	// Half the goroutines generate, half revoke, all retrying through busy
+	// errors the way a real caller does. Each generation must observe one
+	// consistent condition set (suppressed pre-revoke or alert post-revoke),
+	// never a half state.
+	retryBusy := func(op func() error) error {
+		for attempt := 0; attempt < 1000; attempt++ {
+			err := op()
+			if errors.Is(err, ErrBusy) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			return err
+		}
+		return ErrBusy
+	}
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if i%2 == 0 {
+				genErrs[i] = retryBusy(func() error {
+					recs, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+					if err == nil {
+						for _, r := range recs {
+							if r.Finding.TxHash == "0xv" {
+								statuses[i] = r.Status
+							}
+						}
+					}
+					return err
+				})
+			} else {
+				genErrs[i] = retryBusy(func() error {
+					_, _, err := RevokeSuppression(dir, "s1")
+					return err
+				})
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range genErrs {
+		if err != nil {
+			t.Fatalf("goroutine %d unexpected error: %v", i, err)
+		}
+	}
+	// Exactly one generation creates the sandwich record; its status must be
+	// one coherent outcome, and only the matching condition ids are stored.
+	hist, err := AlertHistory(dir, "1", "ops", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := ""
+	count := 0
+	for _, r := range hist {
+		if r.Finding.TxHash == "0xv" {
+			count++
+			final = r.Status
+			if len(r.Suppressions) > 1 {
+				t.Fatalf("inconsistent hit set: %+v", r.Suppressions)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("sandwich processed %d times, want exactly 1", count)
+	}
+	if final != AlertStatusAlert && final != AlertStatusSuppressed {
+		t.Fatalf("final status %q is neither coherent pre/post-revocation state", final)
+	}
+	// The generator that created the record reports the same status it
+	// committed; no generator may return an incoherent status.
+	nonEmpty := 0
+	for i, s := range statuses {
+		if s == "" {
+			continue
+		}
+		nonEmpty++
+		if s != final {
+			t.Fatalf("generator %d observed status %q but history holds %q", i, s, final)
+		}
+	}
+	if nonEmpty != 1 {
+		t.Fatalf("exactly one generation must create the record, %d reported it", nonEmpty)
 	}
 }
