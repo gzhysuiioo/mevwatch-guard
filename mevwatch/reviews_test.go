@@ -637,3 +637,174 @@ func TestSubmitReviewFailureLeavesNoHalfRevision(t *testing.T) {
 		t.Fatal("failed submission modified the archive")
 	}
 }
+
+// breakArchiveSave makes the archive commit fail at the save stage: the
+// temporary file the atomic writer creates becomes a directory, so opening
+// it as a regular file fails while the lock, the archived conclusion, the
+// review object and its revisions are all valid. This is a storage failure
+// at persistence time, not a validation, version-conflict or busy error.
+func breakArchiveSave(t *testing.T, dir string) {
+	t.Helper()
+	tmp := filepath.Join(dir, archiveFileName+".tmp")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("break archive save: %v", err)
+	}
+}
+
+func restoreArchiveSave(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.RemoveAll(filepath.Join(dir, archiveFileName+".tmp")); err != nil {
+		t.Fatalf("restore archive save: %v", err)
+	}
+}
+
+func TestSubmitReviewSaveFailureRetriedAfterRecovery(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+
+	// A pre-existing alert record must survive the failed and successful
+	// submissions byte-for-byte in content.
+	alertsBefore, err := GenerateAlerts(dir, "1", "ops", 0, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alertsBefore) != 2 {
+		t.Fatalf("setup: got %d alert records, want 2", len(alertsBefore))
+	}
+
+	// Main precondition: the object is at version 1 with a real judgment and
+	// one complete revision.
+	first := submit(t, dir, reviewSub("1", "0xa", "0xv", "sandwich", "s-1", "alice", "confirmed bot", ReviewStatusReal, 0))
+	if !first.Created || first.Version != 1 {
+		t.Fatalf("setup submission = %+v", first)
+	}
+
+	original, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original.Status != ReviewStatusReal || original.Version != 1 || len(original.Revisions) != 1 {
+		t.Fatalf("setup object state = %+v", original)
+	}
+	archiveBefore, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Valid target, valid content, valid expected version: the only failure
+	// is storage failing while the new revision is being archived.
+	breakArchiveSave(t, dir)
+	rejudgment := reviewSub("1", "0xa", "0xv", "sandwich", "s-2", "bob", "actually a false positive", ReviewStatusFalsePositive, 1)
+	failed, err := SubmitReview(dir, rejudgment)
+	if err == nil {
+		t.Fatalf("save failure must return an error, got result %+v", failed)
+	}
+	if errors.Is(err, ErrBusy) || errors.Is(err, ErrReviewConflict) ||
+		errors.Is(err, ErrUnknownConclusion) || errors.Is(err, ErrSubmissionConflict) {
+		t.Fatalf("failure must happen at the save stage, got %v", err)
+	}
+	if failed.Created {
+		t.Fatalf("failed save must not report created=true: %+v", failed)
+	}
+	restoreArchiveSave(t, dir)
+
+	// The original judgment is fully retained: still real at version 1, the
+	// single original revision with no trace of the failed submission.
+	after, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != ReviewStatusReal || after.Version != 1 {
+		t.Fatalf("failed save advanced the object: %q/%d, want real/1", after.Status, after.Version)
+	}
+	if len(after.Revisions) != 1 {
+		t.Fatalf("failed save left %d revisions: %+v", len(after.Revisions), after.Revisions)
+	}
+	if !reflect.DeepEqual(after.Revisions[0], original.Revisions[0]) {
+		t.Fatalf("original revision changed: %+v, want %+v", after.Revisions[0], original.Revisions[0])
+	}
+	for _, rev := range after.Revisions {
+		if rev.SubmissionID == "s-2" || rev.Operator == "bob" ||
+			rev.Status == ReviewStatusFalsePositive || rev.Reason == "actually a false positive" {
+			t.Fatalf("failed submission content leaked into history: %+v", rev)
+		}
+	}
+	// The archived original conclusion, its detection version and the raw
+	// swap evidence are untouched, as are the pre-existing alert records.
+	if after.Original == nil ||
+		after.Original.Finding.TxHash != "0xv" || after.Original.Finding.Kind != "sandwich" ||
+		after.Original.Finding.Severity != 3 || len(after.Original.Finding.Evidence) != 3 {
+		t.Fatalf("original conclusion/evidence changed: %+v", after.Original)
+	}
+	if after.Original.Version.ID != BuiltinVersionID {
+		t.Fatalf("detection version changed: %+v", after.Original.Version)
+	}
+	archiveAfter, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(archiveBefore, archiveAfter) {
+		t.Fatal("failed save modified the archive file")
+	}
+	alertsAfter, err := AlertHistory(dir, "1", "ops", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(alertsBefore, alertsAfter) {
+		t.Fatalf("alert records changed: before %+v after %+v", alertsBefore, alertsAfter)
+	}
+
+	// Storage recovered: the exact same submission, same submissionId and
+	// still expectedVersion 1, goes through as a fresh create — the failed
+	// attempt must neither have consumed the submission id nor count as a
+	// stored duplicate.
+	retry, err := SubmitReview(dir, rejudgment)
+	if err != nil {
+		t.Fatalf("retry after recovery: %v", err)
+	}
+	if !retry.Created || retry.Version != 2 || retry.Status != ReviewStatusFalsePositive {
+		t.Fatalf("retry = %+v, want created=true at version 2", retry)
+	}
+	wantRev := rejudgment.revision(2)
+	if !reflect.DeepEqual(retry.Revision, wantRev) {
+		t.Fatalf("saved revision = %+v, want %+v", retry.Revision, wantRev)
+	}
+
+	saved, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != ReviewStatusFalsePositive || saved.Version != 2 || len(saved.Revisions) != 2 {
+		t.Fatalf("object after retry = %q/%d with %d revisions", saved.Status, saved.Version, len(saved.Revisions))
+	}
+	if !reflect.DeepEqual(saved.Revisions[0], original.Revisions[0]) {
+		t.Fatalf("original revision not retained first: %+v", saved.Revisions[0])
+	}
+	if !reflect.DeepEqual(saved.Revisions[1], wantRev) {
+		t.Fatalf("appended revision = %+v, want %+v", saved.Revisions[1], wantRev)
+	}
+
+	// Sending the now-successful submission verbatim a second time is the
+	// ordinary idempotent retry: created:false, the first successfully saved
+	// revision returned, history unchanged.
+	again, err := SubmitReview(dir, rejudgment)
+	if err != nil {
+		t.Fatalf("verbatim resend: %v", err)
+	}
+	if again.Created {
+		t.Fatal("verbatim resend of a stored submission must report created=false")
+	}
+	if !reflect.DeepEqual(again.Revision, wantRev) || again.Version != 2 || again.Status != ReviewStatusFalsePositive {
+		t.Fatalf("resend result = %+v", again)
+	}
+	final, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Version != 2 || len(final.Revisions) != 2 {
+		t.Fatalf("verbatim resend changed history: version %d, %d revisions", final.Version, len(final.Revisions))
+	}
+	if !reflect.DeepEqual(final.Revisions, saved.Revisions) {
+		t.Fatalf("verbatim resend appended a revision: %+v", final.Revisions)
+	}
+}
