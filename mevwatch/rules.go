@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strings"
 	"syscall"
 )
 
@@ -116,6 +115,38 @@ var ErrDuplicateField = errors.New("duplicate field in version spec")
 // JSON value, an unmatched bracket or any other character.
 var ErrTrailingData = errors.New("unexpected trailing data after version spec")
 
+// versionScanPolicy validates the shape of a rule version document with
+// the shared scanner while keeping version-spec wording and sentinel
+// errors.
+var versionScanPolicy = specPolicy{
+	topObject:          "version spec",
+	known:              versionFields,
+	nested:             versionNestedTables,
+	rejectExactUnknown: true,
+	firstTokenError: func(err error) error {
+		if errors.Is(err, io.EOF) {
+			return errors.New("version spec must be a JSON object, got empty input")
+		}
+		return fmt.Errorf("invalid version spec: %w", err)
+	},
+	nonObject: func(tok json.Token) error {
+		if tok == nil {
+			return errors.New("version spec must be a JSON object, got null")
+		}
+		if d, ok := tok.(json.Delim); ok && d == '[' {
+			return errors.New("version spec must be a single JSON object, got array")
+		}
+		return fmt.Errorf("version spec must be a single JSON object, got %s", jsonTokenName(tok))
+	},
+	wrap: func(err error) error {
+		return fmt.Errorf("invalid version spec: %w", err)
+	},
+	duplicate: func(obj, field, first, _ string) error {
+		return fmt.Errorf("%w: %s field %q (also written %q)", ErrDuplicateField, obj, field, first)
+	},
+	trailing: versionTrailingData,
+}
+
 // validateSpecStructure proves raw contains exactly one JSON object with
 // no repeated fields anywhere in it, and nothing but whitespace around
 // it. Keys are matched case-insensitively against the known fields of
@@ -124,208 +155,26 @@ var ErrTrailingData = errors.New("unexpected trailing data after version spec")
 // point at the same field and cannot both appear. Escaped key spellings
 // are decoded before comparison, so "severity" cannot evade it.
 func validateSpecStructure(raw []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	first, err := dec.Token()
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return errors.New("version spec must be a JSON object, got empty input")
-		}
-		return fmt.Errorf("invalid version spec: %w", err)
-	}
-	if first != json.Delim('{') {
-		if first == nil {
-			return errors.New("version spec must be a JSON object, got null")
-		}
-		if d, ok := first.(json.Delim); ok && d == '[' {
-			return errors.New("version spec must be a single JSON object, got array")
-		}
-		return fmt.Errorf("version spec must be a single JSON object, got %s", jsonTokenName(first))
-	}
-	if err := scanObject(dec, versionFields, "version spec"); err != nil {
-		return err
-	}
-	// Inspect the raw remainder instead of decoding another token: the
-	// only legal content after the object is JSON whitespace, and this
-	// names an unmatched '}' or ']' directly rather than as a syntax error.
-	rest := bytes.TrimLeft(raw[dec.InputOffset():], " \t\n\r")
+	return scanJSONObject(raw, versionScanPolicy)
+}
+
+// versionTrailingData names the first non-whitespace byte after the
+// closed object, so an unmatched '}' or ']' is reported directly rather
+// than as a syntax error; only whitespace may follow the object.
+func versionTrailingData(raw []byte, offset int) error {
+	rest := bytes.TrimLeft(raw[offset:], " \t\n\r")
 	if len(rest) > 0 {
 		return fmt.Errorf("%w: %s after closing object", ErrTrailingData, trailingTokenName(rest[0]))
 	}
 	return nil
 }
 
-func trailingTokenName(b byte) string {
-	switch b {
-	case '{':
-		return "object"
-	case '[':
-		return "array"
-	case '}':
-		return "extra closing brace '}'"
-	case ']':
-		return "extra closing bracket ']'"
-	case '"':
-		return "string"
-	case 't', 'f':
-		return "boolean"
-	case 'n':
-		return "null"
-	default:
-		if (b >= '0' && b <= '9') || b == '-' {
-			return "number"
-		}
-		return fmt.Sprintf("unexpected character %q", rune(b))
-	}
-}
-
-// scanObject consumes one open object (its opening brace already read)
-// and checks its keys against known. obj names the object for duplicate
-// error messages. Nested "rules", "sandwich" and "displacement" objects
-// are scanned with their own field tables; any other nested container is
-// skipped without duplicate checking.
-func scanObject(dec *json.Decoder, known map[string]string, obj string) error {
-	seen := make(map[string]string, len(known))
-	spellings := make(map[string]string)
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return fmt.Errorf("invalid version spec: %w", err)
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("invalid version spec: object key is %s, want string", jsonTokenName(keyTok))
-		}
-		// Exact repeat of a decoded key name (any field, known or unknown)
-		// is a duplicate; escapes are decoded first, so "id" == "id".
-		if first, dup := spellings[key]; dup {
-			return fmt.Errorf("%w: %s field %q (also written %q)", ErrDuplicateField, obj, key, first)
-		}
-		spellings[key] = key
-		target, knownKey := known[strings.ToLower(key)]
-		if knownKey {
-			// A case-only spelling of the same known field is the same
-			// field: "Severity" and "severity" cannot share one object.
-			if first, dup := seen[target]; dup {
-				return fmt.Errorf("%w: %s field %q (also written %q)", ErrDuplicateField, obj, target, first)
-			}
-			seen[target] = key
-		}
-		start, err := dec.Token()
-		if err != nil {
-			return fmt.Errorf("invalid version spec: %w", err)
-		}
-		if d, isDelim := start.(json.Delim); isDelim {
-			switch d {
-			case '{':
-				nested, hasShape := nestedObjectTables[target]
-				if !knownKey || !hasShape {
-					if err := skipValue(dec, '{'); err != nil {
-						return err
-					}
-					continue
-				}
-				if err := scanObject(dec, nested.fields, nested.label); err != nil {
-					return err
-				}
-			case '[':
-				if err := skipValue(dec, '['); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-	}
-	closeTok, err := dec.Token()
-	if err != nil {
-		return fmt.Errorf("invalid version spec: %w", err)
-	}
-	if closeTok != json.Delim('}') {
-		return fmt.Errorf("invalid version spec: expected closing brace, got %s", jsonTokenName(closeTok))
-	}
-	return nil
-}
-
-// skipValue consumes the remainder of one container whose opening
-// delimiter has already been read, balancing nested brackets.
-func skipValue(dec *json.Decoder, open json.Delim) error {
-	depth := 1
-	for depth > 0 {
-		tok, err := dec.Token()
-		if err != nil {
-			return fmt.Errorf("invalid version spec: %w", err)
-		}
-		if d, ok := tok.(json.Delim); ok {
-			switch d {
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-				if depth == 0 && d != openBracketClose(open) {
-					return fmt.Errorf("invalid version spec: mismatched closing %s", jsonTokenName(d))
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func openBracketClose(open json.Delim) json.Delim {
-	if open == '[' {
-		return ']'
-	}
-	return '}'
-}
-
-func jsonTokenName(tok json.Token) string {
-	switch t := tok.(type) {
-	case json.Delim:
-		switch t {
-		case '[':
-			return "array"
-		case '{':
-			return "object"
-		case ']':
-			return "extra closing bracket ']'"
-		case '}':
-			return "extra closing brace '}'"
-		}
-	case nil:
-		return "null"
-	case bool:
-		return "boolean"
-	case string:
-		return "string"
-	case json.Number:
-		return "number"
-	case float64:
-		return "number"
-	case int64:
-		return "number"
-	}
-	return "value"
-}
-
-// fieldTable maps the case-insensitive spellings of a struct object's
-// JSON fields to their canonical names.
-func fieldTable(fields ...string) map[string]string {
-	table := make(map[string]string, len(fields))
-	for _, f := range fields {
-		table[strings.ToLower(f)] = f
-	}
-	return table
-}
-
-type nestedObjectSpec struct {
-	fields map[string]string
-	label  string
-}
-
 var (
-	versionFields      = fieldTable("id", "rules")
-	rulesFields        = fieldTable("sandwich", "displacement")
-	sandwichFields     = fieldTable("enabled", "severity")
-	displacementFields = fieldTable("enabled", "severity", "multiplier")
-	nestedObjectTables = map[string]nestedObjectSpec{
+	versionFields       = fieldTable("id", "rules")
+	rulesFields         = fieldTable("sandwich", "displacement")
+	sandwichFields      = fieldTable("enabled", "severity")
+	displacementFields  = fieldTable("enabled", "severity", "multiplier")
+	versionNestedTables = map[string]nestedObjectSpec{
 		"rules":        {rulesFields, "rules object"},
 		"sandwich":     {sandwichFields, "rules.sandwich"},
 		"displacement": {displacementFields, "rules.displacement"},

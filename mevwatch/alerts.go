@@ -149,21 +149,28 @@ func nonEmpty(field string, v *string) (string, error) {
 // declare, in the struct's JSON spelling.
 var suppressionFields = []string{"id", "chainId", "pool", "kind", "channel", "startHeight", "endHeight", "reason"}
 
-// canonicalSuppressionField resolves an unescaped object key to a known
-// field name. Like the JSON decoder itself, a key that differs only in
-// case still names the same field.
-func canonicalSuppressionField(key string) (string, bool) {
-	for _, f := range suppressionFields {
-		if f == key {
-			return f, true
-		}
-	}
-	for _, f := range suppressionFields {
-		if strings.EqualFold(f, key) {
-			return f, true
-		}
-	}
-	return "", false
+// suppressionScanPolicy validates the shape of a suppression document with
+// the shared scanner. Unlike the version document, a suppression document
+// is flat: nested values carry no field table of their own, and only known
+// fields take part in duplicate detection (an unknown key is left for the
+// typed decoder to reject).
+var suppressionScanPolicy = specPolicy{
+	topObject:          "suppression spec",
+	known:              fieldTable(suppressionFields...),
+	rejectExactUnknown: false,
+	firstTokenError: func(err error) error {
+		return fmt.Errorf("invalid suppression spec: %w", err)
+	},
+	nonObject: func(json.Token) error {
+		return errors.New("invalid suppression spec: expected a single JSON object")
+	},
+	wrap: func(err error) error {
+		return fmt.Errorf("invalid suppression spec: %w", err)
+	},
+	duplicate: func(_ string, canonical, first, spelling string) error {
+		return fmt.Errorf("invalid suppression spec: duplicate field %q (declared as %q and %q)", canonical, first, spelling)
+	},
+	trailing: suppressionTrailingData,
 }
 
 // validateSuppressionDocument checks the raw registration input
@@ -177,35 +184,15 @@ func canonicalSuppressionField(key string) (string, bool) {
 // including ones differing only in case, like channel and CHANNEL — count
 // as one duplicate declaration even when both carry the same value.
 func validateSuppressionDocument(raw []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	tok, err := dec.Token()
-	if err != nil {
-		return fmt.Errorf("invalid suppression spec: %w", err)
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return errors.New("invalid suppression spec: expected a single JSON object")
-	}
-	seen := make(map[string]string, len(suppressionFields))
-	for dec.More() {
-		kt, err := dec.Token()
-		if err != nil {
-			return fmt.Errorf("invalid suppression spec: %w", err)
-		}
-		key := kt.(string)
-		if canonical, known := canonicalSuppressionField(key); known {
-			if first, dup := seen[canonical]; dup {
-				return fmt.Errorf("invalid suppression spec: duplicate field %q (declared as %q and %q)", canonical, first, key)
-			}
-			seen[canonical] = key
-		}
-		var value json.RawMessage
-		if err := dec.Decode(&value); err != nil {
-			return fmt.Errorf("invalid suppression spec: %w", err)
-		}
-	}
-	if _, err := dec.Token(); err != nil { // the closing brace
-		return fmt.Errorf("invalid suppression spec: %w", err)
-	}
+	return scanJSONObject(raw, suppressionScanPolicy)
+}
+
+// suppressionTrailingData mirrors decoding one more value after the
+// object: the only legal remainder is whitespace, which reports io.EOF;
+// a second value or an unmatched bracket yields any other error and is
+// trailing data.
+func suppressionTrailingData(raw []byte, offset int) error {
+	dec := json.NewDecoder(bytes.NewReader(raw[offset:]))
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); err != io.EOF {
 		return errors.New("invalid suppression spec: unexpected trailing data")
