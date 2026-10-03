@@ -510,3 +510,141 @@ func TestKVRoundTripRejectsBadFieldTypes(t *testing.T) {
 		}
 	}
 }
+
+// TestKVRoundTripLayerPresenceIndependent 验证两层的字段出现性互不从属推断：
+// 只有最终层带应用字段时，逐条结果不得补出应用字段；反之亦然。
+func TestKVRoundTripLayerPresenceIndependent(t *testing.T) {
+	cases := []struct {
+		name      string
+		data      string
+		wantPer   bool // 逐条结果是否应携带应用字段
+		wantFinal bool // 最终层是否应携带应用字段
+	}{
+		{
+			name: "final only",
+			data: `{"results":[{"accepted":true,"reason":"ok","term":1,"committedIndex":0}],` +
+				`"finalTerm":1,"finalCommittedIndex":0,"finalLog":[],` +
+				`"finalAppliedIndex":0,"finalKV":{},"finalApplyError":null}`,
+			wantPer:   false,
+			wantFinal: true,
+		},
+		{
+			name: "per result only",
+			data: `{"results":[{"accepted":true,"reason":"ok","term":1,"committedIndex":0,` +
+				`"appliedIndex":0,"applyError":null}],` +
+				`"finalTerm":1,"finalCommittedIndex":0,"finalLog":[]}`,
+			wantPer:   true,
+			wantFinal: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out ReplicateOutput
+			if err := json.Unmarshal([]byte(tc.data), &out); err != nil {
+				t.Fatal(err)
+			}
+			reencoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := string(reencoded)
+			// 逐条结果对象单独再编码一次，隔离检查该层字段。
+			perResult, err := json.Marshal(out.Results[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			perBody := string(perResult)
+			if tc.wantPer {
+				for _, fragment := range []string{`"appliedIndex":0`, `"applyError":null`} {
+					if !strings.Contains(perBody, fragment) {
+						t.Fatalf("per-result layer lost %q: %s", fragment, perBody)
+					}
+				}
+			} else {
+				for _, field := range []string{"appliedIndex", "applyError"} {
+					if strings.Contains(perBody, field) {
+						t.Fatalf("per-result layer must not infer %q: %s", field, perBody)
+					}
+				}
+			}
+			if tc.wantFinal {
+				for _, fragment := range []string{`"finalAppliedIndex":0`, `"finalKV":{}`, `"finalApplyError":null`} {
+					if !strings.Contains(body, fragment) {
+						t.Fatalf("final layer lost %q: %s", fragment, body)
+					}
+				}
+			} else {
+				for _, field := range []string{"finalAppliedIndex", "finalKV", "finalApplyError"} {
+					if strings.Contains(body, field) {
+						t.Fatalf("final layer must not infer %q: %s", field, body)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestKVRoundTripPartialPresenceFillsLayer 验证每层只要出现任一应用字段，
+// 再次输出就补齐该层完整的一组字段（0 与 null 也要出现）。
+func TestKVRoundTripPartialPresenceFillsLayer(t *testing.T) {
+	t.Run("final partial", func(t *testing.T) {
+		data := `{"results":[],"finalTerm":1,"finalCommittedIndex":0,"finalLog":[],"finalKV":{}}`
+		var out ReplicateOutput
+		if err := json.Unmarshal([]byte(data), &out); err != nil {
+			t.Fatal(err)
+		}
+		bodyBytes, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(bodyBytes)
+		for _, fragment := range []string{`"finalAppliedIndex":0`, `"finalKV":{}`, `"finalApplyError":null`} {
+			if !strings.Contains(body, fragment) {
+				t.Fatalf("final layer must be completed, missing %q: %s", fragment, body)
+			}
+		}
+	})
+	t.Run("per result partial", func(t *testing.T) {
+		data := `{"accepted":true,"reason":"ok","term":1,"committedIndex":0,"applyError":{"index":2,"reason":"x"}}`
+		var result AppendResult
+		if err := json.Unmarshal([]byte(data), &result); err != nil {
+			t.Fatal(err)
+		}
+		bodyBytes, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(bodyBytes)
+		if !strings.Contains(body, `"appliedIndex":0`) || !strings.Contains(body, `"applyError":{"index":2,"reason":"x"}`) {
+			t.Fatalf("per-result layer must be completed: %s", body)
+		}
+	})
+}
+
+// TestKVAppendResultReuseObjectLeavesNoResidue 验证逐条结果对象复用读入时，
+// 后一份未启用结果完整替换前一份启用结果。
+func TestKVAppendResultReuseObjectLeavesNoResidue(t *testing.T) {
+	var result AppendResult
+	enabled := `{"accepted":true,"reason":"ok","term":2,"committedIndex":1,` +
+		`"appliedIndex":1,"applyError":{"index":2,"reason":"boom"}}`
+	disabled := `{"accepted":false,"reason":"stale term","term":3,"committedIndex":1}`
+	if err := json.Unmarshal([]byte(enabled), &result); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(disabled), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.AppliedIndex != nil || result.ApplyError != nil {
+		t.Fatalf("stale apply state in reused result: %+v", result)
+	}
+	bodyBytes, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(bodyBytes)
+	for _, field := range []string{"appliedIndex", "applyError"} {
+		if strings.Contains(body, field) {
+			t.Fatalf("stale apply field %q in reused result: %s", field, body)
+		}
+	}
+}
