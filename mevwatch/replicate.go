@@ -3,7 +3,6 @@
 package mevwatch
 
 import (
-	"encoding/json"
 	"fmt"
 )
 
@@ -56,62 +55,8 @@ type AppendResult struct {
 	ApplyError   *ApplyError `json:"applyError,omitempty"`
 	// applyFields 为 true 时 JSON 输出总是带上 appliedIndex 与 applyError
 	// （无错误时 applyError 为 null）；为 false 时两个字段完全不出现。
+	// 编解码规则见 applyfields.go。
 	applyFields bool
-}
-
-// MarshalJSON 在未启用键值应用时保持原有输出形状；启用时强制输出
-// appliedIndex 与 applyError（错误为空输出 null）。
-func (r AppendResult) MarshalJSON() ([]byte, error) {
-	type alias AppendResult
-	if !r.applyFields {
-		return json.Marshal(alias(r))
-	}
-	applied := 0
-	if r.AppliedIndex != nil {
-		applied = *r.AppliedIndex
-	}
-	return json.Marshal(struct {
-		alias
-		AppliedIndex int         `json:"appliedIndex"`
-		ApplyError   *ApplyError `json:"applyError"`
-	}{
-		alias:        alias(r),
-		AppliedIndex: applied,
-		ApplyError:   r.ApplyError,
-	})
-}
-
-// UnmarshalJSON 读取结果时按 JSON 中是否出现应用字段恢复 applyFields：
-// 出现 appliedIndex 或 applyError 时视为启用键值应用的结果，再次编码会原样
-// 保留这些字段（含 0、null）；未出现时按未启用处理，且整个对象被完整替换，
-// 不会残留上一次读入的应用状态。字段类型错误照常返回解码错误。
-func (r *AppendResult) UnmarshalJSON(data []byte) error {
-	type alias AppendResult
-	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	present, err := jsonHasAnyKey(data, "appliedIndex", "applyError")
-	if err != nil {
-		return err
-	}
-	*r = AppendResult(decoded)
-	r.applyFields = present
-	return nil
-}
-
-// jsonHasAnyKey 报告 JSON 对象中是否出现任一给定键。
-func jsonHasAnyKey(data []byte, keys ...string) (bool, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return false, err
-	}
-	for _, key := range keys {
-		if _, ok := raw[key]; ok {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // ReplicateOutput 是整次调用的结果。
@@ -129,56 +74,8 @@ type ReplicateOutput struct {
 	FinalAppliedIndex *int              `json:"finalAppliedIndex,omitempty"`
 	FinalKV           map[string]string `json:"finalKV,omitempty"`
 	FinalApplyError   *ApplyError       `json:"finalApplyError,omitempty"`
-	// applyFields 含义同 AppendResult.applyFields。
+	// applyFields 含义同 AppendResult.applyFields，编解码规则见 applyfields.go。
 	applyFields bool
-}
-
-// MarshalJSON 在未启用键值应用时保持原有输出形状；启用时强制输出
-// finalAppliedIndex、finalKV（空表为 {}）与 finalApplyError（无错误为 null）。
-func (o ReplicateOutput) MarshalJSON() ([]byte, error) {
-	type alias ReplicateOutput
-	if !o.applyFields {
-		return json.Marshal(alias(o))
-	}
-	applied := 0
-	if o.FinalAppliedIndex != nil {
-		applied = *o.FinalAppliedIndex
-	}
-	kv := o.FinalKV
-	if kv == nil {
-		kv = map[string]string{}
-	}
-	return json.Marshal(struct {
-		alias
-		FinalAppliedIndex int               `json:"finalAppliedIndex"`
-		FinalKV           map[string]string `json:"finalKV"`
-		FinalApplyError   *ApplyError       `json:"finalApplyError"`
-	}{
-		alias:             alias(o),
-		FinalAppliedIndex: applied,
-		FinalKV:           kv,
-		FinalApplyError:   o.FinalApplyError,
-	})
-}
-
-// UnmarshalJSON 读取结果时按 JSON 中是否出现最终应用字段恢复 applyFields，
-// 语义同 AppendResult.UnmarshalJSON：出现时再次编码保留 finalAppliedIndex、
-// finalKV（空表为 {}）与 finalApplyError（无错误为 null）；未出现时整个对象
-// 被完整替换，不残留上一次读入的键值表、错误或应用位置。Results 中每条请求
-// 结果由 AppendResult.UnmarshalJSON 各自恢复。字段类型错误照常返回解码错误。
-func (o *ReplicateOutput) UnmarshalJSON(data []byte) error {
-	type alias ReplicateOutput
-	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	present, err := jsonHasAnyKey(data, "finalAppliedIndex", "finalKV", "finalApplyError")
-	if err != nil {
-		return err
-	}
-	*o = ReplicateOutput(decoded)
-	o.applyFields = present
-	return nil
 }
 
 // 拒绝原因（稳定标识符，帮助文档中有说明）。
@@ -241,10 +138,7 @@ func ReplicateWithOptions(initial InitialState, requests []AppendRequest, opts R
 			// 每条请求处理结束后，只应用新提交且尚未应用的日志；应用失败
 			// 不改变复制的接受与否、提交位置或拒绝原因。
 			applier.applyUpTo(state.log, state.committedIndex)
-			applied := applier.appliedIndex
-			result.AppliedIndex = &applied
-			result.ApplyError = applier.err
-			result.applyFields = true
+			result.setApplyFields(applier.appliedIndex, applier.err)
 		}
 		results = append(results, result)
 	}
@@ -259,11 +153,7 @@ func ReplicateWithOptions(initial InitialState, requests []AppendRequest, opts R
 		FinalLog:            finalLog,
 	}
 	if applier != nil {
-		applied := applier.appliedIndex
-		output.FinalAppliedIndex = &applied
-		output.FinalKV = applier.kv
-		output.FinalApplyError = applier.err
-		output.applyFields = true
+		output.setApplyFields(applier.appliedIndex, applier.kv, applier.err)
 	}
 	return output, nil
 }
