@@ -2,9 +2,44 @@
 package mevwatch
 
 import (
+	"math"
 	"sort"
 	"strconv"
 )
+
+// gasDominates reports whether front strictly exceeds victim*multiplier,
+// staying correct when victim is zero or near math.MaxInt64.
+func gasDominates(front, victim int64, multiplier int64) bool {
+	return victim <= math.MaxInt64/multiplier && front > victim*multiplier
+}
+
+// judgeVictim is the single product logic behind both single-transaction
+// detection (Detect) and whole-block replay (DetectBlockWithRules): given
+// one victim swap and its adjacent neighbours inside its own pool (already
+// ordered by Index), it decides whether the victim is sandwiched or
+// displaced under the given rules.
+//
+// A sandwich requires the same trader on both sides, different from the
+// victim's trader, with both GasPrices strictly above the victim's; an
+// enabled sandwich hit is the victim's only conclusion. Otherwise the
+// displacement rule hits when the previous swap's GasPrice strictly exceeds
+// Multiplier times the victim's — exactly equal does not hit, a zero victim
+// GasPrice is dominated by any positive previous value, and values near
+// math.MaxInt64 still compare correctly. A victim without a previous swap
+// in its pool has no conclusion; the pool's last swap can still be
+// displaced. With both rules off nothing hits.
+func judgeVictim(front, back *Swap, victim Swap, rules RuleSet) (kind string, severity int, hit bool) {
+	if rules.Sandwich.Enabled && front != nil && back != nil &&
+		front.Trader == back.Trader && front.Trader != victim.Trader &&
+		front.GasPrice > victim.GasPrice && back.GasPrice > victim.GasPrice {
+		return SuppressSandwich, rules.Sandwich.Severity, true
+	}
+	if rules.Displacement.Enabled && front != nil &&
+		gasDominates(front.GasPrice, victim.GasPrice, int64(rules.Displacement.Multiplier)) {
+		return SuppressDisplacement, rules.Displacement.Severity, true
+	}
+	return "", 0, false
+}
 
 // Swap is one observed swap in a pending or confirmed transaction.
 type Swap struct {
@@ -26,16 +61,16 @@ type Finding struct {
 }
 
 // Detect flags sandwich and displacement patterns around one victim swap.
-// It applies the built-in block rules to one transaction, so its conclusion
-// matches DetectBlock for the same records: neighbours are the adjacent
-// swaps inside the victim's own pool ordered by Index, never swaps from
-// other pools and never positions in the input slice. Reordering the input
-// or interleaving other pools therefore cannot change the result. The
-// victim's pool's last swap is still checked for displacement against its
-// predecessor; a victim that is absent or first in its pool has no
-// conclusion. The passed slice is never modified.
+// It always applies the built-in rule version (sandwich severity 3,
+// displacement severity 2 with multiplier 2) through the same judgment the
+// block replay uses, so its conclusion matches DetectBlock for the same
+// records: neighbours are the adjacent swaps inside the victim's own pool
+// ordered by Index, never swaps from other pools and never positions in the
+// input slice. Reordering the input or interleaving other pools therefore
+// cannot change the result. The victim's pool's last swap is still checked
+// for displacement against its predecessor; a victim that is absent or
+// first in its pool has no conclusion. The passed slice is never modified.
 func Detect(swaps []Swap, victim string) []Finding {
-	rules := BuiltinVersion().Rules
 	target, ok := findSwap(swaps, victim)
 	if !ok {
 		return nil
@@ -66,11 +101,13 @@ func Detect(swaps []Swap, victim string) []Finding {
 	if pos+1 < len(pool) {
 		back = &pool[pos+1]
 	}
-	if back != nil &&
-		front.Trader == back.Trader && front.Trader != target.Trader &&
-		front.GasPrice > target.GasPrice && back.GasPrice > target.GasPrice {
+	kind, severity, hit := judgeVictim(&front, back, target, BuiltinVersion().Rules)
+	if !hit {
+		return nil
+	}
+	if kind == SuppressSandwich {
 		return []Finding{{
-			TxHash: victim, Kind: "sandwich", Severity: rules.Sandwich.Severity,
+			TxHash: victim, Kind: kind, Severity: severity,
 			Evidence: []string{
 				"front-run by " + front.Trader + " at gas " + strconv.FormatInt(front.GasPrice, 10),
 				"back-run by " + back.Trader + " at gas " + strconv.FormatInt(back.GasPrice, 10),
@@ -78,11 +115,8 @@ func Detect(swaps []Swap, victim string) []Finding {
 			},
 		}}
 	}
-	if gasDominates(front.GasPrice, target.GasPrice, int64(rules.Displacement.Multiplier)) {
-		return []Finding{{TxHash: victim, Kind: "displacement", Severity: rules.Displacement.Severity,
-			Evidence: []string{"front gas dominates victim by more than 2x"}}}
-	}
-	return nil
+	return []Finding{{TxHash: victim, Kind: kind, Severity: severity,
+		Evidence: []string{"front gas dominates victim by more than 2x"}}}
 }
 
 // findSwap returns the record whose TxHash equals hash. TxHash is unique
