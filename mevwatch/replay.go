@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -155,12 +154,6 @@ func sameContent(blockNumber int64, swaps []Swap, b Block) bool {
 	return blockNumber == b.BlockNumber && swapsEqual(swaps, b.Swaps)
 }
 
-// gasDominates reports whether front strictly exceeds victim*multiplier,
-// staying correct when victim is zero or near math.MaxInt64.
-func gasDominates(front, victim int64, multiplier int64) bool {
-	return victim <= math.MaxInt64/multiplier && front > victim*multiplier
-}
-
 // DetectBlock checks every swap against its adjacent neighbours within its
 // pool under the built-in rules. See DetectBlockWithRules.
 func DetectBlock(swaps []Swap) []ReportFinding {
@@ -168,13 +161,15 @@ func DetectBlock(swaps []Swap) []ReportFinding {
 }
 
 // DetectBlockWithRules checks every swap against its adjacent neighbours
-// within its pool: a sandwich when the same trader brackets the victim with
-// higher gas on both sides, otherwise a displacement when the previous
-// swap's gas strictly exceeds the configured multiple of the victim's. The
-// last swap of a pool is checked too. An enabled sandwich takes priority
-// over displacement for the same victim; with the sandwich rule off the
-// victim can still be flagged for displacement. With both rules off the
-// result is an empty slice.
+// within its pool under the given rule version: a sandwich when the same
+// trader brackets the victim with higher gas on both sides, otherwise a
+// displacement when the previous swap's gas strictly exceeds the configured
+// multiple of the victim's. The last swap of a pool is checked too. An
+// enabled sandwich takes priority over displacement for the same victim;
+// with the sandwich rule off the victim can still be flagged for
+// displacement. With both rules off the result is an empty slice. The
+// judgment itself is shared with Detect; this entry only adds the block
+// report's raw-swap evidence and ordering.
 func DetectBlockWithRules(swaps []Swap, rules RuleSet) []ReportFinding {
 	pools := make(map[string][]Swap)
 	for _, s := range swaps {
@@ -191,22 +186,20 @@ func DetectBlockWithRules(swaps []Swap, rules RuleSet) []ReportFinding {
 			if i+1 < len(pool) {
 				back = &pool[i+1]
 			}
-			if rules.Sandwich.Enabled && front != nil && back != nil &&
-				front.Trader == back.Trader && front.Trader != victim.Trader &&
-				front.GasPrice > victim.GasPrice && back.GasPrice > victim.GasPrice {
-				findings = append(findings, ReportFinding{
-					Kind: "sandwich", Severity: rules.Sandwich.Severity, TxHash: victim.TxHash,
-					Evidence: []Swap{*front, victim, *back},
-				})
+			j, hit := judgeVictim(front, victim, back, rules)
+			if !hit {
 				continue
 			}
-			if rules.Displacement.Enabled && front != nil &&
-				gasDominates(front.GasPrice, victim.GasPrice, int64(rules.Displacement.Multiplier)) {
-				findings = append(findings, ReportFinding{
-					Kind: "displacement", Severity: rules.Displacement.Severity, TxHash: victim.TxHash,
-					Evidence: []Swap{*front, victim},
-				})
+			// The evidence keeps the full swap fields of every record that
+			// participated: front, victim, and for a sandwich also back.
+			evidence := []Swap{*front, victim}
+			if j.kind == "sandwich" {
+				evidence = append(evidence, *back)
 			}
+			findings = append(findings, ReportFinding{
+				Kind: j.kind, Severity: j.severity, TxHash: victim.TxHash,
+				Evidence: evidence,
+			})
 		}
 	}
 	sort.Slice(findings, func(i, j int) bool {

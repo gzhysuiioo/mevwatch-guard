@@ -35,20 +35,14 @@ type Finding struct {
 // predecessor; a victim that is absent or first in its pool has no
 // conclusion. The passed slice is never modified.
 func Detect(swaps []Swap, victim string) []Finding {
+	// Single-transaction detection always runs the built-in version:
+	// sandwich severity 3, displacement severity 2 with multiplier 2.
 	rules := BuiltinVersion().Rules
 	target, ok := findSwap(swaps, victim)
 	if !ok {
 		return nil
 	}
-	// Collect the victim's pool into a private slice before sorting, so the
-	// caller's records and their order stay untouched.
-	pool := make([]Swap, 0, len(swaps))
-	for _, s := range swaps {
-		if s.Pool == target.Pool {
-			pool = append(pool, s)
-		}
-	}
-	sort.Slice(pool, func(i, j int) bool { return pool[i].Index < pool[j].Index })
+	pool := poolSwaps(swaps, target.Pool)
 	pos := -1
 	for i, s := range pool {
 		if s.TxHash == victim {
@@ -56,21 +50,20 @@ func Detect(swaps []Swap, victim string) []Finding {
 			break
 		}
 	}
-	if pos <= 0 {
-		// No preceding swap in the victim's pool: no neighbour can be
-		// evidence, regardless of other pools' gas prices.
-		return nil
+	var front, back *Swap
+	if pos > 0 {
+		front = &pool[pos-1]
 	}
-	front := pool[pos-1]
-	var back *Swap
-	if pos+1 < len(pool) {
+	if pos >= 0 && pos+1 < len(pool) {
 		back = &pool[pos+1]
 	}
-	if back != nil &&
-		front.Trader == back.Trader && front.Trader != target.Trader &&
-		front.GasPrice > target.GasPrice && back.GasPrice > target.GasPrice {
+	j, hit := judgeVictim(front, target, back, rules)
+	if !hit {
+		return nil
+	}
+	if j.kind == "sandwich" {
 		return []Finding{{
-			TxHash: victim, Kind: "sandwich", Severity: rules.Sandwich.Severity,
+			TxHash: victim, Kind: j.kind, Severity: j.severity,
 			Evidence: []string{
 				"front-run by " + front.Trader + " at gas " + strconv.FormatInt(front.GasPrice, 10),
 				"back-run by " + back.Trader + " at gas " + strconv.FormatInt(back.GasPrice, 10),
@@ -78,11 +71,8 @@ func Detect(swaps []Swap, victim string) []Finding {
 			},
 		}}
 	}
-	if gasDominates(front.GasPrice, target.GasPrice, int64(rules.Displacement.Multiplier)) {
-		return []Finding{{TxHash: victim, Kind: "displacement", Severity: rules.Displacement.Severity,
-			Evidence: []string{"front gas dominates victim by more than 2x"}}}
-	}
-	return nil
+	return []Finding{{TxHash: victim, Kind: j.kind, Severity: j.severity,
+		Evidence: []string{"front gas dominates victim by more than 2x"}}}
 }
 
 // findSwap returns the record whose TxHash equals hash. TxHash is unique
