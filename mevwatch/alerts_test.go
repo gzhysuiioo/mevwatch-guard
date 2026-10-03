@@ -572,6 +572,118 @@ func TestParseSuppressionValidation(t *testing.T) {
 	}
 }
 
+func TestParseSuppressionSingleCompleteObject(t *testing.T) {
+	good := `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r"}`
+	// Leading/trailing spaces, newlines and tabs are fine.
+	if _, err := ParseSuppression([]byte(" \n\t" + good + "\t\n ")); err != nil {
+		t.Fatalf("whitespace-padded spec rejected: %v", err)
+	}
+	bad := []struct {
+		name string
+		spec string
+	}{
+		{"empty", ``},
+		{"whitespace only", "  \n\t "},
+		{"array", `[]`},
+		{"array of object", `[` + good + `]`},
+		{"null", `null`},
+		{"scalar", `7`},
+		{"string", `"x"`},
+		{"incomplete object", `{"id":"s","chainId":"1"`},
+		{"extra closing brace", good + `}`},
+		{"extra closing bracket", good + `]`},
+		{"second object", good + ` ` + good},
+		{"trailing value", good + ` 7`},
+		{"trailing null", good + ` null`},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseSuppression([]byte(tc.spec)); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestParseSuppressionDuplicateFields(t *testing.T) {
+	base := func(extra ...string) string {
+		fields := []string{
+			`"id":"s"`, `"chainId":"1"`, `"pool":"p"`, `"kind":"sandwich"`,
+			`"channel":"c"`, `"startHeight":1`, `"endHeight":2`, `"reason":"r"`,
+		}
+		return "{" + strings.Join(append(fields, extra...), ",") + "}"
+	}
+	bad := []struct {
+		name string
+		spec string
+		want string
+	}{
+		{"same field twice", base(`"channel":"c"`, `"channel":"c2"`), "channel"},
+		{"same field same value", base(`"channel":"c"`, `"channel":"c"`), "channel"},
+		{"case variant", base(`"channel":"ops"`, `"CHANNEL":"audit"`), "channel"},
+		{"escaped name", base(`"pool":"p"`, `"poo\u006c":"p2"`), "pool"},
+		{"unicode-escaped name", base(`"kind":"sandwich"`, `"k\u0069nd":"displacement"`), "kind"},
+		{"duplicate height", base(`"startHeight":1`, `"startHeight":5`), "startHeight"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseSuppression([]byte(tc.spec))
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not name the duplicate field %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "trailing") {
+				t.Fatalf("duplicate reported as trailing data: %q", err)
+			}
+		})
+	}
+	// A single case-variant declaration stays legal and is stored verbatim.
+	s, err := ParseSuppression([]byte(`{"id":"s","chainId":"1","pool":"p","kind":"sandwich","CHANNEL":" Ops ","startHeight":1,"endHeight":2,"reason":"r"}`))
+	if err != nil {
+		t.Fatalf("case-variant field name rejected: %v", err)
+	}
+	if s.Channel != " Ops " {
+		t.Fatalf("channel value not stored verbatim: %q", s.Channel)
+	}
+}
+
+func TestRegisterSuppressionRejectsInvalidSpecWithoutTouchingArchive(t *testing.T) {
+	dir := t.TempDir()
+	spec := `{"id":"s","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":1,"endHeight":2,"reason":"r"}`
+	if _, created, err := RegisterSuppression(dir, []byte(spec)); err != nil || !created {
+		t.Fatalf("first register: created=%v err=%v", created, err)
+	}
+	// An invalid document reusing a registered id must be rejected as a bad
+	// spec, never as a conflict and never as a successful retry.
+	invalid := []string{
+		`{"id":"s","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":1,"endHeight":2,"reason":"r"}}`,
+		`{"id":"s","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":1,"endHeight":2,"reason":"r","reason":"r"}`,
+		`{"id":"s","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":1,"endHeight":2,"reason":"r","REASON":"r"}`,
+	}
+	for _, doc := range invalid {
+		_, created, err := RegisterSuppression(dir, []byte(doc))
+		if err == nil {
+			t.Fatalf("invalid spec %s registered (created=%v)", doc, created)
+		}
+		if errors.Is(err, ErrSuppressionConflict) {
+			t.Fatalf("invalid spec %s reported as conflict: %v", doc, err)
+		}
+	}
+	listed, err := ListSuppressions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != "s" || listed[0].Revoked {
+		t.Fatalf("failed registrations mutated the archive: %+v", listed)
+	}
+	// The identical valid retry still succeeds without adding anything.
+	if _, created, err := RegisterSuppression(dir, []byte(spec)); err != nil || created {
+		t.Fatalf("identical retry: created=%v err=%v", created, err)
+	}
+}
+
 func TestRegisterSuppressionIdempotentAndConflict(t *testing.T) {
 	dir := t.TempDir()
 	spec := `{"id":"s","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":1,"endHeight":2,"reason":"r"}`
