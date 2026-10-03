@@ -81,6 +81,39 @@ func (r AppendResult) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// UnmarshalJSON 读取结果时按 JSON 中是否出现应用字段恢复 applyFields：
+// 出现 appliedIndex 或 applyError 时视为启用键值应用的结果，再次编码会原样
+// 保留这些字段（含 0、null）；未出现时按未启用处理，且整个对象被完整替换，
+// 不会残留上一次读入的应用状态。字段类型错误照常返回解码错误。
+func (r *AppendResult) UnmarshalJSON(data []byte) error {
+	type alias AppendResult
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	present, err := jsonHasAnyKey(data, "appliedIndex", "applyError")
+	if err != nil {
+		return err
+	}
+	*r = AppendResult(decoded)
+	r.applyFields = present
+	return nil
+}
+
+// jsonHasAnyKey 报告 JSON 对象中是否出现任一给定键。
+func jsonHasAnyKey(data []byte, keys ...string) (bool, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false, err
+	}
+	for _, key := range keys {
+		if _, ok := raw[key]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // ReplicateOutput 是整次调用的结果。
 type ReplicateOutput struct {
 	// Results 与输入请求一一对应。
@@ -126,6 +159,26 @@ func (o ReplicateOutput) MarshalJSON() ([]byte, error) {
 		FinalKV:           kv,
 		FinalApplyError:   o.FinalApplyError,
 	})
+}
+
+// UnmarshalJSON 读取结果时按 JSON 中是否出现最终应用字段恢复 applyFields，
+// 语义同 AppendResult.UnmarshalJSON：出现时再次编码保留 finalAppliedIndex、
+// finalKV（空表为 {}）与 finalApplyError（无错误为 null）；未出现时整个对象
+// 被完整替换，不残留上一次读入的键值表、错误或应用位置。Results 中每条请求
+// 结果由 AppendResult.UnmarshalJSON 各自恢复。字段类型错误照常返回解码错误。
+func (o *ReplicateOutput) UnmarshalJSON(data []byte) error {
+	type alias ReplicateOutput
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	present, err := jsonHasAnyKey(data, "finalAppliedIndex", "finalKV", "finalApplyError")
+	if err != nil {
+		return err
+	}
+	*o = ReplicateOutput(decoded)
+	o.applyFields = present
+	return nil
 }
 
 // 拒绝原因（稳定标识符，帮助文档中有说明）。

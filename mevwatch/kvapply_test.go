@@ -349,3 +349,164 @@ func TestKVDeterministic(t *testing.T) {
 		t.Fatalf("non-deterministic JSON:\n%s\n%s", encoded1, encoded2)
 	}
 }
+
+// roundTrip 把输出编码为 JSON 再解码、再编码，模拟调用方保存或转交结果。
+func roundTrip(t *testing.T, out ReplicateOutput) (ReplicateOutput, string) {
+	t.Helper()
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ReplicateOutput
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	reencoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decoded, string(reencoded)
+}
+
+func TestKVRoundTripPreservesApplyFields(t *testing.T) {
+	out := runKV(t, InitialState{CurrentTerm: 1},
+		AppendRequest{Term: 1, PrevLogIndex: 0, PrevLogTerm: 0, LeaderCommit: 0},
+	)
+	_, body := roundTrip(t, out)
+	// 应用位置 0、无错误 null、空键值表 {} 在读取再输出后都必须保留。
+	for _, fragment := range []string{
+		`"appliedIndex":0`, `"applyError":null`,
+		`"finalAppliedIndex":0`, `"finalKV":{}`, `"finalApplyError":null`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("round-tripped output lost %q: %s", fragment, body)
+		}
+	}
+}
+
+func TestKVRoundTripPreservesValuesAndError(t *testing.T) {
+	initial := InitialState{CurrentTerm: 1, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set ok=1"),
+	}}
+	out := runKV(t, initial,
+		AppendRequest{Term: 1, PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 3,
+			Entries: []LogEntry{entry(2, 1, "set bad"), entry(3, 1, "set later=3")}},
+	)
+	decoded, _ := roundTrip(t, out)
+	// 错误索引与原因、错误前已应用的键值内容、停住的应用位置原样保留。
+	if decoded.FinalApplyError == nil || decoded.FinalApplyError.Index != 2 ||
+		decoded.FinalApplyError.Reason != ApplyReasonSetMissingEquals {
+		t.Fatalf("finalApplyError = %+v, want index 2 missing '='", decoded.FinalApplyError)
+	}
+	if decoded.FinalAppliedIndex == nil || *decoded.FinalAppliedIndex != 1 {
+		t.Fatalf("finalAppliedIndex = %v, want 1", decoded.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(decoded.FinalKV, map[string]string{"ok": "1"}) {
+		t.Fatalf("finalKV = %v, want only entries applied before the error", decoded.FinalKV)
+	}
+	if decoded.Results[0].ApplyError == nil || decoded.Results[0].ApplyError.Index != 2 {
+		t.Fatalf("per-request applyError = %+v, want index 2", decoded.Results[0].ApplyError)
+	}
+	if decoded.Results[0].AppliedIndex == nil || *decoded.Results[0].AppliedIndex != 1 {
+		t.Fatalf("per-request appliedIndex = %v, want 1", decoded.Results[0].AppliedIndex)
+	}
+}
+
+func TestKVRoundTripWithoutRequestsKeepsFinalApplyState(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 2, Log: []LogEntry{
+		entry(1, 1, "set x=1"), entry(2, 2, "set y=2"),
+	}}
+	_, body := roundTrip(t, runKV(t, initial))
+	for _, fragment := range []string{
+		`"finalAppliedIndex":2`, `"finalKV":{"x":"1","y":"2"}`, `"finalApplyError":null`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("round-tripped output lost %q: %s", fragment, body)
+		}
+	}
+}
+
+func TestKVRoundTripDisabledAddsNoApplyFields(t *testing.T) {
+	out := run(t, InitialState{CurrentTerm: 1, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set x=1"),
+	}}, AppendRequest{Term: 1, PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 1})
+	_, body := roundTrip(t, out)
+	for _, field := range []string{"appliedIndex", "applyError", "finalAppliedIndex", "finalKV", "finalApplyError"} {
+		if strings.Contains(body, field) {
+			t.Fatalf("applyKV disabled: round-tripped output must not contain %q: %s", field, body)
+		}
+	}
+}
+
+func TestKVRoundTripReuseObjectLeavesNoResidue(t *testing.T) {
+	// 同一个结果对象先读启用应用的结果，再读未启用的：后一次输出不得残留
+	// 前一次的键值表、错误或应用位置。
+	enabled := runKV(t, InitialState{CurrentTerm: 1, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set x=1"),
+	}})
+	disabled := run(t, InitialState{CurrentTerm: 1, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set x=1"),
+	}})
+	enabledJSON, err := json.Marshal(enabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledJSON, err := json.Marshal(disabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ReplicateOutput
+	if err := json.Unmarshal(enabledJSON, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(disabledJSON, &out); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"appliedIndex", "applyError", "finalAppliedIndex", "finalKV", "finalApplyError"} {
+		if strings.Contains(string(body), field) {
+			t.Fatalf("stale apply field %q after reusing object: %s", field, body)
+		}
+	}
+	if out.FinalKV != nil || out.FinalAppliedIndex != nil || out.FinalApplyError != nil {
+		t.Fatalf("stale apply state in %+v", out)
+	}
+}
+
+func TestKVAppendResultRoundTripStandalone(t *testing.T) {
+	out := runKV(t, InitialState{CurrentTerm: 1},
+		AppendRequest{Term: 1, PrevLogIndex: 0, PrevLogTerm: 0, LeaderCommit: 0})
+	encoded, err := json.Marshal(out.Results[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded AppendResult
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	reencoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(reencoded)
+	if !strings.Contains(body, `"appliedIndex":0`) || !strings.Contains(body, `"applyError":null`) {
+		t.Fatalf("standalone result round trip lost apply fields: %s", body)
+	}
+}
+
+func TestKVRoundTripRejectsBadFieldTypes(t *testing.T) {
+	for _, data := range []string{
+		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"finalAppliedIndex":"0"}`,
+		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"finalKV":[]}`,
+		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"finalApplyError":{"index":"2","reason":"x"}}`,
+		`{"results":[{"accepted":true,"reason":"ok","term":1,"committedIndex":0,"appliedIndex":"0"}],"finalTerm":1,"finalCommittedIndex":0,"finalLog":[]}`,
+	} {
+		var out ReplicateOutput
+		if err := json.Unmarshal([]byte(data), &out); err == nil {
+			t.Fatalf("expected decode error for %s", data)
+		}
+	}
+}
