@@ -26,34 +26,74 @@ type Finding struct {
 }
 
 // Detect flags sandwich and displacement patterns around one victim swap.
+// It applies the built-in block rules to one transaction, so its conclusion
+// matches DetectBlock for the same records: neighbours are the adjacent
+// swaps inside the victim's own pool ordered by Index, never swaps from
+// other pools and never positions in the input slice. Reordering the input
+// or interleaving other pools therefore cannot change the result. The
+// victim's pool's last swap is still checked for displacement against its
+// predecessor; a victim that is absent or first in its pool has no
+// conclusion. The passed slice is never modified.
 func Detect(swaps []Swap, victim string) []Finding {
-	victimIndex := -1
-	for index, swap := range swaps {
-		if swap.TxHash == victim {
-			victimIndex = index
+	rules := BuiltinVersion().Rules
+	target, ok := findSwap(swaps, victim)
+	if !ok {
+		return nil
+	}
+	// Collect the victim's pool into a private slice before sorting, so the
+	// caller's records and their order stay untouched.
+	pool := make([]Swap, 0, len(swaps))
+	for _, s := range swaps {
+		if s.Pool == target.Pool {
+			pool = append(pool, s)
+		}
+	}
+	sort.Slice(pool, func(i, j int) bool { return pool[i].Index < pool[j].Index })
+	pos := -1
+	for i, s := range pool {
+		if s.TxHash == victim {
+			pos = i
 			break
 		}
 	}
-	if victimIndex <= 0 || victimIndex >= len(swaps)-1 {
+	if pos <= 0 {
+		// No preceding swap in the victim's pool: no neighbour can be
+		// evidence, regardless of other pools' gas prices.
 		return nil
 	}
-	front, back := swaps[victimIndex-1], swaps[victimIndex+1]
-	if front.Trader == back.Trader && front.Pool == back.Pool && front.Trader != swaps[victimIndex].Trader &&
-		front.GasPrice > swaps[victimIndex].GasPrice && back.GasPrice > swaps[victimIndex].GasPrice {
+	front := pool[pos-1]
+	var back *Swap
+	if pos+1 < len(pool) {
+		back = &pool[pos+1]
+	}
+	if back != nil &&
+		front.Trader == back.Trader && front.Trader != target.Trader &&
+		front.GasPrice > target.GasPrice && back.GasPrice > target.GasPrice {
 		return []Finding{{
-			TxHash: victim, Kind: "sandwich", Severity: 3,
+			TxHash: victim, Kind: "sandwich", Severity: rules.Sandwich.Severity,
 			Evidence: []string{
 				"front-run by " + front.Trader + " at gas " + strconv.FormatInt(front.GasPrice, 10),
 				"back-run by " + back.Trader + " at gas " + strconv.FormatInt(back.GasPrice, 10),
-				"victim gas " + strconv.FormatInt(swaps[victimIndex].GasPrice, 10),
+				"victim gas " + strconv.FormatInt(target.GasPrice, 10),
 			},
 		}}
 	}
-	if front.GasPrice > swaps[victimIndex].GasPrice*2 {
-		return []Finding{{TxHash: victim, Kind: "displacement", Severity: 2,
+	if gasDominates(front.GasPrice, target.GasPrice, int64(rules.Displacement.Multiplier)) {
+		return []Finding{{TxHash: victim, Kind: "displacement", Severity: rules.Displacement.Severity,
 			Evidence: []string{"front gas dominates victim by more than 2x"}}}
 	}
 	return nil
+}
+
+// findSwap returns the record whose TxHash equals hash. TxHash is unique
+// among the valid records replay accepts.
+func findSwap(swaps []Swap, hash string) (Swap, bool) {
+	for _, s := range swaps {
+		if s.TxHash == hash {
+			return s, true
+		}
+	}
+	return Swap{}, false
 }
 
 // Rank orders findings by severity then hash.
