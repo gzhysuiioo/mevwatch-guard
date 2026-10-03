@@ -81,6 +81,41 @@ func (r AppendResult) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// UnmarshalJSON 识别 appliedIndex / applyError 是否出现，并恢复内部的
+// applyFields 标记：只有字段确实出现过（无论值是否为 0 或 null），重新编码
+// 时才强制带上它们；未启用键值应用的结果解码后仍不输出这两个字段。
+// 整个对象被完整覆盖写，复用同一结果对象先后解码不同形状的数据时不会残留
+// 上一次的字段。字段类型错误按标准规则返回解码错误。
+func (r *AppendResult) UnmarshalJSON(data []byte) error {
+	type shadow struct {
+		Accepted       bool        `json:"accepted"`
+		Reason         string      `json:"reason"`
+		Term           int         `json:"term"`
+		CommittedIndex int         `json:"committedIndex"`
+		AppliedIndex   *int        `json:"appliedIndex"`
+		ApplyError     *ApplyError `json:"applyError"`
+	}
+	var s shadow
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	var probe struct {
+		AppliedIndex *json.RawMessage `json:"appliedIndex"`
+		ApplyError   *json.RawMessage `json:"applyError"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	r.Accepted = s.Accepted
+	r.Reason = s.Reason
+	r.Term = s.Term
+	r.CommittedIndex = s.CommittedIndex
+	r.AppliedIndex = s.AppliedIndex
+	r.ApplyError = s.ApplyError
+	r.applyFields = probe.AppliedIndex != nil || probe.ApplyError != nil
+	return nil
+}
+
 // ReplicateOutput 是整次调用的结果。
 type ReplicateOutput struct {
 	// Results 与输入请求一一对应。
@@ -126,6 +161,44 @@ func (o ReplicateOutput) MarshalJSON() ([]byte, error) {
 		FinalKV:           kv,
 		FinalApplyError:   o.FinalApplyError,
 	})
+}
+
+// UnmarshalJSON 识别 finalAppliedIndex / finalKV / finalApplyError 是否出现，
+// 恢复内部 applyFields 标记（逐请求结果各自恢复），使解码后再编码仍保留应用
+// 位置（含 0）、键值表（含空表）与错误字段（无错误为 null）。整个对象被完整
+// 覆盖写，复用同一结果对象先后解码启用/未启用两种数据时，后一次输出不会残留
+// 前一次的键值表、错误或位置。字段类型错误按标准规则返回解码错误。
+func (o *ReplicateOutput) UnmarshalJSON(data []byte) error {
+	type shadow struct {
+		Results             []AppendResult    `json:"results"`
+		FinalTerm           int               `json:"finalTerm"`
+		FinalCommittedIndex int               `json:"finalCommittedIndex"`
+		FinalLog            []LogEntry        `json:"finalLog"`
+		FinalAppliedIndex   *int              `json:"finalAppliedIndex"`
+		FinalKV             map[string]string `json:"finalKV"`
+		FinalApplyError     *ApplyError       `json:"finalApplyError"`
+	}
+	var s shadow
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	var probe struct {
+		FinalAppliedIndex *json.RawMessage `json:"finalAppliedIndex"`
+		FinalKV           *json.RawMessage `json:"finalKV"`
+		FinalApplyError   *json.RawMessage `json:"finalApplyError"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	o.Results = s.Results
+	o.FinalTerm = s.FinalTerm
+	o.FinalCommittedIndex = s.FinalCommittedIndex
+	o.FinalLog = s.FinalLog
+	o.FinalAppliedIndex = s.FinalAppliedIndex
+	o.FinalKV = s.FinalKV
+	o.FinalApplyError = s.FinalApplyError
+	o.applyFields = probe.FinalAppliedIndex != nil || probe.FinalKV != nil || probe.FinalApplyError != nil
+	return nil
 }
 
 // 拒绝原因（稳定标识符，帮助文档中有说明）。
