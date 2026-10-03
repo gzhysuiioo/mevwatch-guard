@@ -617,6 +617,128 @@ func TestSubmitReviewConcurrentNoOverwrite(t *testing.T) {
 	}
 }
 
+func TestSubmitReviewSaveFailureAndRetryAfterRecovery(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	// Existing alert records must survive the failed save untouched.
+	if _, err := GenerateAlerts(dir, "1", "ops", 0, 100, 3); err != nil {
+		t.Fatalf("GenerateAlerts: %v", err)
+	}
+
+	// The object starts at version 1 with a real judgment.
+	first := submit(t, dir, reviewSub("1", "0xa", "0xv", "sandwich", "s-1", "alice", "confirmed bot", ReviewStatusReal, 0))
+	if !first.Created || first.Version != 1 {
+		t.Fatalf("setup submission = %+v", first)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeData, err := readArchive(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeData.AlertRecords) == 0 {
+		t.Fatal("setup must carry existing alert records")
+	}
+
+	// Break only the archive save: the atomic-write tmp path is a directory,
+	// so writeArchiveAtomic cannot create its temp file. Validation, the
+	// lock, the conclusion lookup and the version check all still pass.
+	tmp := filepath.Join(dir, archiveFileName+".tmp")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmp) })
+
+	rejudge := reviewSub("1", "0xa", "0xv", "sandwich", "s-2", "bob", "actually fp", ReviewStatusFalsePositive, 1)
+	res, err := SubmitReview(dir, rejudge)
+	if err == nil {
+		t.Fatalf("save failure must return an error, got %+v", res)
+	}
+	if res.Created {
+		t.Fatalf("failed save must not report created=true: %+v", res)
+	}
+	// The failure is the save itself, not a validation, conflict or busy error.
+	for _, sentinel := range []error{ErrUnknownConclusion, ErrReviewConflict, ErrSubmissionConflict, ErrBusy} {
+		if errors.Is(err, sentinel) {
+			t.Fatalf("got %v, want an archive save error", err)
+		}
+	}
+	if !strings.Contains(err.Error(), archiveFileName) {
+		t.Fatalf("error must come from saving the archive, got %v", err)
+	}
+
+	// The failed submission leaves no half revision: the object is still
+	// real at version 1 with only the original revision, and nothing of the
+	// failed attempt (operator, reason, submission id) is stored.
+	hist, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Status != ReviewStatusReal || hist.Version != 1 || len(hist.Revisions) != 1 {
+		t.Fatalf("failed save mutated review state: %+v", hist)
+	}
+	if !reflect.DeepEqual(hist.Revisions[0], first.Revision) {
+		t.Fatalf("original revision changed: got %+v, want %+v", hist.Revisions[0], first.Revision)
+	}
+	// The whole archive — original conclusion, detection version, swap
+	// evidence and the existing alert records — is byte-identical.
+	after, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("failed save modified the archive")
+	}
+
+	// Storage recovers: the exact same submission (same submissionId, same
+	// expectedVersion, same field values) now succeeds. The failed attempt
+	// did not occupy the submission ID.
+	if err := os.Remove(tmp); err != nil {
+		t.Fatal(err)
+	}
+	saved := submit(t, dir, rejudge)
+	if !saved.Created || saved.Version != 2 || saved.Status != ReviewStatusFalsePositive {
+		t.Fatalf("retry after recovery = %+v", saved)
+	}
+	if saved.Revision.Version != 2 || saved.Revision.SubmissionID != "s-2" ||
+		saved.Revision.Operator != "bob" || saved.Revision.Reason != "actually fp" ||
+		saved.Revision.Status != ReviewStatusFalsePositive || saved.Revision.ExpectedVersion != 1 {
+		t.Fatalf("revision content not preserved: %+v", saved.Revision)
+	}
+
+	// History appends exactly one new revision after the original.
+	hist, err = ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Status != ReviewStatusFalsePositive || hist.Version != 2 || len(hist.Revisions) != 2 {
+		t.Fatalf("history after recovery = %+v", hist)
+	}
+	if !reflect.DeepEqual(hist.Revisions[0], first.Revision) ||
+		!reflect.DeepEqual(hist.Revisions[1], saved.Revision) {
+		t.Fatalf("revisions = %+v, want original then the retried one", hist.Revisions)
+	}
+
+	// Re-sending the now-saved submission is an idempotent retry: the stored
+	// revision is returned and nothing is appended.
+	again := submit(t, dir, rejudge)
+	if again.Created {
+		t.Fatal("retry of a saved submission reported created=true")
+	}
+	if !reflect.DeepEqual(again.Revision, saved.Revision) {
+		t.Fatalf("retry returned %+v, want saved revision %+v", again.Revision, saved.Revision)
+	}
+	hist, err = ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 2 || len(hist.Revisions) != 2 {
+		t.Fatalf("idempotent retry appended a revision: %+v", hist)
+	}
+}
+
 func TestSubmitReviewFailureLeavesNoHalfRevision(t *testing.T) {
 	dir := t.TempDir()
 	mustReplay(t, dir, twoFindingsInput)
