@@ -562,6 +562,21 @@ func TestParseSuppressionValidation(t *testing.T) {
 		{"missing reason", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2}`},
 		{"blank reason", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":""}`},
 		{"unknown field", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r","extra":1}`},
+		{"empty input", ``},
+		{"whitespace only", "  \n\t "},
+		{"null", `null`},
+		{"array", `[{"id":"s"}]`},
+		{"scalar", `5`},
+		{"incomplete object", `{"id":"s","chainId":"1"`},
+		{"trailing brace", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r"}}`},
+		{"trailing bracket", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r"}]`},
+		{"second object", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r"} {"id":"t"}`},
+		{"trailing value", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r"} null`},
+		{"duplicate id same value", `{"id":"s","id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r"}`},
+		{"duplicate id different value", `{"id":"s","id":"t","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r"}`},
+		{"duplicate channel case variant", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"ops","CHANNEL":"audit","startHeight":1,"endHeight":2,"reason":"r"}`},
+		{"duplicate via escape", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"ops","ch\u0061nnel":"audit","startHeight":1,"endHeight":2,"reason":"r"}`},
+		{"revoked not settable", `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"c","startHeight":1,"endHeight":2,"reason":"r","revoked":false}`},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
@@ -569,6 +584,70 @@ func TestParseSuppressionValidation(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+func TestParseSuppressionStrictDocument(t *testing.T) {
+	// Surrounding whitespace is fine; field names keep their historical
+	// case-insensitive compatibility; string values are stored verbatim.
+	doc := "\t\n {\"ID\":\"s\",\"ChainID\":\" 1 \",\"pool\":\"p1\",\"kind\":\"sandwich\",\"channel\":\"ops\",\"startHeight\":1,\"endHeight\":2,\"reason\":\"  keep me  \"} \n\t"
+	s, err := ParseSuppression([]byte(doc))
+	if err != nil {
+		t.Fatalf("valid spec rejected: %v", err)
+	}
+	if s.ID != "s" || s.ChainID != " 1 " || s.Reason != "  keep me  " {
+		t.Fatalf("string values must be stored verbatim: %+v", s)
+	}
+	// Escaped field names are recognized after unescaping.
+	esc := `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","ch\u0061nnel":"c","startHeight":1,"endHeight":2,"reason":"r"}`
+	if _, err := ParseSuppression([]byte(esc)); err != nil {
+		t.Fatalf("escaped field names must be recognized: %v", err)
+	}
+}
+
+func TestParseSuppressionErrorCausesDistinct(t *testing.T) {
+	base := `{"id":"s","chainId":"1","pool":"p","kind":"sandwich","channel":"ops","startHeight":1,"endHeight":2,"reason":"r"}`
+	_, dupErr := ParseSuppression([]byte(strings.TrimSuffix(base, "}") + `,"CHANNEL":"audit"}`))
+	if dupErr == nil || !strings.Contains(dupErr.Error(), "duplicate") ||
+		!strings.Contains(dupErr.Error(), "channel") {
+		t.Fatalf("duplicate error must name the field: %v", dupErr)
+	}
+	_, trailErr := ParseSuppression([]byte(base + "}"))
+	if trailErr == nil || !strings.Contains(trailErr.Error(), "trailing") {
+		t.Fatalf("trailing-content error must be distinguishable: %v", trailErr)
+	}
+	for _, err := range []error{dupErr, trailErr} {
+		if errors.Is(err, ErrSuppressionConflict) {
+			t.Fatalf("spec error %v must not look like a registration conflict", err)
+		}
+	}
+}
+
+func TestRegisterSuppressionInvalidSpecWithExistingID(t *testing.T) {
+	dir := t.TempDir()
+	spec := `{"id":"s","chainId":"1","pool":"p1","kind":"sandwich","channel":"ops","startHeight":1,"endHeight":2,"reason":"r"}`
+	if _, created, err := RegisterSuppression(dir, []byte(spec)); err != nil || !created {
+		t.Fatalf("first register: created=%v err=%v", created, err)
+	}
+	// The same document with a duplicate field or trailing content reuses the
+	// registered id, but must be rejected as an invalid spec — never reported
+	// as an idempotent created:false retry.
+	invalid := []string{
+		strings.TrimSuffix(spec, "}") + `,"reason":"r"}`,
+		spec + "}",
+		spec + spec,
+	}
+	for _, doc := range invalid {
+		if _, created, err := RegisterSuppression(dir, []byte(doc)); err == nil || created {
+			t.Fatalf("invalid spec %q: created=%v err=%v, want rejection", doc, created, err)
+		}
+	}
+	listed, err := ListSuppressions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].Revoked {
+		t.Fatalf("rejected specs must not alter stored conditions: %+v", listed)
 	}
 }
 

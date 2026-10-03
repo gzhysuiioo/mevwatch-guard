@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -122,16 +123,115 @@ type alertKey struct {
 
 // suppressionSpec mirrors one suppression registration document. Pointers
 // distinguish missing fields from explicit zero values; heights are parsed
-// separately as unsigned 64-bit integers.
+// separately as unsigned 64-bit integers. The struct is filled by
+// parseSuppressionSpec, never by encoding/json directly, so duplicate and
+// case-variant field declarations can be rejected instead of silently
+// overwritten.
 type suppressionSpec struct {
-	ID          *string `json:"id"`
-	ChainID     *string `json:"chainId"`
-	Pool        *string `json:"pool"`
-	Kind        *string `json:"kind"`
-	Channel     *string `json:"channel"`
-	StartHeight *uint64 `json:"startHeight"`
-	EndHeight   *uint64 `json:"endHeight"`
-	Reason      *string `json:"reason"`
+	ID          *string
+	ChainID     *string
+	Pool        *string
+	Kind        *string
+	Channel     *string
+	StartHeight *uint64
+	EndHeight   *uint64
+	Reason      *string
+}
+
+// suppressionFields lists the canonical registration field names. Field
+// names in a document are matched against these case-insensitively (the
+// same compatibility encoding/json's struct decoding offered), after JSON
+// string unescaping.
+var suppressionFields = []string{
+	"id", "chainId", "pool", "kind", "channel", "startHeight", "endHeight", "reason",
+}
+
+// canonicalSuppressionField resolves a document field name to its canonical
+// registration field, or "" when the field is unknown (this includes
+// "revoked", which a registration document can never set).
+func canonicalSuppressionField(key string) string {
+	for _, name := range suppressionFields {
+		if strings.EqualFold(key, name) {
+			return name
+		}
+	}
+	return ""
+}
+
+// decodeSuppressionField decodes one field value into the spec.
+func decodeSuppressionField(dec *json.Decoder, spec *suppressionSpec, field string) error {
+	switch field {
+	case "id":
+		return dec.Decode(&spec.ID)
+	case "chainId":
+		return dec.Decode(&spec.ChainID)
+	case "pool":
+		return dec.Decode(&spec.Pool)
+	case "kind":
+		return dec.Decode(&spec.Kind)
+	case "channel":
+		return dec.Decode(&spec.Channel)
+	case "startHeight":
+		return dec.Decode(&spec.StartHeight)
+	case "endHeight":
+		return dec.Decode(&spec.EndHeight)
+	case "reason":
+		return dec.Decode(&spec.Reason)
+	}
+	return fmt.Errorf("unhandled field %q", field)
+}
+
+// parseSuppressionSpec decodes raw as exactly one complete JSON object.
+// Leading and trailing whitespace is allowed; anything else after the
+// closing brace — an extra delimiter, a second object, any other value — is
+// a trailing-data error. Empty input, arrays, null, scalars and incomplete
+// objects are rejected, as is every field declared twice, even with an
+// identical value or under a different-but-equivalent spelling (case
+// variants, escape sequences). A duplicate is reported by canonical field
+// name so it cannot be confused with a trailing-data error or with a
+// conflict against an already registered condition.
+func parseSuppressionSpec(raw []byte) (suppressionSpec, error) {
+	var spec suppressionSpec
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return spec, fmt.Errorf("invalid suppression spec: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return spec, errors.New("invalid suppression spec: want a single JSON object")
+	}
+	seen := make(map[string]string, len(suppressionFields))
+	for dec.More() {
+		ktok, err := dec.Token()
+		if err != nil {
+			return spec, fmt.Errorf("invalid suppression spec: %w", err)
+		}
+		key, ok := ktok.(string)
+		if !ok {
+			return spec, errors.New("invalid suppression spec: object key must be a string")
+		}
+		field := canonicalSuppressionField(key)
+		if field == "" {
+			return spec, fmt.Errorf("invalid suppression spec: unknown field %q", key)
+		}
+		if first, dup := seen[field]; dup {
+			return spec, fmt.Errorf("invalid suppression spec: duplicate field %q (first declared as %q)", field, first)
+		}
+		seen[field] = key
+		if err := decodeSuppressionField(dec, &spec, field); err != nil {
+			return spec, fmt.Errorf("invalid suppression spec: field %q: %w", field, err)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return spec, fmt.Errorf("invalid suppression spec: %w", err)
+	}
+	if tok, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return spec, fmt.Errorf("invalid suppression spec: unexpected trailing data after the JSON object (%v)", tok)
+		}
+		return spec, fmt.Errorf("invalid suppression spec: unexpected trailing data after the JSON object: %w", err)
+	}
+	return spec, nil
 }
 
 func nonEmpty(field string, v *string) (string, error) {
@@ -144,19 +244,16 @@ func nonEmpty(field string, v *string) (string, error) {
 	return *v, nil
 }
 
-// ParseSuppression validates one registration document. Only sandwich and
-// displacement kinds exist, every text field must be non-empty, heights are
-// unsigned 64-bit integers and the start height must not exceed the end
+// ParseSuppression validates one registration document. The document must
+// be exactly one complete JSON object (surrounding whitespace allowed) with
+// no trailing content and no field declared more than once. Only sandwich
+// and displacement kinds exist, every text field must be non-empty, heights
+// are unsigned 64-bit integers and the start height must not exceed the end
 // height.
 func ParseSuppression(raw []byte) (Suppression, error) {
-	var spec suppressionSpec
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&spec); err != nil {
-		return Suppression{}, fmt.Errorf("invalid suppression spec: %w", err)
-	}
-	if dec.More() {
-		return Suppression{}, errors.New("invalid suppression spec: unexpected trailing data")
+	spec, err := parseSuppressionSpec(raw)
+	if err != nil {
+		return Suppression{}, err
 	}
 	id, err := nonEmpty("id", spec.ID)
 	if err != nil {
