@@ -135,12 +135,23 @@ type suppressionSpec struct {
 	Reason      *string `json:"reason"`
 }
 
+// nonBlankString is the one business rule for fields that must carry text
+// beyond surrounding whitespace. Whitespace only decides validity; the
+// value is returned to callers untouched, so no padding, casing or any other
+// byte of an accepted string is normalized.
+func nonBlankString(field, v string) error {
+	if strings.TrimSpace(v) == "" {
+		return fmt.Errorf("%s must be a non-empty string", field)
+	}
+	return nil
+}
+
 func nonEmpty(field string, v *string) (string, error) {
 	if v == nil {
 		return "", fmt.Errorf("%s is required (non-empty string)", field)
 	}
-	if strings.TrimSpace(*v) == "" {
-		return "", fmt.Errorf("%s must be a non-empty string", field)
+	if err := nonBlankString(field, *v); err != nil {
+		return "", err
 	}
 	return *v, nil
 }

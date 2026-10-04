@@ -137,10 +137,14 @@ type reviewSpec struct {
 	ExpectedVersion *int    `json:"expectedVersion"`
 }
 
-// ParseReviewSubmission validates one submission document. Identity fields
-// and operator/reason/submissionId must be non-empty, the status must be
-// one of real, false_positive or unreviewed, expectedVersion must be a
-// non-negative integer, and the kind must be a known conclusion kind.
+// ParseReviewSubmission validates one submission document. The structural
+// concerns stay here: pointers distinguish a missing field from an explicit
+// value (so null and a missing field keep their distinct errors), the
+// decoder rejects unknown fields and wrong JSON types, and expectedVersion
+// must be present. Every business rule on the values themselves — blank
+// fields, the known kinds and statuses, and the non-negative version — is
+// then judged by the same predicates validateReviewSubmission applies to a
+// programmatically built submission in SubmitReview.
 func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
 	var spec reviewSpec
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -167,8 +171,8 @@ func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
 	if err != nil {
 		return ReviewSubmission{}, err
 	}
-	if kind != SuppressSandwich && kind != SuppressDisplacement {
-		return ReviewSubmission{}, fmt.Errorf("%w: %q (want sandwich or displacement)", ErrUnknownKind, kind)
+	if err := validateReviewKind(kind); err != nil {
+		return ReviewSubmission{}, err
 	}
 	submissionID, err := nonEmpty("submissionId", spec.SubmissionID)
 	if err != nil {
@@ -186,17 +190,18 @@ func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
 	if err != nil {
 		return ReviewSubmission{}, err
 	}
-	switch status {
-	case ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed:
-	default:
+	if !validReviewStatus(status) {
 		return ReviewSubmission{}, fmt.Errorf("invalid status %q (want %s, %s or %s)",
 			status, ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed)
 	}
+	// A missing or null expectedVersion is a format error here; the
+	// non-negative rule belongs to the shared business validator, so an
+	// explicit zero still reads as a valid first-submission base.
 	if spec.ExpectedVersion == nil {
 		return ReviewSubmission{}, errors.New("expectedVersion is required (non-negative integer)")
 	}
-	if *spec.ExpectedVersion < 0 {
-		return ReviewSubmission{}, fmt.Errorf("expectedVersion must be non-negative, got %d", *spec.ExpectedVersion)
+	if err := validateExpectedVersion(*spec.ExpectedVersion); err != nil {
+		return ReviewSubmission{}, err
 	}
 	return ReviewSubmission{
 		ChainID:         chainID,
@@ -237,7 +242,7 @@ type SubmitReviewResult struct {
 // stale concurrent submission can never overwrite another operator's
 // revision.
 func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) {
-	if err := validateReviewIdentity(sub); err != nil {
+	if err := validateReviewSubmission(sub); err != nil {
 		return SubmitReviewResult{}, err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -339,35 +344,70 @@ func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) 
 	}, nil
 }
 
-func validateReviewIdentity(sub ReviewSubmission) error {
-	if strings.TrimSpace(sub.ChainID) == "" {
-		return errors.New("chainId must be a non-empty string")
+// The business rules for one review submission live in the small predicates
+// below and are shared by both entry points: ParseReviewSubmission invokes
+// them while walking the JSON document (keeping the parser's first-error
+// ordering and wording), while SubmitReview runs validateReviewSubmission on
+// programmatically built submissions, so callers that never went through the
+// spec parser cannot bypass a rule. The checks never mutate a value:
+// whitespace only decides whether a string counts as blank.
+
+// validateReviewSubmission applies every business rule to an assembled
+// submission in the order a document lists its fields.
+func validateReviewSubmission(sub ReviewSubmission) error {
+	if err := nonBlankString("chainId", sub.ChainID); err != nil {
+		return err
 	}
-	if strings.TrimSpace(sub.BlockHash) == "" {
-		return errors.New("blockHash must be a non-empty string")
+	if err := nonBlankString("blockHash", sub.BlockHash); err != nil {
+		return err
 	}
-	if strings.TrimSpace(sub.TxHash) == "" {
-		return errors.New("txHash must be a non-empty string")
+	if err := nonBlankString("txHash", sub.TxHash); err != nil {
+		return err
 	}
-	if sub.Kind != SuppressSandwich && sub.Kind != SuppressDisplacement {
-		return fmt.Errorf("%w: %q (want sandwich or displacement)", ErrUnknownKind, sub.Kind)
+	if err := validateReviewKind(sub.Kind); err != nil {
+		return err
 	}
-	if strings.TrimSpace(sub.SubmissionID) == "" {
-		return errors.New("submissionId must be a non-empty string")
+	if err := nonBlankString("submissionId", sub.SubmissionID); err != nil {
+		return err
 	}
-	if strings.TrimSpace(sub.Operator) == "" {
-		return errors.New("operator must be a non-empty string")
+	if err := nonBlankString("operator", sub.Operator); err != nil {
+		return err
 	}
-	if strings.TrimSpace(sub.Reason) == "" {
-		return errors.New("reason must be a non-empty string")
+	if err := nonBlankString("reason", sub.Reason); err != nil {
+		return err
 	}
-	switch sub.Status {
-	case ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed:
-	default:
+	if !validReviewStatus(sub.Status) {
 		return fmt.Errorf("invalid status %q", sub.Status)
 	}
-	if sub.ExpectedVersion < 0 {
-		return fmt.Errorf("expectedVersion must be non-negative, got %d", sub.ExpectedVersion)
+	return validateExpectedVersion(sub.ExpectedVersion)
+}
+
+// validateReviewKind accepts only the conclusion kinds the archive can
+// carry. An unknown kind keeps its own sentinel error rather than being
+// reported as a generic bad string.
+func validateReviewKind(kind string) error {
+	if kind != SuppressSandwich && kind != SuppressDisplacement {
+		return fmt.Errorf("%w: %q (want sandwich or displacement)", ErrUnknownKind, kind)
+	}
+	return nil
+}
+
+// validReviewStatus reports whether status is one a review revision may
+// carry: real, false_positive or the withdrawal marker unreviewed.
+func validReviewStatus(status string) bool {
+	switch status {
+	case ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateExpectedVersion accepts the explicit zero that bases a first
+// submission and rejects every negative base.
+func validateExpectedVersion(expectedVersion int) error {
+	if expectedVersion < 0 {
+		return fmt.Errorf("expectedVersion must be non-negative, got %d", expectedVersion)
 	}
 	return nil
 }
