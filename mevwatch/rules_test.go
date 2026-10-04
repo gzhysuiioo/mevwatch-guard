@@ -216,6 +216,47 @@ func TestParseRuleVersionRejectsDuplicateFields(t *testing.T) {
 			`{"id":"v","rules":{"sandwich":{"enabled":true},"sandwich":{"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
 			"rules object", "sandwich",
 		},
+		{
+			// U+017F (ſ) folds to s the way encoding/json matches fields.
+			"long-s severity variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3,"ſeverity":5},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"long-s severity first",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"ſeverity":5,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"long-s severity identical value",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3,"ſeverity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"escaped long-s severity variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3,"\u017feverity":5},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"long-s rules variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}},"ruleſ":{"sandwich":{"enabled":false,"severity":1},"displacement":{"enabled":false,"severity":1,"multiplier":2}}}`,
+			"version spec", "rules",
+		},
+		{
+			"long-s sandwich variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"ſandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules object", "sandwich",
+		},
+		{
+			"split long-s sandwich objects cannot complete each other",
+			`{"id":"v","rules":{"sandwich":{"enabled":true},"ſandwich":{"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules object", "sandwich",
+		},
+		{
+			"long-s displacement enabled variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"ſeverity":2,"severity":4,"multiplier":2}}}`,
+			"rules.displacement", "severity",
+		},
 	}
 	for _, tc := range dups {
 		t.Run(tc.name, func(t *testing.T) {
@@ -272,6 +313,54 @@ func TestParseRuleVersionCaseCompatibilityPreserved(t *testing.T) {
 	}
 }
 
+func TestParseRuleVersionFoldSpelledFieldsStillRegister(t *testing.T) {
+	// A field spelled with U+017F (ſ, folds to s) appears only once, so it
+	// is a legal alias the decoder already accepts; the stored parameters
+	// are identical to the standard spelling.
+	dir := t.TempDir()
+	v, created := register(t, dir, `{"id":"longs","rules":{"ſandwich":{"enabled":true,"ſeverity":5},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`)
+	if !created {
+		t.Fatal("fold-spelled single fields must register")
+	}
+	want := RuleSet{
+		Sandwich:     SandwichRule{Enabled: true, Severity: 5},
+		Displacement: DisplacementRule{Enabled: true, Severity: 2, Multiplier: 2},
+	}
+	if v.Rules != want {
+		t.Fatalf("fold-spelled parameters wrong: %+v", v.Rules)
+	}
+	got, err := GetVersion(dir, "longs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Rules != want {
+		t.Fatalf("queried parameters wrong: %+v", got.Rules)
+	}
+	// Retrying with the standard spelling and identical parameters is the
+	// same version, not a new one.
+	if _, created := register(t, dir, `{"id":"longs","rules":{"sandwich":{"enabled":true,"severity":5},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`); created {
+		t.Fatal("standard-spelled retry with identical parameters must not create")
+	}
+	// A lookalike that only resembles a field is still an unknown field.
+	lookalikes := []string{
+		`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3,"ſeveritie":5},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+		`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}},"ſules":{}}`,
+	}
+	for i, spec := range lookalikes {
+		if _, err := ParseRuleVersion([]byte(spec)); err == nil || errors.Is(err, ErrDuplicateField) {
+			t.Fatalf("lookalike %d: got %v, want an unknown-field error", i, err)
+		}
+	}
+	// Fold processing never touches string values.
+	spaced, err := ParseRuleVersion([]byte(`{"id":" ſtrict ","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spaced.ID != " ſtrict " {
+		t.Fatalf("id value must be preserved verbatim, got %q", spaced.ID)
+	}
+}
+
 func TestRejectedSpecLeavesArchiveUntouched(t *testing.T) {
 	dir := t.TempDir()
 	original, created := register(t, dir, strictSpec)
@@ -287,6 +376,9 @@ func TestRejectedSpecLeavesArchiveUntouched(t *testing.T) {
 		``,
 		strictSpec + `{"id":"other"}`,
 		`{"id":"z","rules":{"sandwich":{"enabled":true,"severity":3,"severity":4},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+		// A fold-equivalent duplicate is rejected even when the surviving
+		// value equals the registered parameters of an existing ID.
+		`{"id":"strict","rules":{"sandwich":{"enabled":true,"severity":5,"ſeverity":5},"displacement":{"enabled":true,"severity":4,"multiplier":5}}}`,
 	}
 	for i, spec := range rejected {
 		if v, _, err := RegisterVersion(dir, []byte(spec)); err == nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // This file holds the shared structural validation for the single-object
@@ -25,7 +26,7 @@ import (
 type specPolicy struct {
 	// topObject labels the root object in duplicate-field errors.
 	topObject string
-	// known maps the lowercase spelling of every accepted root field to
+	// known maps the folded spelling of every accepted root field to
 	// its canonical name.
 	known map[string]string
 	// nested names the known fields whose value is itself an object that
@@ -88,7 +89,7 @@ func scanObject(dec *json.Decoder, p specPolicy, known map[string]string, obj st
 		if !ok {
 			return p.wrap(fmt.Errorf("object key is %s, want string", jsonTokenName(keyTok)))
 		}
-		target, knownKey := known[strings.ToLower(key)]
+		target, knownKey := known[foldKey(key)]
 		if p.rejectExactUnknown {
 			// An exact repeat of a decoded key name (known or unknown) is a
 			// duplicate; escapes are decoded first, so "id" == "id".
@@ -98,8 +99,9 @@ func scanObject(dec *json.Decoder, p specPolicy, known map[string]string, obj st
 			spellings[key] = key
 		}
 		if knownKey {
-			// A case-only spelling of the same known field is the same
-			// field: "Severity" and "severity" cannot share one object.
+			// A fold-equivalent spelling of the same known field is the
+			// same field: "Severity", "severity" and "ſeverity" cannot
+			// share one object.
 			if first, dup := seen[target]; dup {
 				return p.duplicate(obj, target, first, key)
 			}
@@ -219,14 +221,32 @@ func trailingTokenName(b byte) string {
 	}
 }
 
-// fieldTable maps the case-insensitive spellings of a struct object's
+// fieldTable maps the fold-equivalent spellings of a struct object's
 // JSON fields to their canonical names.
 func fieldTable(fields ...string) map[string]string {
 	table := make(map[string]string, len(fields))
 	for _, f := range fields {
-		table[strings.ToLower(f)] = f
+		table[foldKey(f)] = f
 	}
 	return table
+}
+
+// foldKey returns the canonical comparison form encoding/json uses when
+// matching an object key against a struct field name: Unicode simple case
+// folding. Every rune is mapped to the smallest rune in its fold orbit, so
+// ASCII case variants fold together and so do non-ASCII equivalents like
+// "ſ" (U+017F) with "s" or "K" (U+212A) with "k". Keys are folded, never
+// values, and only for comparison — the decoded document is untouched.
+func foldKey(s string) string {
+	return strings.Map(func(r rune) rune {
+		folded := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < folded {
+				folded = next
+			}
+		}
+		return folded
+	}, s)
 }
 
 // nestedObjectSpec pairs a nested object's field table with the label used
