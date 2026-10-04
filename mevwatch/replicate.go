@@ -39,6 +39,14 @@ type AppendRequest struct {
 	LeaderCommit int `json:"leaderCommit"`
 }
 
+// ConflictHint 是前置日志不匹配时给调用方的重发建议：Index 是建议重发的
+// 起始索引，Term 是冲突位置的本地任期。只描述本次请求检查时的本地日志，
+// 不随拒绝改变任何状态。
+type ConflictHint struct {
+	Index int `json:"index"`
+	Term  int `json:"term"`
+}
+
 // AppendResult 是单条请求处理后节点对该请求的答复。
 type AppendResult struct {
 	// Accepted 表示本次复制是否成功。
@@ -49,6 +57,9 @@ type AppendResult struct {
 	Term int `json:"term"`
 	// CommittedIndex 是处理后节点的已提交索引。
 	CommittedIndex int `json:"committedIndex"`
+	// Conflict 仅在实际因前置日志不匹配而拒绝时出现；成功请求与其他原因
+	// 的拒绝都不携带。
+	Conflict *ConflictHint `json:"conflict,omitempty"`
 	// AppliedIndex / ApplyError 仅在启用键值应用（ReplicateOptions.ApplyKV）
 	// 时填充：处理本请求后已应用的最高日志索引与首个应用错误。
 	// 复制是否被接受与命令应用是否失败相互独立表达。
@@ -203,11 +214,31 @@ func (s *replicateState) termAt(idx int) (term int, ok bool) {
 	}
 }
 
+// conflictFor 按检查时的完整本地日志（含已提交前缀）生成前置日志不匹配的
+// 重发建议：prevLogIndex 越过日志末尾时建议从末尾加一处重发、任期记 0（空
+// 日志因此是索引 1）；索引存在但任期不同时，反馈该位置的本地任期以及这个
+// 任期在本地日志中第一次出现的索引。索引 0 是哨兵，其本地任期视为 0，而
+// 任期 0 不会出现在真实条目中，第一次出现的位置按索引 1 处理。
+func (s *replicateState) conflictFor(prevLogIndex int) *ConflictHint {
+	if prevLogIndex > len(s.log) {
+		return &ConflictHint{Index: len(s.log) + 1, Term: 0}
+	}
+	term, _ := s.termAt(prevLogIndex)
+	first := 1
+	for i, entry := range s.log {
+		if entry.Term == term {
+			first = i + 1
+			break
+		}
+	}
+	return &ConflictHint{Index: first, Term: term}
+}
+
 // apply 处理单条请求。整个操作是原子的：任何拒绝都不会在日志、已提交索引上
 // 留下部分变更；唯一例外是较高任期带来的 currentTerm 更新，按规则必须保留。
 func (s *replicateState) apply(request AppendRequest) AppendResult {
 	snapshot := *s
-	accepted, reason := s.tryApply(request)
+	accepted, reason, conflict := s.tryApply(request)
 	if !accepted {
 		// 回滚日志与提交位置；较高任期更新（若已发生）保留在 s.currentTerm 中。
 		s.log = snapshot.log
@@ -218,25 +249,26 @@ func (s *replicateState) apply(request AppendRequest) AppendResult {
 		Reason:         reason,
 		Term:           s.currentTerm,
 		CommittedIndex: s.committedIndex,
+		Conflict:       conflict,
 	}
 }
 
-func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
+func (s *replicateState) tryApply(request AppendRequest) (bool, string, *ConflictHint) {
 	// 规则 1：先做字段合法性校验。违反字段规则的请求只记录拒绝、不改变任何
 	// 状态——即使它携带更高任期，也不能更新节点。
 	if reason := validateRequest(request); reason != ReasonOK {
-		return false, reason
+		return false, reason, nil
 	}
 
 	// 规则 2：较低任期直接拒绝，状态（含任期）完全不变。
 	if request.Term < s.currentTerm {
-		return false, ReasonStaleTerm
+		return false, ReasonStaleTerm, nil
 	}
 
 	// 规则 3：首条目任期不得低于前一条日志任期（整段日志必须不下降）。
 	// 这仍属于字段规则，放在任期更新之前：非法请求不能借高任期改变节点。
 	if len(request.Entries) > 0 && request.Entries[0].Term < request.PrevLogTerm {
-		return false, ReasonEntryTermDecreases
+		return false, ReasonEntryTermDecreases, nil
 	}
 
 	// 规则 4：较高任期先更新当前任期，再核对日志；之后即便因前缀不匹配被拒，
@@ -246,9 +278,10 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
 	}
 
 	// 规则 5：前一条日志必须存在且任期相同。索引 0 始终只与任期 0 匹配。
+	// 只有这种拒绝附带重发建议，且建议按此时（未因本请求改变）的本地日志生成。
 	prevTerm, ok := s.termAt(request.PrevLogIndex)
 	if !ok || prevTerm != request.PrevLogTerm {
-		return false, ReasonPrevLogMismatch
+		return false, ReasonPrevLogMismatch, s.conflictFor(request.PrevLogIndex)
 	}
 
 	// 规则 6：把待追加条目与现有位置逐一比对——全部检查通过后才落笔，
@@ -271,10 +304,10 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
 			matched++
 		case existing.Term == incoming.Term:
 			// 同索引同任期却命令不同：拒绝，日志与提交位置保持原样。
-			return false, ReasonCommandConflictSameTerm
+			return false, ReasonCommandConflictSameTerm, nil
 		case idx <= s.committedIndex:
 			// 不同任期意味着要覆盖该处及其后缀；已提交条目不可覆盖。
-			return false, ReasonWouldOverwriteCommitted
+			return false, ReasonWouldOverwriteCommitted, nil
 		default:
 			// 未提交位置上的任期冲突：截断到此处再追加，其后旧日志整段丢弃。
 			cutAt = idx - 1
@@ -304,7 +337,7 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
 	if newCommit > s.committedIndex {
 		s.committedIndex = newCommit
 	}
-	return true, ReasonOK
+	return true, ReasonOK, nil
 }
 
 func validateRequest(request AppendRequest) string {

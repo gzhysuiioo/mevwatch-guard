@@ -96,6 +96,7 @@ Processing rules:
     checked; the term update survives a later prefix-mismatch rejection.
   - A missing prevLogIndex or a differing prevLogTerm rejects the request
     without touching the log or committed index. Index 0 only matches term 0.
+    The rejection carries a conflict hint (see results[].conflict below).
   - After a prefix match, missing positions are appended; existing positions
     with equal term and command are kept; a different term replaces that entry
     and its suffix.
@@ -143,6 +144,18 @@ Output fields:
     results[].reason          "ok" or a specific rejection reason
     results[].term            current term after handling the request
     results[].committedIndex  committed index after handling the request
+    results[].conflict        only on a prev-log-mismatch rejection:
+                              {"index", "term"} suggesting where to resend
+                              from. When prevLogIndex is beyond the local
+                              log, index is the last local index plus one
+                              and term is 0 (empty log: index 1). When the
+                              index exists but its term differs, term is the
+                              local term there and index is the first index
+                              of that term in the full local log (committed
+                              entries included). Index 0 with a non-zero
+                              term yields {"index": 1, "term": 0}. The hint
+                              describes the local log as checked by this
+                              request and changes nothing.
   finalTerm            final current term
   finalCommittedIndex  final committed index
   finalLog             complete log after all requests
