@@ -908,6 +908,158 @@ func TestKVRejectedReplicationKeepsApplyBoundary(t *testing.T) {
 	}
 }
 
+// partialConfirmationInitial 是“部分确认不提交尾部”回归测试的初始状态：任期 2，
+// 日志索引 1..4 的任期均为 2，只有 idx1（set balance=100）已提交；idx2 把
+// balance 改成 200，idx3 是缺少等号的 set 命令，idx4 删除 balance——后三条都是
+// 未提交尾部，idx3 的格式错误不能在提交之前暴露。
+func partialConfirmationInitial() InitialState {
+	return InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 2, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 2, "set balance"), // 缺少 '='：提交到此处时才报告
+		entry(4, 2, "delete balance"),
+	}}
+}
+
+// TestKVPartialConfirmationKeepsTailUncommitted 回归保障：合法请求只确认部分日志时，
+// 本地保留的更长未提交尾部不能因此被提交或应用。日志仍然存在、日志已经提交、命令
+// 已经应用是三种不同的结果，必须分别从每一步的答复与最终状态中看出：
+//   - 初始只提交 idx1：键值表只有 balance=100，idx3 的格式错误不出现；
+//   - 请求一（任期 2、前置 idx1、只携带与本地 idx2 相同的条目、leaderCommit=4）
+//     成功且答复原因为 ok：四条日志全部保留，但提交与应用只到 2，balance=200，
+//     无应用错误；
+//   - 请求二（前置 idx2、空条目、leaderCommit=4）同样成功：确认位置仍是 2，尾部
+//     的 delete 不执行，idx3 的格式错误也不暴露；
+//   - 请求三（前置 idx4、leaderCommit=4）才把提交推进到 4：idx3 的错误被报告，
+//     应用停在 2，idx4 的删除不生效，balance 仍为 200；复制仍成功、日志不变；
+//   - 请求四（前置 idx2、leaderCommit=1）确认位置与领导者提交位置都低于已提交
+//     索引：提交、应用与已报告的错误都不得倒退。
+func TestKVPartialConfirmationKeepsTailUncommitted(t *testing.T) {
+	initial := partialConfirmationInitial()
+	fullLog := append([]LogEntry(nil), initial.Log...)
+
+	// 没有请求时：只应用初始已提交前缀，尾部三条不产生任何效果。
+	start := runKV(t, initial)
+	if *start.FinalAppliedIndex != 1 {
+		t.Fatalf("initial appliedIndex = %d, want 1", *start.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, start), map[string]string{"balance": "100"}) {
+		t.Fatalf("initial kv = %v, want only balance=100", start.FinalKV)
+	}
+	if start.FinalApplyError != nil {
+		t.Fatalf("uncommitted bad entry reported early: %+v", start.FinalApplyError)
+	}
+
+	// 请求一：只确认到 idx2，领导者却声明已提交到 4。
+	partial := AppendRequest{Term: 2, PrevLogIndex: 1, PrevLogTerm: 2, LeaderCommit: 4,
+		Entries: []LogEntry{entry(2, 2, "set balance=200")}}
+	// 请求二：空条目心跳，前置仍为 idx2，领导者提交位置仍为 4。
+	heartbeat := AppendRequest{Term: 2, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 4}
+	// 请求三：前置确认到 idx4，提交位置才推进到 4。
+	confirmAll := AppendRequest{Term: 2, PrevLogIndex: 4, PrevLogTerm: 2, LeaderCommit: 4}
+	// 请求四：确认位置与 leaderCommit 都低于已提交索引，不得倒退。
+	lowerCommit := AppendRequest{Term: 2, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 1}
+
+	// 若输入停在请求一：答复成功，日志四条全在，提交与应用只到 2。
+	stopped := runKV(t, initial, partial)
+	r := stopped.Results[0]
+	if !r.Accepted || r.Reason != ReasonOK {
+		t.Fatalf("partial confirmation must stay a normal success: %+v", r)
+	}
+	if r.CommittedIndex != 2 {
+		t.Fatalf("commit advanced beyond confirmed index: %d, want 2", r.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, r); got != 2 {
+		t.Fatalf("applied index = %d, want 2", got)
+	}
+	if r.ApplyError != nil {
+		t.Fatalf("uncommitted tail error reported early: %+v", r.ApplyError)
+	}
+	if !reflect.DeepEqual(stopped.FinalLog, fullLog) {
+		t.Fatalf("tail deleted by partial confirmation: %+v", stopped.FinalLog)
+	}
+	if stopped.FinalCommittedIndex != 2 || *stopped.FinalAppliedIndex != 2 {
+		t.Fatalf("final state = ci %d applied %d, want 2/2",
+			stopped.FinalCommittedIndex, *stopped.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, stopped), map[string]string{"balance": "200"}) {
+		t.Fatalf("kv = %v, want only balance=200 (delete must not run)", stopped.FinalKV)
+	}
+	if stopped.FinalApplyError != nil {
+		t.Fatalf("unexpected apply error: %+v", stopped.FinalApplyError)
+	}
+
+	// 完整过程：四个请求的答复逐步区分“日志保留 / 已提交 / 已应用”。
+	out := runKV(t, initial, partial, heartbeat, confirmAll, lowerCommit)
+	if len(out.Results) != 4 {
+		t.Fatalf("got %d results, want 4", len(out.Results))
+	}
+	// 四个请求全部以正常成功原因接受：不能为了阻止尾部应用而拒绝请求。
+	for i, result := range out.Results {
+		if !result.Accepted || result.Reason != ReasonOK {
+			t.Fatalf("result %d must be a normal success, got %+v", i, result)
+		}
+		if result.Term != 2 {
+			t.Fatalf("result %d term = %d, want 2", i, result.Term)
+		}
+	}
+	// 请求一、二：确认位置只有 2，leaderCommit=4 不能把提交推过 2。
+	for i := 0; i < 2; i++ {
+		if out.Results[i].CommittedIndex != 2 {
+			t.Fatalf("result %d committedIndex = %d, want 2 (tail not confirmed)",
+				i, out.Results[i].CommittedIndex)
+		}
+		if got := appliedIndexOf(t, out.Results[i]); got != 2 {
+			t.Fatalf("result %d appliedIndex = %d, want 2", i, got)
+		}
+		if out.Results[i].ApplyError != nil {
+			t.Fatalf("result %d exposed uncommitted tail error: %+v", i, out.Results[i].ApplyError)
+		}
+	}
+	// 请求三：提交推进到 4，idx3 的格式错误此时才报告；应用停在 2。
+	third := out.Results[2]
+	if third.CommittedIndex != 4 {
+		t.Fatalf("result 2 committedIndex = %d, want 4", third.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, third); got != 2 {
+		t.Fatalf("result 2 appliedIndex = %d, want 2 (stuck before bad entry)", got)
+	}
+	if third.ApplyError == nil || third.ApplyError.Index != 3 ||
+		third.ApplyError.Reason != ApplyReasonSetMissingEquals {
+		t.Fatalf("result 2 applyError = %+v, want index 3 missing '='", third.ApplyError)
+	}
+	// 请求四：确认位置与 leaderCommit 都低于已提交索引，一切不得倒退。
+	fourth := out.Results[3]
+	if fourth.CommittedIndex != 4 {
+		t.Fatalf("result 3 committedIndex moved backward: %d, want 4", fourth.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, fourth); got != 2 {
+		t.Fatalf("result 3 appliedIndex = %d, want 2", got)
+	}
+	if fourth.ApplyError == nil || fourth.ApplyError.Index != 3 {
+		t.Fatalf("result 3 applyError = %+v, want index 3 retained", fourth.ApplyError)
+	}
+
+	// 最终状态：完整日志不因应用失败而改变；提交到 4、应用停在 2、balance 仍为
+	// 200——idx4 的删除不能生效，idx3 的错误保留在最终输出中。
+	if !reflect.DeepEqual(out.FinalLog, fullLog) {
+		t.Fatalf("final log = %+v, want unchanged %+v", out.FinalLog, fullLog)
+	}
+	if out.FinalTerm != 2 || out.FinalCommittedIndex != 4 {
+		t.Fatalf("final state = term %d ci %d, want term 2 ci 4", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if *out.FinalAppliedIndex != 2 {
+		t.Fatalf("final appliedIndex = %d, want 2", *out.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, out), map[string]string{"balance": "200"}) {
+		t.Fatalf("final kv = %v, want only balance=200 (delete must not run)", out.FinalKV)
+	}
+	if out.FinalApplyError == nil || out.FinalApplyError.Index != 3 ||
+		out.FinalApplyError.Reason != ApplyReasonSetMissingEquals {
+		t.Fatalf("final applyError = %+v, want index 3 missing '='", out.FinalApplyError)
+	}
+}
+
 // uncommittedSuffixInitial 是两个替换规则回归测试共享的初始状态：任期 4，
 // 日志索引 1..4 的任期依次为 1、2、4、4；只有 idx1（set balance=100）已提交，
 // 后三条（set balance=200、delete balance、set legacy=old）是未提交旧后缀。
