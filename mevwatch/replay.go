@@ -92,8 +92,17 @@ func parseBlock(text string) (Block, error) {
 	if err := dec.Decode(&raw); err != nil {
 		return Block{}, fmt.Errorf("invalid JSON: %w", err)
 	}
-	if dec.More() {
-		return Block{}, errors.New("invalid JSON: unexpected trailing data")
+	// A line must carry exactly one complete JSON object: after the first
+	// value only whitespace may follow. dec.More() does not answer this —
+	// it inspects the innermost array/object stream and reports false once
+	// the top-level object ends, so an extra brace, a second object or any
+	// other trailing token would slip past it. Probe for a second value and
+	// insist on EOF (json.Decoder skips leading whitespace itself). The
+	// first object already decoded cleanly, so anything but EOF — a valid
+	// second value or a stray brace — is illegal trailing content.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return Block{}, errors.New("invalid JSON: unexpected trailing content after the block object")
 	}
 	if raw.ChainID == nil || *raw.ChainID == "" {
 		return Block{}, errors.New("chainId must be a non-empty string")
