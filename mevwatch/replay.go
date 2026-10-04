@@ -303,10 +303,18 @@ const (
 
 type archiveData struct {
 	Records []record `json:"records"`
-	// Versions and EnabledVersion are absent in archives written before
-	// rule versions existed; such archives run the built-in rules.
-	Versions       []RuleVersion `json:"versions,omitempty"`
-	EnabledVersion string        `json:"enabledVersion,omitempty"`
+	// VersionSpecs holds the exact registration document of every
+	// registered rule version. A version is re-parsed and re-validated
+	// every time it is resolved, so incomplete or out-of-range parameters
+	// in a hand-edited or damaged archive are reported instead of being
+	// silently treated as zero values.
+	VersionSpecs []json.RawMessage `json:"versionSpecs,omitempty"`
+	// Versions is the pre-spec storage layout. It is decoded only so old
+	// archives can be migrated in memory and is never written back.
+	Versions []RuleVersion `json:"versions,omitempty"`
+	// EnabledVersion is absent in archives written before rule versions
+	// existed; such archives run the built-in rules.
+	EnabledVersion string `json:"enabledVersion,omitempty"`
 	// Suppressions and AlertRecords are absent in archives written before
 	// offline alerting existed; such archives simply have no registered
 	// conditions and no processing history.

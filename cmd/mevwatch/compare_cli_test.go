@@ -461,3 +461,152 @@ func TestCLICompareIsReadOnly(t *testing.T) {
 		t.Fatalf("enabled version changed to %q", enabled)
 	}
 }
+
+// setupCorruptCLIArchive builds the standard archive (input file deleted)
+// and replaces the stored declaration of candC with corruptSpec. The
+// archive stores each registered version as an exact JSON document under
+// "versionSpecs"; patching one element simulates out-of-band damage that
+// registration itself can never write.
+func setupCorruptCLIArchive(t *testing.T, corruptSpec string) string {
+	t.Helper()
+	dir := setupCLIArchive(t)
+	path := filepath.Join(dir, "archive.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var specs []json.RawMessage
+	if err := json.Unmarshal(doc["versionSpecs"], &specs); err != nil {
+		t.Fatalf("fixture archive missing versionSpecs: %v", err)
+	}
+	found := false
+	for i, spec := range specs {
+		var head struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(spec, &head); err != nil {
+			continue
+		}
+		if head.ID == "candC" {
+			specs[i] = json.RawMessage(corruptSpec)
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("candC stored spec not found in fixture")
+	}
+	patched, err := json.Marshal(specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc["versionSpecs"] = patched
+	rewritten, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, rewritten, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestCLICompareCorruptVersionRejected covers the CLI contract for a
+// damaged registered version: non-zero exit, the reason on stderr only
+// (no success JSON or partial comparison on stdout), and wording that
+// distinguishes a corrupt version from an unknown version or block and
+// names the version and bad field.
+func TestCLICompareCorruptVersionRejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		spec      string
+		wantField string
+	}{
+		{"multiplier zero", `{"id":"candC","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":0}}}`, "multiplier"},
+		{"multiplier missing", `{"id":"candC","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2}}}`, "multiplier"},
+		{"severity null", `{"id":"candC","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":null,"multiplier":2}}}`, "displacement.severity"},
+		{"rule object missing", `{"id":"candC","rules":{"sandwich":{"enabled":true,"severity":3}}}`, "displacement"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := setupCorruptCLIArchive(t, tc.spec)
+			res := runCLI(t, "compare", dir, "1", "0xblk", "candC")
+			if res.exitCode != 1 {
+				t.Fatalf("exit = %d, want 1; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+			}
+			if res.stdout != "" {
+				t.Fatalf("failure must print no JSON, got %q", res.stdout)
+			}
+			if !strings.Contains(res.stderr, "corrupt") {
+				t.Fatalf("stderr must report corrupt archived rules, got %q", res.stderr)
+			}
+			if !strings.Contains(res.stderr, "candC") {
+				t.Fatalf("stderr must name the requested version, got %q", res.stderr)
+			}
+			if !strings.Contains(res.stderr, tc.wantField) {
+				t.Fatalf("stderr = %q, must name the bad field %q", res.stderr, tc.wantField)
+			}
+		})
+	}
+}
+
+// TestCLICompareCorruptVersionDistinctFromUnknown pins the three failure
+// categories apart in stderr wording.
+func TestCLICompareCorruptVersionDistinctFromUnknown(t *testing.T) {
+	dir := setupCorruptCLIArchive(t, `{"id":"candC","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2}}}`)
+	corrupt := runCLI(t, "compare", dir, "1", "0xblk", "candC")
+	if !strings.Contains(corrupt.stderr, "corrupt") || strings.Contains(corrupt.stderr, "unknown version") {
+		t.Fatalf("corrupt wording wrong: %q", corrupt.stderr)
+	}
+	unknown := runCLI(t, "compare", dir, "1", "0xblk", "ghost")
+	if !strings.Contains(unknown.stderr, "unknown version") || strings.Contains(unknown.stderr, "corrupt") {
+		t.Fatalf("unknown-version wording wrong: %q", unknown.stderr)
+	}
+}
+
+// TestCLICompareCorruptVersionIsReadOnly checks a failed compare against a
+// damaged version leaves the archive file and enabled marker untouched.
+func TestCLICompareCorruptVersionIsReadOnly(t *testing.T) {
+	dir := setupCorruptCLIArchive(t, `{"id":"candC","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":0}}}`)
+	path := filepath.Join(dir, "archive.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		res := runCLI(t, "compare", dir, "1", "0xblk", "candC")
+		if res.exitCode != 1 || res.stdout != "" {
+			t.Fatalf("corrupt compare must fail cleanly: code=%d stdout=%q", res.exitCode, res.stdout)
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("failed compare rewrote the archive")
+	}
+	// Listing fails honestly because the archive contains a damaged
+	// version; it must not paper over it. Enable the marker check by
+	// reading the file directly instead.
+	var onDisk struct {
+		EnabledVersion string `json:"enabledVersion"`
+	}
+	if err := json.Unmarshal(after, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.EnabledVersion != "liveB" {
+		t.Fatalf("enabled marker changed to %q", onDisk.EnabledVersion)
+	}
+	report, err := mevwatch.Query(dir, "1", "0xblk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Version.ID != "archA" || len(report.Findings) != 3 {
+		t.Fatalf("archived report changed: %+v", report)
+	}
+}

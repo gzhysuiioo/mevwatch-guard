@@ -24,6 +24,13 @@ var ErrUnknownVersion = errors.New("unknown version")
 // with different parameters.
 var ErrVersionConflict = errors.New("version already registered with different parameters")
 
+// ErrCorruptVersion reports a registered version whose stored declaration
+// cannot be used: a missing rule object or required field, a null field, a
+// wrong type, or an out-of-range value. The corrupted version is never
+// repaired with defaults, the built-in rules or the enabled version; the
+// wrapping message names the requested version id and the bad field.
+var ErrCorruptVersion = errors.New("archived rule version is corrupt")
+
 // SandwichRule configures the sandwich rule: whether it runs and the
 // severity of its conclusions.
 type SandwichRule struct {
@@ -245,16 +252,73 @@ func ParseRuleVersion(raw []byte) (RuleVersion, error) {
 	}, nil
 }
 
+// migrateVersionSpecs returns the archive's registered versions as their
+// exact registration documents, migrating the older parsed layout in
+// memory. Old archives stored versions only after they passed registration
+// validation, so their reserialized documents are complete; the documents
+// are re-parsed on every resolution regardless. No data is written back.
+func migrateVersionSpecs(data archiveData) []json.RawMessage {
+	if len(data.VersionSpecs) > 0 {
+		return data.VersionSpecs
+	}
+	if len(data.Versions) == 0 {
+		return nil
+	}
+	specs := make([]json.RawMessage, 0, len(data.Versions))
+	for _, v := range data.Versions {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			// RuleVersion contains only strings, bools and ints.
+			continue
+		}
+		specs = append(specs, raw)
+	}
+	return specs
+}
+
+// specVersionID extracts just the id field of a stored registration
+// document so a corrupted version can still be named in error messages.
+// The document's shape is validated separately through ParseRuleVersion.
+func specVersionID(raw json.RawMessage) string {
+	var head struct {
+		ID *string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil || head.ID == nil {
+		return ""
+	}
+	return *head.ID
+}
+
+// parseStoredVersion validates one archived registration document. Any
+// defect — missing object or field, null, wrong type, out-of-range value —
+// is reported as a corrupted version, naming the requested id and the
+// offending rule or field; the parameters are never replaced by defaults.
+func parseStoredVersion(raw json.RawMessage, requestedID string) (RuleVersion, error) {
+	v, err := ParseRuleVersion(raw)
+	if err != nil {
+		id := requestedID
+		if stored := specVersionID(raw); stored != "" {
+			id = stored
+		}
+		return RuleVersion{}, fmt.Errorf("%w %q: %v", ErrCorruptVersion, id, err)
+	}
+	return v, nil
+}
+
 // findVersion resolves id against the built-in version and the archive's
-// registered versions.
+// registered versions. A registered version is re-parsed and fully
+// re-validated on every lookup, so a damaged declaration is a
+// ErrCorruptVersion error rather than a set of zero-valued parameters.
 func findVersion(data archiveData, id string) (RuleVersion, error) {
 	if id == BuiltinVersionID {
 		return BuiltinVersion(), nil
 	}
-	for _, v := range data.Versions {
-		if v.ID == id {
-			return v, nil
+	for _, raw := range migrateVersionSpecs(data) {
+		stored := specVersionID(raw)
+		if stored != id {
+			continue
 		}
+		return parseStoredVersion(raw, id)
 	}
 	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
 }
@@ -295,15 +359,27 @@ func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err e
 	if err != nil {
 		return RuleVersion{}, false, err
 	}
-	for _, existing := range data.Versions {
-		if existing.ID == v.ID {
-			if existing.Rules == v.Rules {
-				return existing, false, nil
-			}
-			return RuleVersion{}, false, fmt.Errorf("%w: %s", ErrVersionConflict, v.ID)
+	specs := migrateVersionSpecs(data)
+	// Only a prior declaration with this same id matters for the
+	// idempotent/conflict checks. Damaged documents belonging to other
+	// versions are never touched, so registering an unrelated version
+	// keeps working even while one version in the archive is corrupt.
+	for _, raw := range specs {
+		if specVersionID(raw) != v.ID {
+			continue
 		}
+		existing, perr := parseStoredVersion(raw, v.ID)
+		if perr != nil {
+			return RuleVersion{}, false, perr
+		}
+		if existing.Rules == v.Rules {
+			return existing, false, nil
+		}
+		return RuleVersion{}, false, fmt.Errorf("%w: %s", ErrVersionConflict, v.ID)
 	}
-	data.Versions = append(data.Versions, v)
+	specs = append(specs, json.RawMessage(append([]byte(nil), raw...)))
+	data.VersionSpecs = specs
+	data.Versions = nil
 	if err := writeArchiveAtomic(dir, data); err != nil {
 		return RuleVersion{}, false, err
 	}
@@ -360,7 +436,14 @@ func ListVersions(dir string) (versions []RuleVersion, enabled string, err error
 	if err != nil {
 		return nil, "", err
 	}
-	versions = append([]RuleVersion{BuiltinVersion()}, data.Versions...)
+	versions = append(versions, BuiltinVersion())
+	for _, raw := range migrateVersionSpecs(data) {
+		v, verr := parseStoredVersion(raw, "")
+		if verr != nil {
+			return nil, "", verr
+		}
+		versions = append(versions, v)
+	}
 	enabled = data.EnabledVersion
 	if enabled == "" {
 		enabled = BuiltinVersionID
@@ -418,7 +501,11 @@ type CompareResult struct {
 // registered version and diffs the conclusions against the archived
 // report. It only reads the archive: the original input file is not
 // needed, and neither the archived report nor the enabled version is
-// modified.
+// modified. The selected version is re-parsed and fully validated from
+// its stored declaration before any swap is judged — even for a block
+// with no swaps — so a missing, null, mistyped or out-of-range parameter
+// fails with ErrCorruptVersion instead of being replaced by zero values,
+// the built-in rules, the enabled version or any default.
 func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if _, err := os.Stat(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
