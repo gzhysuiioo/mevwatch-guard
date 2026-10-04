@@ -511,6 +511,112 @@ func TestKVRoundTripRejectsBadFieldTypes(t *testing.T) {
 	}
 }
 
+// TestKVRejectionsPreserveApplyBoundary 覆盖“已提交前缀 + 未提交尾部”状态下
+// 两类拒绝的边界：前缀不匹配的较高任期请求只更新任期，日志、提交位置、已应用
+// 位置与键值表全部保持原值，且不产生应用错误；字段非法的请求连任期都不得改变。
+// 两种拒绝之后，合法请求仍能正常追加、提交并应用，逐条结果按输入顺序呈现。
+func TestKVRejectionsPreserveApplyBoundary(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 2, "set balance=100"), entry(2, 2, "set balance=200"),
+	}}
+	// 前缀不匹配：prevLogIndex 指向 idx2 却声称其任期为 3（实际为 2）。
+	prefixMismatch := AppendRequest{Term: 5, PrevLogIndex: 2, PrevLogTerm: 3, LeaderCommit: 3}
+	// 字段非法：条目索引没有从 prevLogIndex+1 开始，即使任期更高、声称提交更多。
+	indexGap := AppendRequest{Term: 9, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 5,
+		Entries: []LogEntry{entry(4, 9, "set balance=999")}}
+	// 合法请求：正确匹配 idx2，追加 idx3 并提交到 3。
+	appendAndCommit := AppendRequest{Term: 5, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+		Entries: []LogEntry{entry(3, 5, "set receipt=ok")}}
+
+	// 输入停在第一条请求时：任期升到 5，但最终键值表仍只有已提交的 balance=100。
+	stopped := runKV(t, initial, prefixMismatch)
+	if stopped.FinalTerm != 5 || stopped.FinalCommittedIndex != 1 {
+		t.Fatalf("stopped early: term=%d committedIndex=%d, want 5/1",
+			stopped.FinalTerm, stopped.FinalCommittedIndex)
+	}
+	if kv := finalKVOf(t, stopped); !reflect.DeepEqual(kv, map[string]string{"balance": "100"}) {
+		t.Fatalf("stopped early: finalKV = %v, want only balance=100", kv)
+	}
+	if *stopped.FinalAppliedIndex != 1 || stopped.FinalApplyError != nil {
+		t.Fatalf("stopped early: appliedIndex=%d applyError=%+v, want 1/nil",
+			*stopped.FinalAppliedIndex, stopped.FinalApplyError)
+	}
+
+	out := runKV(t, initial, prefixMismatch, indexGap, appendAndCommit)
+	if len(out.Results) != 3 {
+		t.Fatalf("expected 3 results, got %+v", out.Results)
+	}
+
+	// 第一条：前缀不匹配拒绝；任期更新保留，日志、提交与应用位置不变，无应用错误。
+	first := out.Results[0]
+	if first.Accepted || first.Reason != ReasonPrevLogMismatch {
+		t.Fatalf("result 0 = %+v, want prev-log-mismatch rejection", first)
+	}
+	if first.Term != 5 || first.CommittedIndex != 1 {
+		t.Fatalf("result 0 term/committedIndex = %d/%d, want 5/1", first.Term, first.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, first); got != 1 {
+		t.Fatalf("result 0 appliedIndex = %d, want 1", got)
+	}
+	if first.ApplyError != nil {
+		t.Fatalf("result 0 unexpected apply error: %+v", first.ApplyError)
+	}
+
+	// 第二条：字段非法整条拒绝，连当前任期都不得改变——与前一种拒绝留下的
+	// 状态变化不同（任期停在 5 而不是 9）。
+	second := out.Results[1]
+	if second.Accepted || second.Reason != ReasonEntryIndexGap {
+		t.Fatalf("result 1 = %+v, want entry-index-gap rejection", second)
+	}
+	if second.Term != 5 || second.CommittedIndex != 1 {
+		t.Fatalf("result 1 term/committedIndex = %d/%d, want 5/1", second.Term, second.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, second); got != 1 {
+		t.Fatalf("result 1 appliedIndex = %d, want 1", got)
+	}
+	if second.ApplyError != nil {
+		t.Fatalf("result 1 unexpected apply error: %+v", second.ApplyError)
+	}
+
+	// 第三条：合法请求照常接受，追加 idx3 并提交到 3，未应用的命令按原日志
+	// 顺序应用（idx2 的 balance=200 先于 idx3 的 receipt=ok）。
+	third := out.Results[2]
+	if !third.Accepted || third.Reason != ReasonOK {
+		t.Fatalf("result 2 = %+v, want acceptance", third)
+	}
+	if third.Term != 5 || third.CommittedIndex != 3 {
+		t.Fatalf("result 2 term/committedIndex = %d/%d, want 5/3", third.Term, third.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, third); got != 3 {
+		t.Fatalf("result 2 appliedIndex = %d, want 3", got)
+	}
+	if third.ApplyError != nil {
+		t.Fatalf("result 2 unexpected apply error: %+v", third.ApplyError)
+	}
+
+	// 最终输出与逐条结果一致：两条原日志完整保留，非法请求的高任期与高
+	// leaderCommit 均未生效，未确认的命令没有写进键值表。
+	if out.FinalTerm != 5 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("final term/committedIndex = %d/%d, want 5/3", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	wantLog := []LogEntry{
+		entry(1, 2, "set balance=100"), entry(2, 2, "set balance=200"), entry(3, 5, "set receipt=ok"),
+	}
+	if !reflect.DeepEqual(out.FinalLog, wantLog) {
+		t.Fatalf("finalLog = %+v, want %+v", out.FinalLog, wantLog)
+	}
+	if *out.FinalAppliedIndex != 3 {
+		t.Fatalf("finalAppliedIndex = %d, want 3", *out.FinalAppliedIndex)
+	}
+	wantKV := map[string]string{"balance": "200", "receipt": "ok"}
+	if kv := finalKVOf(t, out); !reflect.DeepEqual(kv, wantKV) {
+		t.Fatalf("finalKV = %v, want %v", kv, wantKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("unexpected final apply error: %+v", out.FinalApplyError)
+	}
+}
+
 // decodeMap 把 JSON 解码为通用对象，便于只按“键是否出现”断言输出形状
 // （不能用字符串包含判断：appliedIndex 是 finalAppliedIndex 的子串）。
 func decodeMap(t *testing.T, data []byte) map[string]any {
