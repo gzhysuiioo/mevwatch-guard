@@ -581,6 +581,19 @@ func sortReviewDetails(details []ReviewDetail) {
 	})
 }
 
+// evaluateArchiveDoc mirrors the archive file the way an evaluation reads
+// it: records and reviews fully decoded, but each registered version kept
+// as its raw stored document. A corrupt version entry — a missing or
+// wrong-typed multiplier, say — then cannot break the read, masquerade as
+// whole-archive corruption, or contaminate intact versions; the version the
+// caller actually named is judged on its own by intactVersion, exactly as
+// the single-block comparison does.
+type evaluateArchiveDoc struct {
+	Records  []record          `json:"records"`
+	Versions []json.RawMessage `json:"versions"`
+	Reviews  []ReviewObject    `json:"reviews"`
+}
+
 // EvaluateReviews re-judges every archived block on chainID in the inclusive
 // range [startHeight, endHeight] under the given registered rule version and
 // compares the candidate conclusions against archived originals, using only
@@ -590,9 +603,14 @@ func sortReviewDetails(details []ReviewDetail) {
 // matter) and missed; false positives split into still hit and eliminated.
 // A candidate hit on the same tx and kind without a valid (non-withdrawn)
 // review counts as pending, as does the new kind when the candidate changes
-// a tx's conclusion type; withdrawn objects behave as unreviewed. The call
-// is read-only: reports, the enabled version, reviews and alert records are
-// never modified. An empty range yields zero counts and an empty list.
+// a tx's conclusion type; withdrawn objects behave as unreviewed. The named
+// version's stored document must still satisfy the registration rules in
+// full; a corrupt one fails with ErrCorruptVersion — naming the version and
+// the offending rule or field — rather than evaluating under zeroed or
+// substituted parameters, and it fails the same way whether or not the
+// range holds any block, swap or valid review. The call is read-only:
+// reports, the enabled version, reviews and alert records are never
+// modified. An empty range yields zero counts and an empty list.
 func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, versionID string) (ReviewEvaluation, error) {
 	if strings.TrimSpace(chainID) == "" {
 		return ReviewEvaluation{}, errors.New("chainId must be a non-empty string")
@@ -630,23 +648,33 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	data, err := readArchiveBytes(dir)
 	if err != nil {
 		return ReviewEvaluation{}, err
 	}
-	candidate, err := findVersion(data, versionID)
+	var doc evaluateArchiveDoc
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &doc); err != nil {
+			return ReviewEvaluation{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	// The requested version must be intact in the archive: re-validate its
+	// stored document before judging anything, so a corrupt version fails
+	// the same way even when the range matches no blocks, the blocks carry
+	// no swaps, or no conclusion has a valid review.
+	candidate, err := intactVersion(doc.Versions, versionID)
 	if err != nil {
 		return ReviewEvaluation{}, err
 	}
 	result.Version = candidate
 
-	reviews := make(map[conclusionKey]*ReviewObject, len(data.Reviews))
-	for i := range data.Reviews {
-		reviews[data.Reviews[i].key()] = &data.Reviews[i]
+	reviews := make(map[conclusionKey]*ReviewObject, len(doc.Reviews))
+	for i := range doc.Reviews {
+		reviews[doc.Reviews[i].key()] = &doc.Reviews[i]
 	}
 
 	details := []ReviewDetail{}
-	for _, rec := range data.Records {
+	for _, rec := range doc.Records {
 		if rec.ChainID != chainID {
 			continue
 		}
