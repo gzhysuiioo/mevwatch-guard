@@ -504,6 +504,11 @@ func TestKVRoundTripRejectsBadFieldTypes(t *testing.T) {
 		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"finalKV":[]}`,
 		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"finalApplyError":{"index":"2","reason":"x"}}`,
 		`{"results":[{"accepted":true,"reason":"ok","term":1,"committedIndex":0,"appliedIndex":"0"}],"finalTerm":1,"finalCommittedIndex":0,"finalLog":[]}`,
+		// 字段名仅大小写不同时，非法类型仍按解码错误处理，不能被当作零值接受。
+		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"FinalAppliedIndex":"0"}`,
+		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"FINALKV":[]}`,
+		`{"results":[],"finalTerm":0,"finalCommittedIndex":0,"finalLog":[],"finalapplyerror":{"index":"2","reason":"x"}}`,
+		`{"results":[{"accepted":true,"reason":"ok","term":1,"committedIndex":0,"APPLIEDINDEX":"0"}],"finalTerm":1,"finalCommittedIndex":0,"finalLog":[]}`,
 	} {
 		var out ReplicateOutput
 		if err := json.Unmarshal([]byte(data), &out); err == nil {
@@ -1047,6 +1052,11 @@ func TestKVRoundTripFailedReuseKeepsPreviousResult(t *testing.T) {
 		`{"results":[],"finalTerm":9,"finalCommittedIndex":9,"finalLog":[],"finalAppliedIndex":"9"}`,
 		// 最终层：键值表写成数组。
 		`{"results":[],"finalTerm":9,"finalCommittedIndex":9,"finalLog":[],"finalKV":["nope"]}`,
+		// 字段名仅大小写不同时同样必须报解码错误，不能借大小写绕开类型校验。
+		`{"results":[{"accepted":true,"reason":"ok","term":9,"committedIndex":9,"AppliedIndex":"3"}],"finalTerm":9,"finalCommittedIndex":9,"finalLog":[]}`,
+		`{"results":[],"finalTerm":9,"finalCommittedIndex":9,"finalLog":[],"FINALAPPLIEDINDEX":"9"}`,
+		`{"results":[],"finalTerm":9,"finalCommittedIndex":9,"finalLog":[],"FinalKV":["nope"]}`,
+		`{"results":[{"accepted":true,"reason":"ok","term":9,"committedIndex":9,"ApplyError":{"index":"3","reason":"x"}}],"finalTerm":9,"finalCommittedIndex":9,"finalLog":[]}`,
 	}
 	for _, bad := range badInputs {
 		var out ReplicateOutput
@@ -1125,5 +1135,302 @@ func TestKVCommitAfterOverflowFieldErrorApplies(t *testing.T) {
 	}
 	if out.FinalTerm != 3 || *out.FinalAppliedIndex != 2 {
 		t.Fatalf("unexpected final state: term=%d applied=%+v", out.FinalTerm, out.FinalAppliedIndex)
+	}
+}
+
+// TestKVRoundTripCasedPerRequestFieldName 回归保障：单条请求答复中的应用字段名
+// 仅大小写不同（现有解码本来就接受）时，读回后也必须按应用字段已出现处理，
+// 与值是否为空无关——再次输出必须带齐 appliedIndex 与 applyError，缺索引补 0、
+// 无错误补 null；已提供的非零索引与错误中的索引、原因原样保留，并使用标准
+// 字段名输出。
+func TestKVRoundTripCasedPerRequestFieldName(t *testing.T) {
+	cases := []struct {
+		name      string
+		extra     string
+		wantIndex float64
+		wantError any // nil 表示输出必须为 null；否则为期望的错误对象
+	}{
+		{"only null cased apply error", `"ApplyError":null`, 0, nil},
+		{"only zero cased applied index", `"APPLIEDINDEX":0`, 0, nil},
+		{"only nonzero cased applied index", `"AppliedIndex":5`, 5, nil},
+		{"only cased apply error object",
+			`"APPLYERROR":{"index":3,"reason":"boom"}`, 0,
+			map[string]any{"index": float64(3), "reason": "boom"}},
+		{"mixed-case error object preserves values",
+			`"aPpLiEdInDeX":4,"aPpLyErRoR":{"index":5,"reason":"why"}`, 4,
+			map[string]any{"index": float64(5), "reason": "why"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := `{"accepted":true,"reason":"ok","term":2,"committedIndex":1,` + tc.extra + `}`
+			var result AppendResult
+			if err := json.Unmarshal([]byte(data), &result); err != nil {
+				t.Fatal(err)
+			}
+			reencoded, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := decodeMap(t, reencoded)
+			mustHaveKeys(t, m, "per-request result", "appliedIndex", "applyError")
+			// 输出必须沿用标准字段名，不保留读入时的大小写写法。
+			if len(m) != 6 {
+				t.Fatalf("unexpected keys in re-encoded result: %v", m)
+			}
+			if m["appliedIndex"] != tc.wantIndex {
+				t.Fatalf("appliedIndex = %v, want %v: %v", m["appliedIndex"], tc.wantIndex, m)
+			}
+			if tc.wantError == nil {
+				if m["applyError"] != nil {
+					t.Fatalf("applyError = %v, want null: %v", m["applyError"], m)
+				}
+			} else if !reflect.DeepEqual(m["applyError"], tc.wantError) {
+				t.Fatalf("applyError = %v, want %v", m["applyError"], tc.wantError)
+			}
+			if m["accepted"] != true || m["reason"] != "ok" ||
+				m["term"] != float64(2) || m["committedIndex"] != float64(1) {
+				t.Fatalf("replication fields changed: %v", m)
+			}
+		})
+	}
+}
+
+// TestKVRoundTripCasedFinalFieldName 回归保障最终结果一层：finalAppliedIndex、
+// finalKV、finalApplyError 中任一字段名仅大小写不同地出现时，读回再输出必须
+// 带齐三个标准字段；缺索引补 0、缺或 null 键值表补 {}、无错误补 null；非零
+// 索引、键值内容、错误索引与原因原样保留。
+func TestKVRoundTripCasedFinalFieldName(t *testing.T) {
+	cases := []struct {
+		name      string
+		extra     string
+		wantIndex float64
+		wantKV    any // 表示必须输出的键值表
+		wantError any // nil 表示必须输出 null
+	}{
+		{"only null cased final apply error", `"FinalApplyError":null`, 0,
+			map[string]any{}, nil},
+		{"only zero cased final applied index", `"FINALAPPLIEDINDEX":0`, 0,
+			map[string]any{}, nil},
+		{"only nonzero cased final applied index", `"FinalAppliedIndex":7`, 7,
+			map[string]any{}, nil},
+		{"only empty cased final kv", `"FINALKV":{}`, 0, map[string]any{}, nil},
+		{"only nonempty cased final kv",
+			`"FinalKv":{"a":"1","b":"x=y"}`, 0,
+			map[string]any{"a": "1", "b": "x=y"}, nil},
+		{"only cased final apply error object",
+			`"fInAlApPlYeRrOr":{"index":2,"reason":"` + ApplyReasonSetMissingEquals + `"}`, 0,
+			map[string]any{},
+			map[string]any{"index": float64(2), "reason": ApplyReasonSetMissingEquals}},
+		{"all cased names preserve values",
+			`"FINALAPPLIEDINDEX":6,"FINALKV":{"k":"v"},"FINALAPPLYERROR":{"index":7,"reason":"boom"}`, 6,
+			map[string]any{"k": "v"},
+			map[string]any{"index": float64(7), "reason": "boom"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := `{"results":[],"finalTerm":2,"finalCommittedIndex":1,` +
+				`"finalLog":[{"index":1,"term":1,"command":"set a=1"}],` + tc.extra + `}`
+			var out ReplicateOutput
+			if err := json.Unmarshal([]byte(data), &out); err != nil {
+				t.Fatal(err)
+			}
+			reencoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := decodeMap(t, reencoded)
+			mustHaveKeys(t, m, "final output",
+				"finalAppliedIndex", "finalKV", "finalApplyError")
+			if m["finalAppliedIndex"] != tc.wantIndex {
+				t.Fatalf("finalAppliedIndex = %v, want %v: %v",
+					m["finalAppliedIndex"], tc.wantIndex, m)
+			}
+			if !reflect.DeepEqual(m["finalKV"], tc.wantKV) {
+				t.Fatalf("finalKV = %v, want %v", m["finalKV"], tc.wantKV)
+			}
+			if tc.wantError == nil {
+				if m["finalApplyError"] != nil {
+					t.Fatalf("finalApplyError = %v, want null: %v",
+						m["finalApplyError"], m)
+				}
+			} else if !reflect.DeepEqual(m["finalApplyError"], tc.wantError) {
+				t.Fatalf("finalApplyError = %v, want %v", m["finalApplyError"], tc.wantError)
+			}
+			if m["finalTerm"] != float64(2) || m["finalCommittedIndex"] != float64(1) {
+				t.Fatalf("final replication fields changed: %v", m)
+			}
+		})
+	}
+}
+
+// TestKVRoundTripCasedFieldLevelsIndependent 字段是否出现仍按各层各自判断，
+// 大小写变体也不例外：最终层出现大小写不同的应用字段时，没有应用字段的请求
+// 答复不能凭空补齐；某条请求带大小写不同的应用字段时，最终结果与其他请求也
+// 不能凭空补齐。
+func TestKVRoundTripCasedFieldLevelsIndependent(t *testing.T) {
+	perRequestKeys := []string{"appliedIndex", "applyError"}
+	finalKeys := []string{"finalAppliedIndex", "finalKV", "finalApplyError"}
+	cases := []struct {
+		name         string
+		data         string
+		finalApplied bool
+	}{
+		{
+			"cased final level keys, requests mixed plain and applied",
+			`{"results":[` +
+				`{"accepted":true,"reason":"ok","term":3,"committedIndex":0},` +
+				`{"accepted":false,"reason":"stale term: leader term is lower than current term","term":3,"committedIndex":0,"APPLIEDINDEX":2,"APPLYERROR":{"index":3,"reason":"boom"}}` +
+				`],"finalTerm":3,"finalCommittedIndex":0,"finalLog":[],` +
+				`"FinalAppliedIndex":2,"FinalKV":{"k":"v"},"FinalApplyError":{"index":3,"reason":"boom"}}`,
+			true,
+		},
+		{
+			"no final level keys, requests mixed cased applied and plain",
+			`{"results":[` +
+				`{"accepted":true,"reason":"ok","term":1,"committedIndex":0,"AppliedIndex":0,"ApplyError":null},` +
+				`{"accepted":true,"reason":"ok","term":1,"committedIndex":0}` +
+				`],"finalTerm":1,"finalCommittedIndex":0,"finalLog":[]}`,
+			false,
+		},
+		{
+			"only cased final level key, all requests plain",
+			`{"results":[` +
+				`{"accepted":true,"reason":"ok","term":1,"committedIndex":0}` +
+				`],"finalTerm":1,"finalCommittedIndex":0,"finalLog":[],"FINALKV":{}}`,
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out ReplicateOutput
+			if err := json.Unmarshal([]byte(tc.data), &out); err != nil {
+				t.Fatal(err)
+			}
+			reencoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := decodeMap(t, reencoded)
+			results := resultMaps(t, m)
+			if tc.finalApplied {
+				mustHaveKeys(t, m, "final output", finalKeys...)
+				plainIdx := 0
+				if tc.name == "only cased final level key, all requests plain" {
+					mustLackKeys(t, results[0], "plain request", perRequestKeys...)
+					return
+				}
+				mustLackKeys(t, results[plainIdx], "plain request", perRequestKeys...)
+				mustHaveKeys(t, results[1], "applied request", perRequestKeys...)
+				if results[1]["appliedIndex"] != float64(2) {
+					t.Fatalf("request appliedIndex changed: %v", results[1])
+				}
+				if !reflect.DeepEqual(results[1]["applyError"],
+					map[string]any{"index": float64(3), "reason": "boom"}) {
+					t.Fatalf("request applyError changed: %v", results[1])
+				}
+				if !reflect.DeepEqual(m["finalKV"], map[string]any{"k": "v"}) {
+					t.Fatalf("finalKV changed: %v", m["finalKV"])
+				}
+			} else {
+				mustHaveKeys(t, results[0], "applied request", perRequestKeys...)
+				if results[0]["appliedIndex"] != float64(0) || results[0]["applyError"] != nil {
+					t.Fatalf("applied request values changed: %v", results[0])
+				}
+				mustLackKeys(t, results[1], "plain request", perRequestKeys...)
+				mustLackKeys(t, m, "final output", finalKeys...)
+			}
+		})
+	}
+}
+
+// TestKVRoundTripSimilarUnrelatedKeysNotTriggered 与应用字段名相似、但并非忽略
+// 大小写相等的键不能触发补齐；完全没有应用字段的结果继续保持原有输出形状。
+func TestKVRoundTripSimilarUnrelatedKeysNotTriggered(t *testing.T) {
+	perRequest := []string{
+		`"appliedindexx":0`,
+		`"apply_errors":null`,
+		`"AppliedIndex ":0`, // 尾部空格不是大小写差异
+		`"applied_index":0`,
+		`"appliedindices":0`,
+	}
+	for _, extra := range perRequest {
+		data := `{"accepted":true,"reason":"ok","term":1,"committedIndex":0,` + extra + `}`
+		var result AppendResult
+		if err := json.Unmarshal([]byte(data), &result); err != nil {
+			t.Fatalf("%s: %v", data, err)
+		}
+		reencoded, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := decodeMap(t, reencoded)
+		mustLackKeys(t, m, "per-request result", "appliedIndex", "applyError")
+	}
+
+	final := []string{
+		`"finalappliedindexx":0`,
+		`"final_kv":{}`,
+		`"finalapplyerrors":null`,
+		`"FinalKV2":{"a":"1"}`,
+		`"myfinalappliedindex":1`,
+	}
+	for _, extra := range final {
+		data := `{"results":[],"finalTerm":1,"finalCommittedIndex":0,"finalLog":[],` + extra + `}`
+		var out ReplicateOutput
+		if err := json.Unmarshal([]byte(data), &out); err != nil {
+			t.Fatalf("%s: %v", data, err)
+		}
+		reencoded, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := decodeMap(t, reencoded)
+		mustLackKeys(t, m, "final output",
+			"finalAppliedIndex", "finalKV", "finalApplyError")
+	}
+}
+
+// TestKVRoundTripCasedKeysReuseObjectLeavesNoResidue 复用同一结果对象：先用大小
+// 写变体字段名读入启用应用的结果（必须被识别为已出现），再读入完全没有应用
+// 字段的结果——后一次输出不得残留前一次的键值表、错误或应用位置。
+func TestKVRoundTripCasedKeysReuseObjectLeavesNoResidue(t *testing.T) {
+	enabledCased := `{"results":[` +
+		`{"accepted":true,"reason":"ok","term":1,"committedIndex":1,"AppliedIndex":1,"ApplyError":null}` +
+		`],"finalTerm":1,"finalCommittedIndex":1,` +
+		`"finalLog":[{"index":1,"term":1,"command":"set x=1"}],` +
+		`"FinalAppliedIndex":1,"FinalKV":{"x":"1"},"FinalApplyError":null}`
+	disabled := run(t, InitialState{CurrentTerm: 1, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set x=1"),
+	}}, AppendRequest{Term: 1, PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 1})
+	disabledJSON, err := json.Marshal(disabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ReplicateOutput
+	if err := json.Unmarshal([]byte(enabledCased), &out); err != nil {
+		t.Fatal(err)
+	}
+	// 先确认大小写变体确实被识别为应用字段已出现。
+	first, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMap := decodeMap(t, first)
+	mustHaveKeys(t, firstMap, "first read",
+		"finalAppliedIndex", "finalKV", "finalApplyError")
+	if err := json.Unmarshal(disabledJSON, &out); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"appliedIndex", "applyError", "finalAppliedIndex", "finalKV", "finalApplyError"} {
+		if strings.Contains(string(body), field) {
+			t.Fatalf("stale apply field %q after reusing object: %s", field, body)
+		}
+	}
+	if out.FinalKV != nil || out.FinalAppliedIndex != nil || out.FinalApplyError != nil {
+		t.Fatalf("stale apply state in %+v", out)
 	}
 }

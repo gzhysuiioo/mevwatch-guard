@@ -5,6 +5,7 @@ package mevwatch
 
 import (
 	"encoding/json"
+	"strings"
 )
 
 // 两层结果共用的应用字段规则：
@@ -21,9 +22,12 @@ import (
 //
 // 读入：按该层 JSON 中是否出现任一应用字段恢复开关。出现任一字段即视为
 // 启用应用的结果，再次输出时带上该层完整应用字段；完全未出现则不补上。
-// 两层各自独立判断，互不推断。读入会用解码出的新值完整替换结果对象，不
-// 残留上一次读入的键值表、应用位置或错误；字段类型不合法照常返回解码
-// 错误，不会把错误内容当作零值接受。
+// 字段是否出现与解码一致地按忽略大小写判定——现有解码接受的仅大小写不同
+// 的应用字段名（如 ApplyError）同样视为已出现，与其值是否为空无关；其他
+// 与应用字段名并非忽略大小写相等的相似键不会触发。两层各自独立判断，互不
+// 推断。读入会用解码出的新值完整替换结果对象，不残留上一次读入的键值表、
+// 应用位置或错误；字段类型不合法照常返回解码错误，不会把错误内容当作零值
+// 接受。
 
 // appendResultApplyKeys 是 AppendResult 一层用于判定应用字段是否出现的键名。
 var appendResultApplyKeys = []string{"appliedIndex", "applyError"}
@@ -56,15 +60,20 @@ func unmarshalApplyFields[T any](data []byte, dst *T, keys []string) (present bo
 	return present, nil
 }
 
-// jsonHasAnyKey 报告 JSON 对象中是否出现任一给定键。
+// jsonHasAnyKey 报告 JSON 对象中是否出现任一给定键。键名比较与 encoding/json
+// 的字段匹配一致地忽略大小写（其 foldName 折叠结果即 strings.EqualFold），
+// 因此现有解码接受的仅大小写不同的字段名（如 "ApplyError" 之于 "applyError"）
+// 也会被计入“应用字段已出现”。
 func jsonHasAnyKey(data []byte, keys ...string) (bool, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return false, err
 	}
-	for _, key := range keys {
-		if _, ok := raw[key]; ok {
-			return true, nil
+	for presentKey := range raw {
+		for _, key := range keys {
+			if strings.EqualFold(presentKey, key) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
