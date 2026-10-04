@@ -2,6 +2,7 @@ package mevwatch
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -446,5 +447,131 @@ func TestSequentialScenario(t *testing.T) {
 	}
 	if out.FinalCommittedIndex != 3 {
 		t.Fatalf("final commit = %d, want 3", out.FinalCommittedIndex)
+	}
+}
+
+// 首条位置越过 int 上限：prevLogIndex 取 MaxInt、非空条目的首条索引以最小负值
+// 给出（恰好是回绕后的位置）。这是字段错误，按条目索引不连续拒绝：任期、提交
+// 位置与日志都保持请求前状态，不能借高任期抬高节点任期。
+func TestEntryIndexOverflowAtFirstPositionIsFieldError(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1,
+		Log: []LogEntry{entry(1, 2, "a")}}
+	out := run(t, initial,
+		AppendRequest{Term: 9, PrevLogIndex: math.MaxInt, PrevLogTerm: 0, LeaderCommit: 0,
+			Entries: []LogEntry{entry(math.MinInt, 9, "x")}},
+	)
+	result := out.Results[0]
+	if result.Accepted || !strings.Contains(result.Reason, "not consecutive") {
+		t.Fatalf("expected index-gap field error, got %+v", result)
+	}
+	if result.Term != 2 || result.CommittedIndex != 1 {
+		t.Fatalf("field error changed state: %+v", result)
+	}
+	if !reflect.DeepEqual(out.FinalLog, initial.Log) {
+		t.Fatalf("log changed: %+v", out.FinalLog)
+	}
+	if out.FinalTerm != 2 {
+		t.Fatalf("final term changed: %d", out.FinalTerm)
+	}
+}
+
+// 高任期溢出非法请求不能影响后续合法请求：第二条任期 3 的合法追加正常接受，
+// 最终任期为 3，原有已提交条目保留，提交位置随第二条推进。
+func TestOverflowFieldErrorDoesNotPoisonLaterRequest(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1,
+		Log: []LogEntry{entry(1, 2, "a")}}
+	out := run(t, initial,
+		AppendRequest{Term: 9, PrevLogIndex: math.MaxInt, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MinInt, 9, "x")}},
+		AppendRequest{Term: 3, PrevLogIndex: 1, PrevLogTerm: 2, LeaderCommit: 2,
+			Entries: []LogEntry{entry(2, 3, "b")}},
+	)
+	if out.Results[0].Accepted || !strings.Contains(out.Results[0].Reason, "not consecutive") {
+		t.Fatalf("first request should be an index-gap field error, got %+v", out.Results[0])
+	}
+	if out.Results[0].Term != 2 {
+		t.Fatalf("term should stay 2, got %d", out.Results[0].Term)
+	}
+	if !out.Results[1].Accepted || out.Results[1].Reason != ReasonOK {
+		t.Fatalf("valid request after field error rejected: %+v", out.Results[1])
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 2 {
+		t.Fatalf("unexpected final state: term=%d ci=%d", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	want := []LogEntry{entry(1, 2, "a"), entry(2, 3, "b")}
+	if !reflect.DeepEqual(out.FinalLog, want) {
+		t.Fatalf("log = %+v, want %+v", out.FinalLog, want)
+	}
+}
+
+// 溢出点在链中间：首条索引恰好为 MaxInt 合法，下一位置无法表示即整体字段错误，
+// 即使输入的第二个索引恰好是回绕后的 MinInt。
+func TestEntryIndexOverflowMidChainIsFieldError(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1,
+		Log: []LogEntry{entry(1, 2, "a")}}
+	out := run(t, initial,
+		AppendRequest{Term: 9, PrevLogIndex: math.MaxInt - 1, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MaxInt, 9, "x"), entry(math.MinInt, 9, "y")}},
+	)
+	result := out.Results[0]
+	if result.Accepted || !strings.Contains(result.Reason, "not consecutive") {
+		t.Fatalf("expected index-gap field error, got %+v", result)
+	}
+	if result.Term != 2 || result.CommittedIndex != 1 {
+		t.Fatalf("field error changed state: %+v", result)
+	}
+	if !reflect.DeepEqual(out.FinalLog, initial.Log) {
+		t.Fatalf("log changed: %+v", out.FinalLog)
+	}
+}
+
+// 大索引本身不是字段非法：entries 为空时 prevLogIndex 取 MaxInt 也不要求存在
+// 下一位置；非空请求最后条目恰好到达 MaxInt 同样合法。两者前置位置都不在本地
+// 日志中，按原有的前缀不匹配规则拒绝，并保留较高任期更新。
+func TestLargeRepresentableIndexesRemainLegalPrefixMismatch(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1,
+		Log: []LogEntry{entry(1, 2, "a")}}
+	out := run(t, initial,
+		// 空条目心跳：不要求下一条索引存在。
+		AppendRequest{Term: 7, PrevLogIndex: math.MaxInt, PrevLogTerm: 0},
+		// 非空请求，最后一条恰好到达 MaxInt。
+		AppendRequest{Term: 8, PrevLogIndex: math.MaxInt - 1, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MaxInt, 8, "z")}},
+	)
+	if out.Results[0].Accepted || !strings.Contains(out.Results[0].Reason, "prev log mismatch") {
+		t.Fatalf("empty MaxInt heartbeat should be prev mismatch, got %+v", out.Results[0])
+	}
+	if out.Results[0].Term != 7 {
+		t.Fatalf("term update should survive: %d", out.Results[0].Term)
+	}
+	if out.Results[1].Accepted || !strings.Contains(out.Results[1].Reason, "prev log mismatch") {
+		t.Fatalf("last-entry-at-MaxInt request should be prev mismatch, got %+v", out.Results[1])
+	}
+	if out.Results[1].Term != 8 {
+		t.Fatalf("term update should survive: %d", out.Results[1].Term)
+	}
+	if out.FinalTerm != 8 || out.FinalCommittedIndex != 1 || len(out.FinalLog) != 1 {
+		t.Fatalf("state changed: term=%d ci=%d log=%+v", out.FinalTerm, out.FinalCommittedIndex, out.FinalLog)
+	}
+}
+
+// 任何非正的真实条目索引都是字段错误：哨兵之后首条索引不能为 0 或负值，
+// 即使它在补码意义下等于某个回绕位置。
+func TestNonPositiveEntryIndexIsFieldError(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2}
+	cases := []AppendRequest{
+		{Term: 9, PrevLogIndex: 0, Entries: []LogEntry{entry(0, 9, "x")}},
+		{Term: 9, PrevLogIndex: 0, Entries: []LogEntry{entry(-1, 9, "x")}},
+		{Term: 9, PrevLogIndex: 1, Entries: []LogEntry{entry(0, 9, "x")}},
+	}
+	for i, request := range cases {
+		out := run(t, initial, request)
+		result := out.Results[0]
+		if result.Accepted || !strings.Contains(result.Reason, "not consecutive") {
+			t.Fatalf("case %d: expected index-gap field error, got %+v", i, result)
+		}
+		if result.Term != 2 {
+			t.Fatalf("case %d: term changed to %d", i, result.Term)
+		}
 	}
 }

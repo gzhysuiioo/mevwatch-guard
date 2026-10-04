@@ -4,6 +4,7 @@ package mevwatch
 
 import (
 	"fmt"
+	"math"
 )
 
 // LogEntry 是一条日志：Index 从 1 开始连续编号，Term 为该条目写入时的任期，
@@ -323,8 +324,19 @@ func validateRequest(request AppendRequest) string {
 	// 条目必须从前一条索引加 1 开始连续排列；任期为正、沿请求条目自身
 	// 不下降，且不得超过请求（领导者）任期。与 prevLogTerm 的衔接在
 	// tryApply 中单独检查。索引 0 是哨兵，真实条目索引必为正。
+	//
+	// 位置必须用检查过的加法逐条推进：prevLogIndex+1 或链上任一后续位置
+	// 超过当前 int 上限时，输入里的负索引恰好在数学上等于回绕后的位置，
+	// 直接相加会静默溢出把它误判为连续。这种请求属于字段错误，与普通索引
+	// 不连续一样拒绝，不能取得合法请求才有的任期更新效果。空条目不要求
+	// 存在下一位置，最后一条恰好到达 int 上限同样合法。
+	position := request.PrevLogIndex
 	for i, entry := range request.Entries {
-		if entry.Index != request.PrevLogIndex+1+i {
+		if position == math.MaxInt {
+			return ReasonEntryIndexGap // 下一位置无法用 int 表示
+		}
+		position++
+		if entry.Index <= 0 || entry.Index != position {
 			return ReasonEntryIndexGap
 		}
 		if entry.Term <= 0 {

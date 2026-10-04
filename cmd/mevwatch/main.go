@@ -84,8 +84,10 @@ Request fields:
   prevLogIndex  number  index of the log entry immediately before new entries
   prevLogTerm   number  its term; index 0 with term 0 marks the log origin
                         (a sentinel, not a real entry)
-  entries       array   entries to append, must be consecutive from
-                        prevLogIndex+1, may be empty
+  entries       array   entries to append, may be empty; when non-empty
+                        the entry indexes must be positive, consecutive
+                        from prevLogIndex+1, and every position must fit
+                        the platform integer range
   leaderCommit  number  leader's committed index
 
 Processing rules:
@@ -103,6 +105,14 @@ Processing rules:
     requests create no duplicate entries.
   - On success committedIndex advances to min(leaderCommit, last acknowledged
     index = prevLogIndex + len(entries)) but never moves backward.
+  - Real entry indexes must be positive and consecutive from prevLogIndex+1,
+    and prevLogIndex+1 through the last entry's position must all be
+    representable: if the next or any later position exceeds the platform
+    integer maximum (even when a supplied negative index numerically equals
+    the wrapped-around position), the whole request is a field error rejected
+    as non-consecutive entries. Empty entries require no next position, and a
+    non-empty request whose last entry lands exactly on the maximum is legal;
+    such requests are still subject to the ordinary prev-log mismatch rules.
 
 Key/value application (only when applyKV is true):
   - The table starts empty for this invocation. The committed prefix of the

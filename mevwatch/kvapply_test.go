@@ -2,6 +2,7 @@ package mevwatch
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -1063,5 +1064,66 @@ func TestKVRoundTripFailedReuseKeepsPreviousResult(t *testing.T) {
 			t.Fatalf("previous result not preserved after failed decode of %s:\nwant %s\n got %s",
 				bad, originalJSON, reencoded)
 		}
+	}
+}
+
+// 溢出非法请求不应用任何命令：请求被字段错误拒绝后日志与提交位置不变，
+// appliedIndex 停在初始已提交前缀，键值表不含非法请求中的写入。
+func TestKVOverflowFieldErrorAppliesNothing(t *testing.T) {
+	out := runKV(t, InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 2, "set a=1"),
+	}},
+		AppendRequest{Term: 9, PrevLogIndex: math.MaxInt, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MinInt, 9, "set evil=1")}},
+	)
+	result := out.Results[0]
+	if result.Accepted || !strings.Contains(result.Reason, "not consecutive") {
+		t.Fatalf("expected index-gap field error, got %+v", result)
+	}
+	if got := appliedIndexOf(t, result); got != 1 {
+		t.Fatalf("applied index = %d, want 1", got)
+	}
+	if result.ApplyError != nil {
+		t.Fatalf("unexpected apply error: %+v", result.ApplyError)
+	}
+	kv := finalKVOf(t, out)
+	if _, ok := kv["evil"]; ok {
+		t.Fatalf("illegal request command was applied: %+v", kv)
+	}
+	if kv["a"] != "1" {
+		t.Fatalf("initial committed entry missing: %+v", kv)
+	}
+	if out.FinalAppliedIndex == nil || *out.FinalAppliedIndex != 1 {
+		t.Fatalf("final applied index = %+v, want 1", out.FinalAppliedIndex)
+	}
+}
+
+// 非法请求之后的合法提交仍按现有规则应用：第二条追加索引 2 并提交到 2，
+// 键值表随提交位置推进到索引 2。
+func TestKVCommitAfterOverflowFieldErrorApplies(t *testing.T) {
+	out := runKV(t, InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 2, "set a=1"),
+	}},
+		AppendRequest{Term: 9, PrevLogIndex: math.MaxInt, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MinInt, 9, "set evil=1")}},
+		AppendRequest{Term: 3, PrevLogIndex: 1, PrevLogTerm: 2, LeaderCommit: 2,
+			Entries: []LogEntry{entry(2, 3, "set b=2")}},
+	)
+	if !out.Results[1].Accepted {
+		t.Fatalf("valid request rejected: %+v", out.Results[1])
+	}
+	if got := appliedIndexOf(t, out.Results[0]); got != 1 {
+		t.Fatalf("after field error applied index = %d, want 1", got)
+	}
+	if got := appliedIndexOf(t, out.Results[1]); got != 2 {
+		t.Fatalf("after valid commit applied index = %d, want 2", got)
+	}
+	kv := finalKVOf(t, out)
+	want := map[string]string{"a": "1", "b": "2"}
+	if !reflect.DeepEqual(kv, want) {
+		t.Fatalf("kv = %+v, want %+v", kv, want)
+	}
+	if out.FinalTerm != 3 || *out.FinalAppliedIndex != 2 {
+		t.Fatalf("unexpected final state: term=%d applied=%+v", out.FinalTerm, out.FinalAppliedIndex)
 	}
 }

@@ -149,6 +149,45 @@ func TestCLIApplyKVOmittedKeepsOutputShape(t *testing.T) {
 	}
 }
 
+func TestCLIOverflowEntryIndexIsFieldError(t *testing.T) {
+	// prevLogIndex 取 int 最大值、首条真实条目索引以最小负值给出（恰好是
+	// 回绕后的位置）：必须按字段错误拒绝且不抬高任期，随后的合法追加正常接受。
+	input := `{
+	  "currentTerm": 2,
+	  "committedIndex": 1,
+	  "log": [{"index": 1, "term": 2, "command": "a"}],
+	  "requests": [
+	    {"term": 9, "prevLogIndex": 9223372036854775807, "prevLogTerm": 0,
+	     "entries": [{"index": -9223372036854775808, "term": 9, "command": "evil"}],
+	     "leaderCommit": 0},
+	    {"term": 3, "prevLogIndex": 1, "prevLogTerm": 2,
+	     "entries": [{"index": 2, "term": 3, "command": "b"}],
+	     "leaderCommit": 2}
+	  ]
+	}`
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var out mevwatch.ReplicateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	if out.Results[0].Accepted || !strings.Contains(out.Results[0].Reason, "not consecutive") {
+		t.Fatalf("first request should be an index-gap field error, got %+v", out.Results[0])
+	}
+	if out.Results[0].Term != 2 {
+		t.Fatalf("field error must not bump term, got %d", out.Results[0].Term)
+	}
+	if !out.Results[1].Accepted {
+		t.Fatalf("valid follow-up request rejected: %+v", out.Results[1])
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 2 || len(out.FinalLog) != 2 {
+		t.Fatalf("unexpected final state: %+v", out)
+	}
+}
+
 func TestCLIErrors(t *testing.T) {
 	cases := []string{
 		`not json`,
