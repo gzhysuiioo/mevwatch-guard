@@ -137,6 +137,105 @@ type reviewSpec struct {
 	ExpectedVersion *int    `json:"expectedVersion"`
 }
 
+// reviewRule identifies one business limit every review submission must
+// satisfy, however it was supplied (JSON spec or direct call).
+type reviewRule int
+
+const (
+	ruleBlankString        reviewRule = iota // a text field is empty or all whitespace
+	ruleKnownKind                            // the conclusion kind is not sandwich/displacement
+	ruleKnownStatus                          // the status is not real/false_positive/unreviewed
+	ruleNonNegativeVersion                   // the expected version is negative
+)
+
+// reviewViolation is the first business limit a submission breaks. Both
+// submission entries render it with their own longstanding wording.
+type reviewViolation struct {
+	rule    reviewRule
+	field   string // the submission field the rule rejected, in JSON spelling
+	value   string // the offending kind, status or text value
+	version int    // the offending expected version
+}
+
+// validateReviewSubmission applies the business limits every review
+// submission must satisfy, in the order both entries have always reported
+// them: chain, block hash, victim tx hash, kind, submission id, operator,
+// reason, status, then the expected version. It only judges the values —
+// nothing is trimmed, re-cased or replaced — and returns the first
+// violation, or nil when the submission is valid.
+func validateReviewSubmission(sub ReviewSubmission) *reviewViolation {
+	for _, f := range []struct{ field, value string }{
+		{"chainId", sub.ChainID},
+		{"blockHash", sub.BlockHash},
+		{"txHash", sub.TxHash},
+		{"kind", sub.Kind},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			return &reviewViolation{rule: ruleBlankString, field: f.field, value: f.value}
+		}
+	}
+	if sub.Kind != SuppressSandwich && sub.Kind != SuppressDisplacement {
+		return &reviewViolation{rule: ruleKnownKind, field: "kind", value: sub.Kind}
+	}
+	for _, f := range []struct{ field, value string }{
+		{"submissionId", sub.SubmissionID},
+		{"operator", sub.Operator},
+		{"reason", sub.Reason},
+		{"status", sub.Status},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			return &reviewViolation{rule: ruleBlankString, field: f.field, value: f.value}
+		}
+	}
+	switch sub.Status {
+	case ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed:
+	default:
+		return &reviewViolation{rule: ruleKnownStatus, field: "status", value: sub.Status}
+	}
+	if sub.ExpectedVersion < 0 {
+		return &reviewViolation{rule: ruleNonNegativeVersion, field: "expectedVersion", version: sub.ExpectedVersion}
+	}
+	return nil
+}
+
+// specError renders the violation with the JSON spec entry's wording.
+func (v *reviewViolation) specError() error {
+	switch v.rule {
+	case ruleBlankString:
+		return fmt.Errorf("%s must be a non-empty string", v.field)
+	case ruleKnownKind:
+		return fmt.Errorf("%w: %q (want sandwich or displacement)", ErrUnknownKind, v.value)
+	case ruleKnownStatus:
+		return fmt.Errorf("invalid status %q (want %s, %s or %s)",
+			v.value, ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed)
+	case ruleNonNegativeVersion:
+		return fmt.Errorf("expectedVersion must be non-negative, got %d", v.version)
+	}
+	return nil
+}
+
+// submitError renders the violation with the direct submission entry's
+// wording. That entry never blank-checked kind and status separately: a
+// blank kind reads as an unknown kind and a blank status as an invalid one,
+// and its invalid-status message carries no candidate list.
+func (v *reviewViolation) submitError() error {
+	switch v.rule {
+	case ruleBlankString:
+		switch v.field {
+		case "kind":
+			return fmt.Errorf("%w: %q (want sandwich or displacement)", ErrUnknownKind, v.value)
+		case "status":
+			return fmt.Errorf("invalid status %q", v.value)
+		default:
+			return fmt.Errorf("%s must be a non-empty string", v.field)
+		}
+	case ruleKnownStatus:
+		return fmt.Errorf("invalid status %q", v.value)
+	default:
+		return v.specError()
+	}
+}
+
 // ParseReviewSubmission validates one submission document. Identity fields
 // and operator/reason/submissionId must be non-empty, the status must be
 // one of real, false_positive or unreviewed, expectedVersion must be a
@@ -151,64 +250,42 @@ func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
 	if dec.More() {
 		return ReviewSubmission{}, errors.New("invalid review spec: unexpected trailing data")
 	}
-	chainID, err := nonEmpty("chainId", spec.ChainID)
-	if err != nil {
-		return ReviewSubmission{}, err
+	// A field the document never declares decodes as a nil pointer and
+	// reaches the shared business check as the empty value. The document's
+	// own missing-field error for that field precedes its content check, so
+	// a blank-value violation on an undeclared field is reported as the
+	// missing field instead.
+	missing := map[string]bool{}
+	value := func(field string, p *string) string {
+		if p == nil {
+			missing[field] = true
+			return ""
+		}
+		return *p
 	}
-	blockHash, err := nonEmpty("blockHash", spec.BlockHash)
-	if err != nil {
-		return ReviewSubmission{}, err
+	sub := ReviewSubmission{
+		ChainID:      value("chainId", spec.ChainID),
+		BlockHash:    value("blockHash", spec.BlockHash),
+		TxHash:       value("txHash", spec.TxHash),
+		Kind:         value("kind", spec.Kind),
+		SubmissionID: value("submissionId", spec.SubmissionID),
+		Operator:     value("operator", spec.Operator),
+		Reason:       value("reason", spec.Reason),
+		Status:       value("status", spec.Status),
 	}
-	txHash, err := nonEmpty("txHash", spec.TxHash)
-	if err != nil {
-		return ReviewSubmission{}, err
+	if spec.ExpectedVersion != nil {
+		sub.ExpectedVersion = *spec.ExpectedVersion
 	}
-	kind, err := nonEmpty("kind", spec.Kind)
-	if err != nil {
-		return ReviewSubmission{}, err
-	}
-	if kind != SuppressSandwich && kind != SuppressDisplacement {
-		return ReviewSubmission{}, fmt.Errorf("%w: %q (want sandwich or displacement)", ErrUnknownKind, kind)
-	}
-	submissionID, err := nonEmpty("submissionId", spec.SubmissionID)
-	if err != nil {
-		return ReviewSubmission{}, err
-	}
-	operator, err := nonEmpty("operator", spec.Operator)
-	if err != nil {
-		return ReviewSubmission{}, err
-	}
-	reason, err := nonEmpty("reason", spec.Reason)
-	if err != nil {
-		return ReviewSubmission{}, err
-	}
-	status, err := nonEmpty("status", spec.Status)
-	if err != nil {
-		return ReviewSubmission{}, err
-	}
-	switch status {
-	case ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed:
-	default:
-		return ReviewSubmission{}, fmt.Errorf("invalid status %q (want %s, %s or %s)",
-			status, ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed)
+	if v := validateReviewSubmission(sub); v != nil {
+		if v.rule == ruleBlankString && missing[v.field] {
+			return ReviewSubmission{}, fmt.Errorf("%s is required (non-empty string)", v.field)
+		}
+		return ReviewSubmission{}, v.specError()
 	}
 	if spec.ExpectedVersion == nil {
 		return ReviewSubmission{}, errors.New("expectedVersion is required (non-negative integer)")
 	}
-	if *spec.ExpectedVersion < 0 {
-		return ReviewSubmission{}, fmt.Errorf("expectedVersion must be non-negative, got %d", *spec.ExpectedVersion)
-	}
-	return ReviewSubmission{
-		ChainID:         chainID,
-		BlockHash:       blockHash,
-		TxHash:          txHash,
-		Kind:            kind,
-		SubmissionID:    submissionID,
-		Operator:        operator,
-		Reason:          reason,
-		Status:          status,
-		ExpectedVersion: *spec.ExpectedVersion,
-	}, nil
+	return sub, nil
 }
 
 // SubmitReviewResult is the outcome of one submission attempt. Created is
@@ -237,8 +314,8 @@ type SubmitReviewResult struct {
 // stale concurrent submission can never overwrite another operator's
 // revision.
 func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) {
-	if err := validateReviewIdentity(sub); err != nil {
-		return SubmitReviewResult{}, err
+	if v := validateReviewSubmission(sub); v != nil {
+		return SubmitReviewResult{}, v.submitError()
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return SubmitReviewResult{}, err
@@ -337,39 +414,6 @@ func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) 
 		Version:   currentVersion + 1,
 		Revision:  rev,
 	}, nil
-}
-
-func validateReviewIdentity(sub ReviewSubmission) error {
-	if strings.TrimSpace(sub.ChainID) == "" {
-		return errors.New("chainId must be a non-empty string")
-	}
-	if strings.TrimSpace(sub.BlockHash) == "" {
-		return errors.New("blockHash must be a non-empty string")
-	}
-	if strings.TrimSpace(sub.TxHash) == "" {
-		return errors.New("txHash must be a non-empty string")
-	}
-	if sub.Kind != SuppressSandwich && sub.Kind != SuppressDisplacement {
-		return fmt.Errorf("%w: %q (want sandwich or displacement)", ErrUnknownKind, sub.Kind)
-	}
-	if strings.TrimSpace(sub.SubmissionID) == "" {
-		return errors.New("submissionId must be a non-empty string")
-	}
-	if strings.TrimSpace(sub.Operator) == "" {
-		return errors.New("operator must be a non-empty string")
-	}
-	if strings.TrimSpace(sub.Reason) == "" {
-		return errors.New("reason must be a non-empty string")
-	}
-	switch sub.Status {
-	case ReviewStatusReal, ReviewStatusFalsePositive, ReviewStatusUnreviewed:
-	default:
-		return fmt.Errorf("invalid status %q", sub.Status)
-	}
-	if sub.ExpectedVersion < 0 {
-		return fmt.Errorf("expectedVersion must be non-negative, got %d", sub.ExpectedVersion)
-	}
-	return nil
 }
 
 // ReviewOriginal pairs the archived conclusion with the detection version
