@@ -39,6 +39,20 @@ type AppendRequest struct {
 	LeaderCommit int `json:"leaderCommit"`
 }
 
+// ConflictHint 是前置日志不匹配（ReasonPrevLogMismatch）时附带的冲突反馈，
+// 帮助调用者不必对照完整日志即可判断从哪里重发：
+//
+//	Index 是建议重发的起始日志索引；
+//	Term  是冲突位置（请求给出的 prevLogIndex）在本地日志中的任期。
+//
+// 仅实际因前置日志不匹配而拒绝的结果携带本对象；成功以及因其他原因被拒
+// 的结果中 conflict 缺省。反馈只描述本次请求检查时的本地日志快照，不改变
+// 日志、提交位置或键值应用结果。
+type ConflictHint struct {
+	Index int `json:"index"`
+	Term  int `json:"term"`
+}
+
 // AppendResult 是单条请求处理后节点对该请求的答复。
 type AppendResult struct {
 	// Accepted 表示本次复制是否成功。
@@ -49,6 +63,10 @@ type AppendResult struct {
 	Term int `json:"term"`
 	// CommittedIndex 是处理后节点的已提交索引。
 	CommittedIndex int `json:"committedIndex"`
+	// Conflict 仅在因前置日志缺失或任期不同（ReasonPrevLogMismatch）而拒绝
+	// 时非空：给出建议重发的起始索引与冲突位置的本地任期。计算规则见
+	// replicateState.prevLogConflict。
+	Conflict *ConflictHint `json:"conflict,omitempty"`
 	// AppliedIndex / ApplyError 仅在启用键值应用（ReplicateOptions.ApplyKV）
 	// 时填充：处理本请求后已应用的最高日志索引与首个应用错误。
 	// 复制是否被接受与命令应用是否失败相互独立表达。
@@ -207,7 +225,7 @@ func (s *replicateState) termAt(idx int) (term int, ok bool) {
 // 留下部分变更；唯一例外是较高任期带来的 currentTerm 更新，按规则必须保留。
 func (s *replicateState) apply(request AppendRequest) AppendResult {
 	snapshot := *s
-	accepted, reason := s.tryApply(request)
+	accepted, reason, conflict := s.tryApply(request)
 	if !accepted {
 		// 回滚日志与提交位置；较高任期更新（若已发生）保留在 s.currentTerm 中。
 		s.log = snapshot.log
@@ -218,25 +236,29 @@ func (s *replicateState) apply(request AppendRequest) AppendResult {
 		Reason:         reason,
 		Term:           s.currentTerm,
 		CommittedIndex: s.committedIndex,
+		Conflict:       conflict,
 	}
 }
 
-func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
+// tryApply 处理单条请求并返回接受状态、拒绝原因，以及前置日志不匹配时的冲突
+// 反馈。除返回值外，它与 apply 的原子性约定不变：被拒时 apply 负责回滚日志与
+// 提交位置（较高任期更新保留）。
+func (s *replicateState) tryApply(request AppendRequest) (bool, string, *ConflictHint) {
 	// 规则 1：先做字段合法性校验。违反字段规则的请求只记录拒绝、不改变任何
 	// 状态——即使它携带更高任期，也不能更新节点。
 	if reason := validateRequest(request); reason != ReasonOK {
-		return false, reason
+		return false, reason, nil
 	}
 
 	// 规则 2：较低任期直接拒绝，状态（含任期）完全不变。
 	if request.Term < s.currentTerm {
-		return false, ReasonStaleTerm
+		return false, ReasonStaleTerm, nil
 	}
 
 	// 规则 3：首条目任期不得低于前一条日志任期（整段日志必须不下降）。
 	// 这仍属于字段规则，放在任期更新之前：非法请求不能借高任期改变节点。
 	if len(request.Entries) > 0 && request.Entries[0].Term < request.PrevLogTerm {
-		return false, ReasonEntryTermDecreases
+		return false, ReasonEntryTermDecreases, nil
 	}
 
 	// 规则 4：较高任期先更新当前任期，再核对日志；之后即便因前缀不匹配被拒，
@@ -246,9 +268,11 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
 	}
 
 	// 规则 5：前一条日志必须存在且任期相同。索引 0 始终只与任期 0 匹配。
+	// 不匹配时按检查时刻的本地日志给出建议重发位置与冲突处本地任期；此时
+	// 本次请求尚未改动日志，快照反映的就是拒绝前状态。
 	prevTerm, ok := s.termAt(request.PrevLogIndex)
 	if !ok || prevTerm != request.PrevLogTerm {
-		return false, ReasonPrevLogMismatch
+		return false, ReasonPrevLogMismatch, s.prevLogConflict(request.PrevLogIndex)
 	}
 
 	// 规则 6：把待追加条目与现有位置逐一比对——全部检查通过后才落笔，
@@ -271,10 +295,10 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
 			matched++
 		case existing.Term == incoming.Term:
 			// 同索引同任期却命令不同：拒绝，日志与提交位置保持原样。
-			return false, ReasonCommandConflictSameTerm
+			return false, ReasonCommandConflictSameTerm, nil
 		case idx <= s.committedIndex:
 			// 不同任期意味着要覆盖该处及其后缀；已提交条目不可覆盖。
-			return false, ReasonWouldOverwriteCommitted
+			return false, ReasonWouldOverwriteCommitted, nil
 		default:
 			// 未提交位置上的任期冲突：截断到此处再追加，其后旧日志整段丢弃。
 			cutAt = idx - 1
@@ -304,7 +328,36 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string) {
 	if newCommit > s.committedIndex {
 		s.committedIndex = newCommit
 	}
-	return true, ReasonOK
+	return true, ReasonOK, nil
+}
+
+// prevLogConflict 在前置日志不匹配时计算冲突反馈：
+//
+//   - prevLogIndex 超过本地日志末尾：Index 为本地最后索引加一（空日志即 1），
+//     Term 为 0；索引 0 哨兵携带非零任期同样是前置不匹配，但反馈固定为
+//     index 1、term 0（不随本地日志长度变化）；
+//   - 该索引存在、只是本地任期与请求声称的 prevLogTerm 不同：Term 为该位置
+//     条目的本地任期，Index 为这一任期在【完整本地日志】（含已提交前缀，不按
+//     提交位置截断）中第一次出现的索引。
+//
+// 例如本地 idx1 任期 1、idx2..4 任期 3，请求在 idx4 声称前置任期 2 时，反馈
+// index=2、term=3，而不是只给 idx4。调用方据此跳过整个冲突任期段重发。
+func (s *replicateState) prevLogConflict(prevLogIndex int) *ConflictHint {
+	// 索引 0 是日志起点哨兵而非真实条目：在该处携带非零前置任期被拒时，反馈
+	// 固定为索引 1、任期 0（与本地日志多长无关）。
+	if prevLogIndex == 0 {
+		return &ConflictHint{Index: 1, Term: 0}
+	}
+	// 超过本地日志末尾：本地最后索引加一（空日志即 1）、任期 0。
+	if prevLogIndex > len(s.log) {
+		return &ConflictHint{Index: len(s.log) + 1, Term: 0}
+	}
+	localTerm := s.log[prevLogIndex-1].Term
+	first := prevLogIndex
+	for first > 1 && s.log[first-2].Term == localTerm {
+		first--
+	}
+	return &ConflictHint{Index: first, Term: localTerm}
 }
 
 func validateRequest(request AppendRequest) string {

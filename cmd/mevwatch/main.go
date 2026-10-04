@@ -96,6 +96,17 @@ Processing rules:
     checked; the term update survives a later prefix-mismatch rejection.
   - A missing prevLogIndex or a differing prevLogTerm rejects the request
     without touching the log or committed index. Index 0 only matches term 0.
+    Such a rejection carries a "conflict" hint: index is the suggested index
+    to restart sending from and term is the local term at the conflicting
+    position. When prevLogIndex is beyond the local log end, index is one
+    past the local last index (1 for an empty log) and term is 0; a non-zero
+    term claimed at the index-0 sentinel always reports {"index":1,"term":0}.
+    When the index exists with a different term, term is that entry's local
+    term and index is the first index of that term in the complete local log,
+    counting committed entries (e.g. local terms 1,3,3,3 and a prev term of 2
+    claimed at index 4 yields {"index":2,"term":3}, never just index 4). The
+    hint describes the local log at the moment that request is checked and
+    changes no state.
   - After a prefix match, missing positions are appended; existing positions
     with equal term and command are kept; a different term replaces that entry
     and its suffix.
@@ -143,6 +154,13 @@ Output fields:
     results[].reason          "ok" or a specific rejection reason
     results[].term            current term after handling the request
     results[].committedIndex  committed index after handling the request
+    results[].conflict        present only for a prev-log mismatch rejection:
+                              {"index", "term"} with the suggested restart
+                              index and the local term at the conflict;
+                              absent for accepted requests and every other
+                              rejection reason (stale term, field errors,
+                              same-term command conflict, overwriting a
+                              committed entry)
   finalTerm            final current term
   finalCommittedIndex  final committed index
   finalLog             complete log after all requests

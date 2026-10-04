@@ -575,3 +575,207 @@ func TestNonPositiveEntryIndexIsFieldError(t *testing.T) {
 		}
 	}
 }
+
+// prevLogIndex 超过本地日志末尾：conflict.index 为本地最后索引加一、term 为 0。
+func TestConflictBeyondLogEnd(t *testing.T) {
+	initial := InitialState{CurrentTerm: 3, CommittedIndex: 1,
+		Log: []LogEntry{entry(1, 2, "a"), entry(2, 3, "b")}}
+	out := run(t, initial,
+		AppendRequest{Term: 3, PrevLogIndex: 5, PrevLogTerm: 3},
+		// 恰好是末尾加一。
+		AppendRequest{Term: 3, PrevLogIndex: 3, PrevLogTerm: 9},
+	)
+	want := []ConflictHint{{Index: 3, Term: 0}, {Index: 3, Term: 0}}
+	for i, result := range out.Results {
+		if result.Accepted || !strings.Contains(result.Reason, "prev log mismatch") {
+			t.Fatalf("result %d: expected prev log mismatch, got %+v", i, result)
+		}
+		if !reflect.DeepEqual(result.Conflict, &want[i]) {
+			t.Fatalf("result %d: conflict = %+v, want %+v", i, result.Conflict, want[i])
+		}
+	}
+}
+
+// 空日志：任何不存在的前置索引都反馈 index 1、term 0。
+func TestConflictEmptyLog(t *testing.T) {
+	out := run(t, InitialState{CurrentTerm: 1},
+		AppendRequest{Term: 1, PrevLogIndex: 1, PrevLogTerm: 0},
+		AppendRequest{Term: 1, PrevLogIndex: 9, PrevLogTerm: 4},
+	)
+	for i, result := range out.Results {
+		want := &ConflictHint{Index: 1, Term: 0}
+		if !reflect.DeepEqual(result.Conflict, want) {
+			t.Fatalf("result %d: conflict = %+v, want %+v", i, result.Conflict, want)
+		}
+	}
+}
+
+// 索引存在但任期不同：反馈该位置本地任期，以及该任期在完整本地日志中第一次
+// 出现的索引——不能只回冲突位置本身。
+func TestConflictTermMismatchFindsFirstIndexOfTerm(t *testing.T) {
+	// idx1 任期 1，idx2..4 任期 3。
+	initial := InitialState{CurrentTerm: 3,
+		Log: []LogEntry{entry(1, 1, "a"), entry(2, 3, "b"), entry(3, 3, "c"), entry(4, 3, "d")}}
+	out := run(t, initial,
+		// 在 idx4 声称前置任期 2：反馈 idx2、term 3。
+		AppendRequest{Term: 3, PrevLogIndex: 4, PrevLogTerm: 2},
+		// 在 idx3 声称其他任期：同样回退到任期 3 段的起点 idx2。
+		AppendRequest{Term: 3, PrevLogIndex: 3, PrevLogTerm: 1},
+		// 在 idx2 声称任期 4：本地就是任期 3 段起点 idx2。
+		AppendRequest{Term: 3, PrevLogIndex: 2, PrevLogTerm: 4},
+		// 在 idx1 声称任期 2：本地任期 1 段起点就是 idx1。
+		AppendRequest{Term: 3, PrevLogIndex: 1, PrevLogTerm: 2},
+	)
+	want := []ConflictHint{
+		{Index: 2, Term: 3},
+		{Index: 2, Term: 3},
+		{Index: 2, Term: 3},
+		{Index: 1, Term: 1},
+	}
+	for i, result := range out.Results {
+		if !reflect.DeepEqual(result.Conflict, &want[i]) {
+			t.Fatalf("result %d: conflict = %+v, want %+v", i, result.Conflict, want[i])
+		}
+	}
+}
+
+// 起点按完整本地日志确定：冲突任期段的一部分甚至全部已经提交时，也不能把
+// 起点改成提交位置之后。
+func TestConflictFirstIndexCountsCommittedPrefix(t *testing.T) {
+	initial := InitialState{CurrentTerm: 3, CommittedIndex: 4,
+		Log: []LogEntry{entry(1, 1, "a"), entry(2, 3, "b"), entry(3, 3, "c"), entry(4, 3, "d")}}
+	out := run(t, initial,
+		AppendRequest{Term: 3, PrevLogIndex: 4, PrevLogTerm: 2},
+	)
+	want := &ConflictHint{Index: 2, Term: 3}
+	if got := out.Results[0].Conflict; !reflect.DeepEqual(got, want) {
+		t.Fatalf("conflict = %+v, want %+v (committed prefix must not shift the start)", got, want)
+	}
+	if out.FinalCommittedIndex != 4 || len(out.FinalLog) != 4 {
+		t.Fatalf("state changed: ci=%d log=%+v", out.FinalCommittedIndex, out.FinalLog)
+	}
+}
+
+// 索引 0 哨兵携带非零前置任期：按前置不匹配拒绝，反馈 index 1、term 0，
+// 无论本地日志是否为空。
+func TestConflictSentinelNonZeroTerm(t *testing.T) {
+	cases := []InitialState{
+		{CurrentTerm: 3},
+		{CurrentTerm: 3, Log: []LogEntry{entry(1, 2, "old")}},
+	}
+	for i, initial := range cases {
+		out := run(t, initial,
+			AppendRequest{Term: 3, PrevLogIndex: 0, PrevLogTerm: 1},
+		)
+		want := &ConflictHint{Index: 1, Term: 0}
+		if got := out.Results[0].Conflict; !reflect.DeepEqual(got, want) {
+			t.Fatalf("case %d: conflict = %+v, want %+v", i, got, want)
+		}
+	}
+}
+
+// 成功请求，以及因低任期、字段非法、同任期命令冲突、覆盖已提交条目而拒绝的
+// 请求，都不输出 conflict。
+func TestConflictAbsentForOtherOutcomes(t *testing.T) {
+	initial := InitialState{CurrentTerm: 4, CommittedIndex: 3,
+		Log: []LogEntry{entry(1, 2, "a"), entry(2, 3, "b"), entry(3, 3, "c"), entry(4, 3, "d")}}
+	out := run(t, initial,
+		// 成功：心跳。
+		AppendRequest{Term: 4, PrevLogIndex: 4, PrevLogTerm: 3},
+		// 低任期拒绝。
+		AppendRequest{Term: 2, PrevLogIndex: 4, PrevLogTerm: 3},
+		// 字段非法：负 leaderCommit（虽也看似前置问题，字段规则优先）。
+		AppendRequest{Term: 4, PrevLogIndex: 4, PrevLogTerm: 3, LeaderCommit: -1},
+		// 同任期命令冲突。
+		AppendRequest{Term: 4, PrevLogIndex: 1, PrevLogTerm: 2,
+			Entries: []LogEntry{entry(2, 3, "X")}},
+		// 覆盖已提交条目。
+		AppendRequest{Term: 4, PrevLogIndex: 1, PrevLogTerm: 2,
+			Entries: []LogEntry{entry(2, 4, "e")}},
+	)
+	for i, result := range out.Results {
+		if result.Conflict != nil {
+			t.Fatalf("result %d must carry no conflict, got %+v (reason=%s)", i, result.Conflict, result.Reason)
+		}
+	}
+	if accepted := out.Results[0]; !accepted.Accepted {
+		t.Fatalf("result 0 should be accepted: %+v", accepted)
+	}
+}
+
+// 合法的更高任期请求即使前置不匹配，任期更新保留，conflict 照常附带。
+func TestConflictWithHigherTermKeepsTermUpdate(t *testing.T) {
+	initial := InitialState{CurrentTerm: 3,
+		Log: []LogEntry{entry(1, 1, "a"), entry(2, 3, "b"), entry(3, 3, "c")}}
+	out := run(t, initial,
+		AppendRequest{Term: 7, PrevLogIndex: 3, PrevLogTerm: 2},
+	)
+	result := out.Results[0]
+	want := &ConflictHint{Index: 2, Term: 3}
+	if !reflect.DeepEqual(result.Conflict, want) {
+		t.Fatalf("conflict = %+v, want %+v", result.Conflict, want)
+	}
+	if result.Term != 7 {
+		t.Fatalf("term update should survive, got %d", result.Term)
+	}
+	if len(out.FinalLog) != 3 {
+		t.Fatalf("log changed: %+v", out.FinalLog)
+	}
+}
+
+// 顺序处理：每条反馈反映各自处理时的日志，不能借用最终日志生成；前置不匹配
+// 不改变任何状态。
+func TestConflictHintsReflectLogAtEachRequest(t *testing.T) {
+	initial := InitialState{CurrentTerm: 3,
+		Log: []LogEntry{entry(1, 1, "a")}}
+	out := run(t, initial,
+		// 此刻本地只有 idx1：声称 idx3 缺失 → index 2、term 0。
+		AppendRequest{Term: 3, PrevLogIndex: 3, PrevLogTerm: 1},
+		// 合法追加 idx2..3（任期 3）。
+		AppendRequest{Term: 3, PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 0,
+			Entries: []LogEntry{entry(2, 3, "b"), entry(3, 3, "c")}},
+		// 现在 idx3 存在但任期与声称的 2 不同：回退到任期 3 段起点 idx2。
+		AppendRequest{Term: 3, PrevLogIndex: 3, PrevLogTerm: 2},
+	)
+	want := []ConflictHint{{Index: 2, Term: 0}, {}, {Index: 2, Term: 3}}
+	if got := out.Results[0].Conflict; !reflect.DeepEqual(got, &want[0]) {
+		t.Fatalf("result 0 conflict = %+v, want %+v", got, want[0])
+	}
+	if !out.Results[1].Accepted {
+		t.Fatalf("result 1 should be accepted: %+v", out.Results[1])
+	}
+	if got := out.Results[2].Conflict; !reflect.DeepEqual(got, &want[2]) {
+		t.Fatalf("result 2 conflict = %+v, want %+v（must reflect the grown log, not the first one）", got, want[2])
+	}
+}
+
+// conflict 字段的 JSON 形状：不匹配时出现，成功/其他拒绝时整体缺省；往返保留。
+func TestConflictJSONShapeAndRoundTrip(t *testing.T) {
+	initial := InitialState{CurrentTerm: 3,
+		Log: []LogEntry{entry(1, 1, "a"), entry(2, 3, "b"), entry(3, 3, "c")}}
+	out := run(t, initial,
+		AppendRequest{Term: 3, PrevLogIndex: 3, PrevLogTerm: 2},
+		AppendRequest{Term: 3, PrevLogIndex: 3, PrevLogTerm: 3},
+	)
+	rejected, err := json.Marshal(out.Results[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := json.Marshal(out.Results[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rejected), `"conflict":{"index":2,"term":3}`) {
+		t.Fatalf("rejected result missing conflict: %s", rejected)
+	}
+	if strings.Contains(string(accepted), "conflict") {
+		t.Fatalf("accepted result must omit conflict: %s", accepted)
+	}
+	var decoded AppendResult
+	if err := json.Unmarshal(rejected, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, out.Results[0]) {
+		t.Fatalf("round trip mismatch:\n%+v\n%+v", decoded, out.Results[0])
+	}
+}
