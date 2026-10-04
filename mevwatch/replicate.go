@@ -170,18 +170,17 @@ func newReplicateState(initial InitialState) (replicateState, error) {
 		return replicateState{}, fmt.Errorf("invalid initial state: committedIndex %d exceeds log length %d", initial.CommittedIndex, len(initial.Log))
 	}
 	log := append([]LogEntry(nil), initial.Log...)
-	for i, entry := range log {
+	if rule, i := checkEntryRules(log, 0, initial.CurrentTerm); rule != entryRuleOK {
 		expected := i + 1
-		if entry.Index != expected {
+		entry := log[i]
+		switch rule {
+		case entryRuleIndexGap:
 			return replicateState{}, fmt.Errorf("invalid initial state: log entry %d has non-consecutive index %d", expected, entry.Index)
-		}
-		if entry.Term <= 0 {
+		case entryRuleTermNonPositive:
 			return replicateState{}, fmt.Errorf("invalid initial state: log entry %d has non-positive term %d", expected, entry.Term)
-		}
-		if i > 0 && entry.Term < log[i-1].Term {
+		case entryRuleTermDecreases:
 			return replicateState{}, fmt.Errorf("invalid initial state: log entry %d term %d is lower than previous term %d", expected, entry.Term, log[i-1].Term)
-		}
-		if entry.Term > initial.CurrentTerm {
+		case entryRuleTermExceedsMax:
 			return replicateState{}, fmt.Errorf("invalid initial state: log entry %d term %d exceeds currentTerm %d", expected, entry.Term, initial.CurrentTerm)
 		}
 	}
@@ -323,31 +322,64 @@ func validateRequest(request AppendRequest) string {
 	}
 	// 条目必须从前一条索引加 1 开始连续排列；任期为正、沿请求条目自身
 	// 不下降，且不得超过请求（领导者）任期。与 prevLogTerm 的衔接在
-	// tryApply 中单独检查。索引 0 是哨兵，真实条目索引必为正。
-	//
-	// 位置必须用检查过的加法逐条推进：prevLogIndex+1 或链上任一后续位置
-	// 超过当前 int 上限时，输入里的负索引恰好在数学上等于回绕后的位置，
-	// 直接相加会静默溢出把它误判为连续。这种请求属于字段错误，与普通索引
-	// 不连续一样拒绝，不能取得合法请求才有的任期更新效果。空条目不要求
-	// 存在下一位置，最后一条恰好到达 int 上限同样合法。
-	position := request.PrevLogIndex
-	for i, entry := range request.Entries {
+	// tryApply 中单独检查。
+	switch rule, _ := checkEntryRules(request.Entries, request.PrevLogIndex, request.Term); rule {
+	case entryRuleIndexGap:
+		return ReasonEntryIndexGap
+	case entryRuleTermNonPositive:
+		return ReasonEmptyEntryTerm
+	case entryRuleTermDecreases:
+		return ReasonEntryTermDecreases
+	case entryRuleTermExceedsMax:
+		return ReasonEntryTermExceedsReqTerm
+	}
+	return ReasonOK
+}
+
+// entryRule 是日志条目序列共有校验发现的违规类别。初始日志与复制请求条目
+// 共用同一套规则（见 checkEntryRules），各自把类别翻译成自己的错误表达。
+type entryRule int
+
+const (
+	entryRuleOK entryRule = iota
+	// entryRuleIndexGap：索引未从期望位置连续排列（含下一位置超出 int 上限）。
+	entryRuleIndexGap
+	// entryRuleTermNonPositive：任期非正。
+	entryRuleTermNonPositive
+	// entryRuleTermDecreases：任期低于序列内前一条目。
+	entryRuleTermDecreases
+	// entryRuleTermExceedsMax：任期超过调用方给定的上限。
+	entryRuleTermExceedsMax
+)
+
+// checkEntryRules 按条目顺序校验 entries 是否从 prevPosition+1 开始连续编号、
+// 任期为正、沿序列自身不下降且不超过 maxTerm，返回首个违规的类别与该条目在
+// entries 中的下标；全部通过时返回 entryRuleOK 与 -1。与序列之前一条日志
+// （prevLogTerm）的任期衔接不属于本函数职责，由调用方单独检查。
+//
+// 位置必须用检查过的加法逐条推进：prevPosition+1 或链上任一后续位置超过当前
+// int 上限时，输入里的负索引恰好在数学上等于回绕后的位置，直接相加会静默溢出
+// 把它误判为连续。这种情况按索引不连续处理。空条目序列不要求存在下一位置，
+// 最后一条恰好到达 int 上限同样合法。索引 0 是哨兵，真实条目索引必为正。
+func checkEntryRules(entries []LogEntry, prevPosition, maxTerm int) (entryRule, int) {
+	position := prevPosition
+	for i, entry := range entries {
 		if position == math.MaxInt {
-			return ReasonEntryIndexGap // 下一位置无法用 int 表示
+			return entryRuleIndexGap, i // 下一位置无法用 int 表示
 		}
 		position++
 		if entry.Index <= 0 || entry.Index != position {
-			return ReasonEntryIndexGap
+			return entryRuleIndexGap, i
 		}
 		if entry.Term <= 0 {
-			return ReasonEmptyEntryTerm
+			return entryRuleTermNonPositive, i
 		}
-		if i > 0 && entry.Term < request.Entries[i-1].Term {
-			return ReasonEntryTermDecreases
+		if i > 0 && entry.Term < entries[i-1].Term {
+			return entryRuleTermDecreases, i
 		}
-		if entry.Term > request.Term {
-			return ReasonEntryTermExceedsReqTerm
+		if entry.Term > maxTerm {
+			return entryRuleTermExceedsMax, i
 		}
 	}
-	return ReasonOK
+	return entryRuleOK, -1
 }
