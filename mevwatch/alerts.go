@@ -180,9 +180,11 @@ var suppressionScanPolicy = specPolicy{
 // than whitespace may follow the closing brace (a second object, an extra
 // } or ] or any other JSON value is rejected). Inside the object every
 // known field may be declared at most once: field names are compared after
-// JSON unescaping, and two spellings that resolve to the same field —
-// including ones differing only in case, like channel and CHANNEL — count
-// as one duplicate declaration even when both carry the same value.
+// JSON unescaping with the decoder's own field-name folding, and two
+// spellings that resolve to the same field — differing only in case, like
+// channel and CHANNEL, or in a compatibility character, like U+017F for
+// s — count as one duplicate declaration even when both carry the same
+// value.
 func validateSuppressionDocument(raw []byte) error {
 	return scanJSONObject(raw, suppressionScanPolicy)
 }

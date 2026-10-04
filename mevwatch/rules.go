@@ -106,8 +106,10 @@ func parseSeverity(name string, v *int) (int, error) {
 
 // ErrDuplicateField reports a JSON object in a registration spec that
 // names the same field twice. Field names are compared the way JSON
-// decoding matches struct fields, so two spellings that differ only in
-// case (for example "severity" and "Severity") are also duplicates.
+// decoding matches struct fields, so two spellings the decoder folds
+// together — differing only in case, like "severity" and "Severity", or
+// using a compatibility character, like "ſeverity" (U+017F for s) — are
+// also duplicates.
 var ErrDuplicateField = errors.New("duplicate field in version spec")
 
 // ErrTrailingData reports non-whitespace content after the single JSON
@@ -149,10 +151,10 @@ var versionScanPolicy = specPolicy{
 
 // validateSpecStructure proves raw contains exactly one JSON object with
 // no repeated fields anywhere in it, and nothing but whitespace around
-// it. Keys are matched case-insensitively against the known fields of
-// the version, rules, sandwich and displacement objects, preserving the
-// decoder's case-compatible field matching: "SEVERITY" and "severity"
-// point at the same field and cannot both appear. Escaped key spellings
+// it. Keys are matched against the known fields of the version, rules,
+// sandwich and displacement objects with the decoder's own field-name
+// folding: "SEVERITY", "severity" and "ſeverity" (U+017F for s) all point
+// at the same field and cannot share one object. Escaped key spellings
 // are decoded before comparison, so "severity" cannot evade it.
 func validateSpecStructure(raw []byte) error {
 	return scanJSONObject(raw, versionScanPolicy)
@@ -186,8 +188,8 @@ var (
 // allowed): a second object or value, an unmatched bracket or any other
 // trailing character fails, and empty input, arrays and null are not
 // specs. Duplicate fields are rejected at the top level, in rules and in
-// each rule's parameters, including case-only variants of the same known
-// field. Missing fields, wrong types, out-of-range values and unknown
+// each rule's parameters, including any spellings the decoder folds onto
+// the same known field (case variants, U+017F for s, and the like). Missing fields, wrong types, out-of-range values and unknown
 // rules or fields all fail with a reason.
 func ParseRuleVersion(raw []byte) (RuleVersion, error) {
 	if err := validateSpecStructure(raw); err != nil {

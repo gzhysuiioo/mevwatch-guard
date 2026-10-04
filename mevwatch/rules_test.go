@@ -216,6 +216,36 @@ func TestParseRuleVersionRejectsDuplicateFields(t *testing.T) {
 			`{"id":"v","rules":{"sandwich":{"enabled":true},"sandwich":{"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
 			"rules object", "sandwich",
 		},
+		{
+			"long-s severity variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3,"ſeverity":5},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"escaped long-s severity variant",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"\u017feverity":3,"severity":4},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules.sandwich", "severity",
+		},
+		{
+			"long-s enabled variant in displacement",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"ſeverity":2,"severity":2,"multiplier":2}}}`,
+			"rules.displacement", "severity",
+		},
+		{
+			"long-s rules variant at top level",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}},"ruleſ":{"sandwich":{"enabled":false,"severity":1},"displacement":{"enabled":false,"severity":1,"multiplier":2}}}`,
+			"version spec", "rules",
+		},
+		{
+			"long-s sandwich variant in rules",
+			`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"ſandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules object", "sandwich",
+		},
+		{
+			"split long-s sandwich objects cannot complete each other",
+			`{"id":"v","rules":{"sandwich":{"enabled":true},"ſandwich":{"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+			"rules object", "sandwich",
+		},
 	}
 	for _, tc := range dups {
 		t.Run(tc.name, func(t *testing.T) {
@@ -272,6 +302,31 @@ func TestParseRuleVersionCaseCompatibilityPreserved(t *testing.T) {
 	}
 }
 
+func TestParseRuleVersionLongSCompatibilityPreserved(t *testing.T) {
+	// A single "ſeverity" (U+017F) names the severity field, exactly as the
+	// decoder reads it; the stored parameters match the standard spelling.
+	spec := `{"id":"v","rules":{"sandwich":{"enabled":true,"ſeverity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`
+	v, err := ParseRuleVersion([]byte(spec))
+	if err != nil {
+		t.Fatalf("single long-s field must still decode: %v", err)
+	}
+	if v.Rules.Sandwich.Severity != 3 {
+		t.Fatalf("long-s severity not stored: %+v", v)
+	}
+	standard, err := ParseRuleVersion([]byte(`{"id":"v","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != standard {
+		t.Fatalf("long-s and standard spellings diverge: %+v vs %+v", v, standard)
+	}
+	// A lookalike name the decoder never matched stays an unknown field.
+	unknown := `{"id":"v","rules":{"sandwich":{"enabled":true,"ſeveritiy":3},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`
+	if _, err := ParseRuleVersion([]byte(unknown)); err == nil || errors.Is(err, ErrDuplicateField) {
+		t.Fatalf("unknown lookalike field must fail as unknown, got %v", err)
+	}
+}
+
 func TestRejectedSpecLeavesArchiveUntouched(t *testing.T) {
 	dir := t.TempDir()
 	original, created := register(t, dir, strictSpec)
@@ -287,6 +342,10 @@ func TestRejectedSpecLeavesArchiveUntouched(t *testing.T) {
 		``,
 		strictSpec + `{"id":"other"}`,
 		`{"id":"z","rules":{"sandwich":{"enabled":true,"severity":3,"severity":4},"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`,
+		// A folded-spelling duplicate is rejected even when the surviving
+		// values would equal the registered parameters of an existing ID.
+		`{"id":"strict","rules":{"sandwich":{"enabled":true,"severity":5,"ſeverity":5},"displacement":{"enabled":true,"severity":4,"multiplier":5}}}`,
+		`{"id":"strict","ruleſ":{"sandwich":{"enabled":true,"severity":5},"displacement":{"enabled":true,"severity":4,"multiplier":5}},"rules":{"sandwich":{"enabled":true,"severity":5},"displacement":{"enabled":true,"severity":4,"multiplier":5}}}`,
 	}
 	for i, spec := range rejected {
 		if v, _, err := RegisterVersion(dir, []byte(spec)); err == nil {
