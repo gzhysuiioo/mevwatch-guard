@@ -177,6 +177,15 @@ func TestReplayValidationErrors(t *testing.T) {
 		{"negative gas", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":-5,"Index":0}]}`, 1},
 		{"negative index", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":0,"Index":-1}]}`, 1},
 		{"fractional gas", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":1.5,"Index":0}]}`, 1},
+		{"missing in", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","Out":0,"GasPrice":0,"Index":0}]}`, 1},
+		{"missing out", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"GasPrice":0,"Index":0}]}`, 1},
+		{"missing gas", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"Index":0}]}`, 1},
+		{"missing index", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":0}]}`, 1},
+		{"null in", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":null,"Out":0,"GasPrice":0,"Index":0}]}`, 1},
+		{"null out", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":null,"GasPrice":0,"Index":0}]}`, 1},
+		{"null gas", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":null,"Index":0}]}`, 1},
+		{"null index", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":0,"Index":null}]}`, 1},
+		{"missing gas on later swap", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":30,"Index":0},{"TxHash":"0x2","Pool":"p","Trader":"u","In":0,"Out":0,"Index":1}]}`, 1},
 		{"conflicting duplicate tx", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":1,"Index":0},{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":2,"Index":0}]}`, 1},
 		{"shared index", `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":0,"Out":0,"GasPrice":1,"Index":0},{"TxHash":"0x2","Pool":"p","Trader":"u","In":0,"Out":0,"GasPrice":1,"Index":0}]}`, 1},
 		{"error on later line", "{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[]}\n\nnot json", 3},
@@ -211,6 +220,174 @@ func TestReplayInFileConflict(t *testing.T) {
 	var le *LineError
 	if !errors.As(err, &le) || le.Line != 2 {
 		t.Fatalf("want LineError at line 2, got %v", err)
+	}
+}
+
+// TestReplayIncompleteSwapNamesFieldAndSwap covers the core data-quality
+// fix: a missing or null numeric field fails the replay with the actual
+// input line, the swap position and the field name, and is never silently
+// treated as zero.
+func TestReplayIncompleteSwapNamesFieldAndSwap(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantSub string
+	}{
+		{
+			"missing GasPrice after higher-gas swap",
+			`{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"Out":1,"GasPrice":30,"Index":0},{"TxHash":"0x2","Pool":"p","Trader":"u","In":1,"Out":1,"Index":1}]}`,
+			"swaps[1]: GasPrice",
+		},
+		{
+			"null GasPrice",
+			`{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"Out":1,"GasPrice":null,"Index":0}]}`,
+			"swaps[0]: GasPrice",
+		},
+		{
+			"null In",
+			`{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":null,"Out":1,"GasPrice":1,"Index":0}]}`,
+			"swaps[0]: In",
+		},
+		{
+			"missing Out",
+			`{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"GasPrice":1,"Index":0}]}`,
+			"swaps[0]: Out",
+		},
+		{
+			"null Index",
+			`{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"Out":1,"GasPrice":1,"Index":null}]}`,
+			"swaps[0]: Index",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, err := Replay(strings.NewReader(tc.input), dir)
+			if err == nil {
+				t.Fatal("incomplete swap must fail the replay")
+			}
+			var le *LineError
+			if !errors.As(err, &le) || le.Line != 1 {
+				t.Fatalf("want LineError at line 1, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q must name %q", err.Error(), tc.wantSub)
+			}
+			if _, serr := os.Stat(filepath.Join(dir, archiveFileName)); !errors.Is(serr, os.ErrNotExist) {
+				t.Fatalf("archive file exists after failed replay: %v", serr)
+			}
+		})
+	}
+}
+
+// TestReplayIncompleteSwapLineNumbers checks 1-based line counting with
+// blank lines counted, including a last line without a trailing newline.
+func TestReplayIncompleteSwapLineNumbers(t *testing.T) {
+	dir := t.TempDir()
+	good := "{\"chainId\":\"1\",\"blockHash\":\"0g\",\"blockNumber\":1,\"swaps\":[]}\n"
+	blank := "\n  \n"
+	// Last line has no trailing newline; it is still line 4.
+	bad := `{"chainId":"1","blockHash":"0b","blockNumber":2,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"Out":1,"GasPrice":1,"Index":0},{"TxHash":"0x2","Pool":"p","Trader":"u","In":1,"Out":1,"GasPrice":null,"Index":1}]}`
+	_, err := Replay(strings.NewReader(good+blank+bad), dir)
+	var le *LineError
+	if !errors.As(err, &le) || le.Line != 4 {
+		t.Fatalf("want LineError at line 4, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "swaps[1]: GasPrice") {
+		t.Fatalf("error must name the second swap and GasPrice: %v", err)
+	}
+}
+
+// TestReplayIncompleteSwapNotSavedByDuplicate ensures an incomplete record
+// is rejected even when an earlier complete record with the same tx hash
+// would otherwise be deduplicated.
+func TestReplayIncompleteSwapNotSavedByDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	input := `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[` +
+		`{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"Out":2,"GasPrice":5,"Index":0},` +
+		`{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"Out":2,"GasPrice":null,"Index":0}]}`
+	_, err := Replay(strings.NewReader(input), dir)
+	var le *LineError
+	if !errors.As(err, &le) {
+		t.Fatalf("want LineError, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "swaps[1]: GasPrice") {
+		t.Fatalf("incomplete duplicate slipped through: %v", err)
+	}
+	if _, err := Query(dir, "1", "0x"); !errors.Is(err, ErrUnknownBlock) {
+		t.Fatalf("block was archived despite incomplete record: %v", err)
+	}
+}
+
+// TestReplayExplicitZeroesRemainValid proves explicit zero values are not
+// mistaken for missing fields: gas 0 still participates in displacement
+// exactly as before.
+func TestReplayExplicitZeroesRemainValid(t *testing.T) {
+	dir := t.TempDir()
+	input := `{"chainId":"1","blockHash":"0z","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"a","In":0,"Out":0,"GasPrice":30,"Index":0},{"TxHash":"0x2","Pool":"p","Trader":"b","In":0,"Out":0,"GasPrice":0,"Index":1}]}`
+	reports := replay(t, dir, input)
+	found := false
+	for _, f := range reports[0].Findings {
+		if f.TxHash == "0x2" {
+			found = true
+			if f.Kind != "displacement" {
+				t.Fatalf("explicit gas 0 victim judged %q, want displacement", f.Kind)
+			}
+			if f.Evidence[1].GasPrice != 0 {
+				t.Fatalf("evidence lost explicit zero gas: %+v", f.Evidence)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("explicit gas 0 must still produce displacement: %+v", reports[0].Findings)
+	}
+}
+
+// TestReplayIncompleteSwapRejectedWithRulesOff ensures validation runs
+// before and independently of rule selection, for both replay entry points.
+func TestReplayIncompleteSwapRejectedWithRulesOff(t *testing.T) {
+	dir := t.TempDir()
+	spec := `{"id":"off","rules":{"sandwich":{"enabled":false,"severity":1},"displacement":{"enabled":false,"severity":1,"multiplier":2}}}`
+	register(t, dir, spec)
+	input := "\n" + `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p","Trader":"t","In":1,"Out":1,"GasPrice":1,"Index":0},{"TxHash":"0x2","Pool":"p","Trader":"u","In":1,"Out":1,"Index":1}]}`
+	for _, replay := range []func() error{
+		func() error { _, err := Replay(strings.NewReader(input), dir); return err },
+		func() error { _, err := ReplayWithVersion(strings.NewReader(input), dir, "off"); return err },
+	} {
+		err := replay()
+		var le *LineError
+		if !errors.As(err, &le) || le.Line != 2 {
+			t.Fatalf("want LineError at line 2 under disabled rules, got %v", err)
+		}
+	}
+	if _, err := Query(dir, "1", "0x"); !errors.Is(err, ErrUnknownBlock) {
+		t.Fatalf("failed replay archived a block: %v", err)
+	}
+}
+
+// TestReplayIncompleteSwapAbortsWholeBatch verifies all-or-nothing
+// behaviour: valid new blocks earlier in the same file are neither
+// archived nor reported when a later swap is incomplete, and previously
+// archived content survives untouched.
+func TestReplayIncompleteSwapAbortsWholeBatch(t *testing.T) {
+	dir := t.TempDir()
+	replay(t, dir, sandwichInput)
+	input := "{\"chainId\":\"2\",\"blockHash\":\"0xnew\",\"blockNumber\":1,\"swaps\":[]}\n" +
+		"{\"chainId\":\"2\",\"blockHash\":\"0xb\",\"blockNumber\":2,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p\",\"Trader\":\"t\",\"In\":1,\"Out\":1,\"Index\":0}]}"
+	reports, err := Replay(strings.NewReader(input), dir)
+	if reports != nil {
+		t.Fatalf("failed batch must return no reports, got %+v", reports)
+	}
+	var le *LineError
+	if !errors.As(err, &le) || le.Line != 2 {
+		t.Fatalf("want LineError at line 2, got %v", err)
+	}
+	if _, err := Query(dir, "2", "0xnew"); !errors.Is(err, ErrUnknownBlock) {
+		t.Fatalf("earlier block partially committed: %v", err)
+	}
+	r, err := Query(dir, "1", "0xa")
+	if err != nil || r.SwapCount != 3 {
+		t.Fatalf("previously archived content damaged: %v %+v", err, r)
 	}
 }
 

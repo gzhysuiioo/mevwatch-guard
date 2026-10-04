@@ -66,10 +66,37 @@ type blockID struct {
 // blockLine mirrors one input line. Pointers distinguish a missing field
 // from an explicit zero value.
 type blockLine struct {
-	ChainID     *string `json:"chainId"`
-	BlockHash   *string `json:"blockHash"`
-	BlockNumber *int64  `json:"blockNumber"`
-	Swaps       *[]Swap `json:"swaps"`
+	ChainID     *string     `json:"chainId"`
+	BlockHash   *string     `json:"blockHash"`
+	BlockNumber *int64      `json:"blockNumber"`
+	Swaps       *[]swapLine `json:"swaps"`
+}
+
+// swapLine mirrors one swap inside an input line. Every numeric field is a
+// pointer: a key that is absent or written as null leaves the pointer nil,
+// while an explicit zero decodes to a non-nil pointer to zero. A replay
+// record must be complete on its own — values are never inferred from
+// adjacent transactions, another record with the same hash, or defaults.
+type swapLine struct {
+	TxHash   string `json:"TxHash"`
+	Pool     string `json:"Pool"`
+	Trader   string `json:"Trader"`
+	In       *int64 `json:"In"`
+	Out      *int64 `json:"Out"`
+	GasPrice *int64 `json:"GasPrice"`
+	Index    *int   `json:"Index"`
+}
+
+// requiredSwapFields lists the numeric fields every swap record must carry.
+// The order doubles as the field order used in completeness errors.
+var requiredSwapFields = []struct {
+	name    string
+	missing func(swapLine) bool
+}{
+	{"In", func(s swapLine) bool { return s.In == nil }},
+	{"Out", func(s swapLine) bool { return s.Out == nil }},
+	{"GasPrice", func(s swapLine) bool { return s.GasPrice == nil }},
+	{"Index", func(s swapLine) bool { return s.Index == nil }},
 }
 
 func parseBlock(text string) (Block, error) {
@@ -110,21 +137,34 @@ func parseBlock(text string) (Block, error) {
 		if s.Trader == "" {
 			return Block{}, fmt.Errorf("swaps[%d]: Trader must not be empty", i)
 		}
-		if s.In < 0 || s.Out < 0 || s.GasPrice < 0 || s.Index < 0 {
+		// Missing keys and explicit nulls both arrive as nil pointers;
+		// either makes the record incomplete and rejects the whole replay.
+		// An explicit 0 is a non-nil pointer and stays valid input.
+		for _, f := range requiredSwapFields {
+			if f.missing(s) {
+				return Block{}, fmt.Errorf("swaps[%d]: %s is required and must not be null", i, f.name)
+			}
+		}
+		in, out, gas, index := *s.In, *s.Out, *s.GasPrice, *s.Index
+		if in < 0 || out < 0 || gas < 0 || index < 0 {
 			return Block{}, fmt.Errorf("swaps[%d]: In, Out, GasPrice and Index must be non-negative", i)
 		}
-		if prev, ok := byTx[s.TxHash]; ok {
-			if prev != s {
-				return Block{}, fmt.Errorf("swaps[%d]: conflicting records for tx %s", i, s.TxHash)
+		parsed := Swap{
+			TxHash: s.TxHash, Pool: s.Pool, Trader: s.Trader,
+			In: in, Out: out, GasPrice: gas, Index: index,
+		}
+		if prev, ok := byTx[parsed.TxHash]; ok {
+			if prev != parsed {
+				return Block{}, fmt.Errorf("swaps[%d]: conflicting records for tx %s", i, parsed.TxHash)
 			}
 			continue // exact duplicate, keep one copy
 		}
-		if other, ok := byIndex[s.Index]; ok {
-			return Block{}, fmt.Errorf("swaps[%d]: Index %d already used by tx %s", i, s.Index, other)
+		if other, ok := byIndex[parsed.Index]; ok {
+			return Block{}, fmt.Errorf("swaps[%d]: Index %d already used by tx %s", i, parsed.Index, other)
 		}
-		byTx[s.TxHash] = s
-		byIndex[s.Index] = s.TxHash
-		swaps = append(swaps, s)
+		byTx[parsed.TxHash] = parsed
+		byIndex[parsed.Index] = parsed.TxHash
+		swaps = append(swaps, parsed)
 	}
 	sort.Slice(swaps, func(i, j int) bool { return swaps[i].Index < swaps[j].Index })
 	return Block{
