@@ -461,3 +461,67 @@ func TestCLICompareIsReadOnly(t *testing.T) {
 		t.Fatalf("enabled version changed to %q", enabled)
 	}
 }
+
+// corruptStoredVersion rewrites the stored archive document of one
+// registered version, simulating an archive that is still valid JSON but
+// whose registered version no longer satisfies the registration rules.
+func corruptStoredVersion(t *testing.T, dir, id string, mutate func(ver map[string]any)) {
+	t.Helper()
+	archivePath := filepath.Join(dir, "archive.json")
+	raw, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range doc["versions"].([]any) {
+		ver := entry.(map[string]any)
+		if ver["id"] == id {
+			mutate(ver)
+		}
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archivePath, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCLICompareCorruptVersion(t *testing.T) {
+	dir := setupCLIArchive(t)
+	// The stored candC document loses its displacement multiplier: valid
+	// JSON, but no longer a complete rule declaration.
+	corruptStoredVersion(t, dir, "candC", func(ver map[string]any) {
+		delete(ver["rules"].(map[string]any)["displacement"].(map[string]any), "multiplier")
+	})
+
+	res := runCLI(t, "compare", dir, "1", "0xblk", "candC")
+	if res.exitCode != 1 {
+		t.Fatalf("exit = %d, want 1; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if res.stdout != "" {
+		t.Fatalf("corrupt version must print no success JSON, got %q", res.stdout)
+	}
+	for _, want := range []string{"corrupt", "candC", "multiplier"} {
+		if !strings.Contains(res.stderr, want) {
+			t.Fatalf("stderr = %q, want substring %q", res.stderr, want)
+		}
+	}
+
+	// An unregistered version stays a plain unknown-version failure.
+	res = runCLI(t, "compare", dir, "1", "0xblk", "nope")
+	if res.exitCode != 1 || !strings.Contains(res.stderr, "unknown version: nope") ||
+		strings.Contains(res.stderr, "corrupt") {
+		t.Fatalf("unknown version failure changed shape: exit=%d stderr=%q", res.exitCode, res.stderr)
+	}
+
+	// The corrupt sibling does not contaminate intact versions.
+	res = runCLI(t, "compare", dir, "1", "0xblk", "builtin")
+	if res.exitCode != 0 {
+		t.Fatalf("compare under builtin failed: %d %q", res.exitCode, res.stderr)
+	}
+}

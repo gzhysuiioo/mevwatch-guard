@@ -10,6 +10,7 @@ package mevwatch
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -543,5 +544,238 @@ func TestCompareRegressionDecoysDoNotMixIn(t *testing.T) {
 		}) {
 			t.Fatalf("original findings not severity/hash ordered: %+v", r.OriginalFindings)
 		}
+	}
+}
+
+// rewriteStoredVersion rewrites the stored archive document of the
+// registered version id through mutate, simulating an archive whose
+// registered version no longer satisfies the registration rules even
+// though the file is still valid JSON.
+func rewriteStoredVersion(t *testing.T, dir, id string, mutate func(ver map[string]any)) {
+	t.Helper()
+	path := filepath.Join(dir, archiveFileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	versions, ok := doc["versions"].([]any)
+	if !ok {
+		t.Fatalf("no versions array in archive: %s", raw)
+	}
+	found := false
+	for _, entry := range versions {
+		ver, ok := entry.(map[string]any)
+		if !ok || ver["id"] != id {
+			continue
+		}
+		mutate(ver)
+		found = true
+	}
+	if !found {
+		t.Fatalf("version %s not stored in archive", id)
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// storedRule navigates to one rule object inside a stored version
+// document.
+func storedRule(t *testing.T, ver map[string]any, name string) map[string]any {
+	t.Helper()
+	rules, ok := ver["rules"].(map[string]any)
+	if !ok {
+		t.Fatalf("stored version has no rules object: %v", ver)
+	}
+	rule, ok := rules[name].(map[string]any)
+	if !ok {
+		t.Fatalf("stored version has no rules.%s object: %v", name, ver)
+	}
+	return rule
+}
+
+// setupCorruptCompareArchive registers candC (sandwich off, displacement
+// severity 4 multiplier 2) and twin, and archives one block under candC
+// whose adjacent same-pool swaps hit displacement with no sandwich — the
+// exact shape that crashed detection when the stored multiplier decayed
+// to zero.
+func setupCorruptCompareArchive(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	register(t, dir, candidateVersionSpec)
+	register(t, dir, twinVersionSpec)
+	input := cmpBlockLine("1", "0xblk", 7,
+		cmpSwap("0xf", "p1", "w", 40, 0),
+		cmpSwap("0xv", "p1", "u", 10, 1),
+	)
+	if _, err := ReplayWithVersion(strings.NewReader(input), dir, "candC"); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestCompareCorruptVersionRefused(t *testing.T) {
+	corruptions := []struct {
+		name    string
+		mutate  func(t *testing.T, ver map[string]any)
+		wantErr string
+	}{
+		{"multiplier missing", func(t *testing.T, v map[string]any) {
+			delete(storedRule(t, v, "displacement"), "multiplier")
+		}, "multiplier"},
+		{"multiplier zero", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "displacement")["multiplier"] = 0
+		}, "multiplier"},
+		{"multiplier below range", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "displacement")["multiplier"] = 1
+		}, "multiplier"},
+		{"multiplier above range", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "displacement")["multiplier"] = 101
+		}, "multiplier"},
+		{"multiplier null", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "displacement")["multiplier"] = nil
+		}, "multiplier"},
+		{"multiplier wrong type", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "displacement")["multiplier"] = "2"
+		}, "multiplier"},
+		{"displacement severity missing", func(t *testing.T, v map[string]any) {
+			delete(storedRule(t, v, "displacement"), "severity")
+		}, "severity"},
+		{"displacement severity zero", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "displacement")["severity"] = 0
+		}, "severity"},
+		{"displacement severity above range", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "displacement")["severity"] = 6
+		}, "severity"},
+		{"displacement enabled missing", func(t *testing.T, v map[string]any) {
+			delete(storedRule(t, v, "displacement"), "enabled")
+		}, "enabled"},
+		// The sandwich rule is disabled in candC, but a disabled rule must
+		// still declare complete, in-range parameters.
+		{"disabled sandwich severity zero", func(t *testing.T, v map[string]any) {
+			storedRule(t, v, "sandwich")["severity"] = 0
+		}, "severity"},
+		{"disabled sandwich enabled missing", func(t *testing.T, v map[string]any) {
+			delete(storedRule(t, v, "sandwich"), "enabled")
+		}, "enabled"},
+		{"sandwich object missing", func(t *testing.T, v map[string]any) {
+			delete(v["rules"].(map[string]any), "sandwich")
+		}, "sandwich"},
+		{"displacement object missing", func(t *testing.T, v map[string]any) {
+			delete(v["rules"].(map[string]any), "displacement")
+		}, "displacement"},
+		{"rules object missing", func(t *testing.T, v map[string]any) {
+			delete(v, "rules")
+		}, "rules"},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := setupCorruptCompareArchive(t)
+			rewriteStoredVersion(t, dir, "candC", func(ver map[string]any) {
+				tc.mutate(t, ver)
+			})
+			_, err := Compare(dir, "1", "0xblk", "candC")
+			if err == nil {
+				t.Fatalf("corrupt version compared successfully")
+			}
+			if !errors.Is(err, ErrCorruptVersion) {
+				t.Fatalf("error = %v, want ErrCorruptVersion", err)
+			}
+			if errors.Is(err, ErrUnknownVersion) || errors.Is(err, ErrUnknownBlock) {
+				t.Fatalf("corruption misreported as unknown version/block: %v", err)
+			}
+			if !strings.Contains(err.Error(), "candC") {
+				t.Fatalf("error must name the requested version, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error must name the offending rule or field %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestCompareCorruptVersionEmptySwapsStillRefused(t *testing.T) {
+	dir := t.TempDir()
+	register(t, dir, candidateVersionSpec)
+	// A block with no swaps produces no conclusions under any version; the
+	// corrupt candidate must still be refused, not reported as an empty
+	// success.
+	input := `{"chainId":"1","blockHash":"0xempty","blockNumber":3,"swaps":[]}`
+	if _, err := ReplayWithVersion(strings.NewReader(input), dir, "candC"); err != nil {
+		t.Fatal(err)
+	}
+	rewriteStoredVersion(t, dir, "candC", func(ver map[string]any) {
+		delete(storedRule(t, ver, "displacement"), "multiplier")
+	})
+	_, err := Compare(dir, "1", "0xempty", "candC")
+	if !errors.Is(err, ErrCorruptVersion) {
+		t.Fatalf("error = %v, want ErrCorruptVersion", err)
+	}
+}
+
+func TestCompareCorruptVersionDistinctFromUnknown(t *testing.T) {
+	dir := setupCorruptCompareArchive(t)
+	rewriteStoredVersion(t, dir, "candC", func(ver map[string]any) {
+		delete(storedRule(t, ver, "displacement"), "multiplier")
+	})
+
+	// A version that was never registered stays an unknown-version
+	// failure, never a corruption one.
+	if _, err := Compare(dir, "1", "0xblk", "ghost"); !errors.Is(err, ErrUnknownVersion) ||
+		errors.Is(err, ErrCorruptVersion) {
+		t.Fatalf("unknown version error = %v", err)
+	}
+	// An unknown block stays an unknown-block failure.
+	if _, err := Compare(dir, "1", "0xghost", "candC"); !errors.Is(err, ErrUnknownBlock) {
+		t.Fatalf("unknown block error = %v", err)
+	}
+	// The corrupt sibling does not contaminate intact versions: comparing
+	// under twin or builtin still succeeds against the same archive.
+	for _, id := range []string{"twin", BuiltinVersionID} {
+		result, err := Compare(dir, "1", "0xblk", id)
+		if err != nil {
+			t.Fatalf("compare under intact %s failed: %v", id, err)
+		}
+		if len(result.ComparedFindings) != 1 || result.ComparedFindings[0].Kind != "displacement" {
+			t.Fatalf("compare under intact %s misjudged: %+v", id, result.ComparedFindings)
+		}
+	}
+}
+
+func TestCompareCorruptVersionReadOnly(t *testing.T) {
+	dir := setupCorruptCompareArchive(t)
+	rewriteStoredVersion(t, dir, "candC", func(ver map[string]any) {
+		storedRule(t, ver, "displacement")["multiplier"] = 0
+	})
+	before, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compare(dir, "1", "0xblk", "candC"); !errors.Is(err, ErrCorruptVersion) {
+		t.Fatalf("error = %v, want ErrCorruptVersion", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("failed compare against a corrupt version changed the archive")
+	}
+	// The archived report keeps its candC conclusions and parameters.
+	report, err := Query(dir, "1", "0xblk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Version.ID != "candC" || len(report.Findings) != 1 ||
+		report.Findings[0].Kind != "displacement" || report.Findings[0].Severity != 4 {
+		t.Fatalf("archived report changed: %+v", report)
 	}
 }

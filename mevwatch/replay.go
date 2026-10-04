@@ -317,13 +317,26 @@ type archiveData struct {
 	Reviews []ReviewObject `json:"reviews,omitempty"`
 }
 
-func readArchive(dir string) (archiveData, error) {
+// readArchiveBytes returns the exact bytes of the archive file, or nil
+// when no archive exists yet.
+func readArchiveBytes(dir string) ([]byte, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, archiveFileName))
 	if errors.Is(err, os.ErrNotExist) {
-		return archiveData{Records: []record{}}, nil
+		return nil, nil
 	}
 	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func readArchive(dir string) (archiveData, error) {
+	raw, err := readArchiveBytes(dir)
+	if err != nil {
 		return archiveData{}, err
+	}
+	if raw == nil {
+		return archiveData{Records: []record{}}, nil
 	}
 	var data archiveData
 	if err := json.Unmarshal(raw, &data); err != nil {

@@ -24,6 +24,17 @@ var ErrUnknownVersion = errors.New("unknown version")
 // with different parameters.
 var ErrVersionConflict = errors.New("version already registered with different parameters")
 
+// ErrCorruptVersion reports a version whose stored archive document no
+// longer satisfies the registration rules: a rule object or a required
+// field is missing or null, a value has the wrong type, or a severity or
+// multiplier is out of range. The decoded struct cannot tell a missing
+// field from an explicit zero value, so such an archive would otherwise
+// compare under silently zeroed parameters (a zero displacement
+// multiplier even crashes detection). A comparison naming a corrupt
+// version is refused; the corrupt content is never replaced by the
+// enabled version, the built-in rules or defaults.
+var ErrCorruptVersion = errors.New("archived rule version is corrupted")
+
 // SandwichRule configures the sandwich rule: whether it runs and the
 // severity of its conclusions.
 type SandwichRule struct {
@@ -259,6 +270,37 @@ func findVersion(data archiveData, id string) (RuleVersion, error) {
 	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
 }
 
+// intactVersion resolves id for a comparison and proves the version's
+// stored archive document still satisfies every registration rule,
+// re-validating the raw document with the same parser registrations pass.
+// The decoded struct cannot do this: a missing enabled, severity or
+// multiplier field unmarshals as the zero value and is indistinguishable
+// from an explicitly declared one, and a wrong-typed field fails the
+// whole-archive decode before any judgment can run. An explicitly
+// declared false or any in-range value is valid; a missing or null field,
+// a wrong type or an out-of-range number makes the version corrupt, and
+// the failure names the version and the offending rule or field. The
+// built-in version is constructed in code and always intact.
+func intactVersion(versions []json.RawMessage, id string) (RuleVersion, error) {
+	if id == BuiltinVersionID {
+		return BuiltinVersion(), nil
+	}
+	for _, entry := range versions {
+		var meta struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(entry, &meta); err != nil || meta.ID != id {
+			continue
+		}
+		v, err := ParseRuleVersion(entry)
+		if err != nil {
+			return RuleVersion{}, fmt.Errorf("%w: %s: %w", ErrCorruptVersion, id, err)
+		}
+		return v, nil
+	}
+	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
+}
+
 // enabledVersion resolves the archive's currently enabled version. Archives
 // written before rule versions existed have no marker and run the built-in
 // rules.
@@ -414,11 +456,23 @@ type CompareResult struct {
 	Changed          []FindingChange `json:"changed"`
 }
 
+// compareArchiveDoc mirrors the archive file the way a comparison reads
+// it: records fully decoded, but each registered version kept as its raw
+// stored document. A corrupt version entry — a wrong-typed field, say —
+// then cannot break the read or masquerade as whole-archive corruption;
+// it is judged on its own by intactVersion.
+type compareArchiveDoc struct {
+	Records  []record          `json:"records"`
+	Versions []json.RawMessage `json:"versions"`
+}
+
 // Compare re-runs detection for one archived block under the given
 // registered version and diffs the conclusions against the archived
 // report. It only reads the archive: the original input file is not
 // needed, and neither the archived report nor the enabled version is
-// modified.
+// modified. The named version's stored document must still satisfy the
+// registration rules in full; a corrupt one fails with ErrCorruptVersion
+// rather than comparing under zeroed or substituted parameters.
 func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if _, err := os.Stat(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -432,25 +486,34 @@ func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return CompareResult{}, err
 	}
+	var doc compareArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return CompareResult{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
 	var rec *record
-	for i := range data.Records {
-		if data.Records[i].ChainID == chainID && data.Records[i].BlockHash == blockHash {
-			rec = &data.Records[i]
+	for i := range doc.Records {
+		if doc.Records[i].ChainID == chainID && doc.Records[i].BlockHash == blockHash {
+			rec = &doc.Records[i]
 			break
 		}
 	}
 	if rec == nil {
 		return CompareResult{}, ErrUnknownBlock
 	}
-	compared, err := findVersion(data, versionID)
+	// The requested version must be intact in the archive: re-validate its
+	// stored document before judging anything, so a corrupt version fails
+	// the same way even when the block has no swaps and detection would
+	// produce no conclusions at all.
+	compared, err := intactVersion(doc.Versions, versionID)
 	if err != nil {
 		return CompareResult{}, err
 	}
-
 	original := rec.Findings
 	if original == nil {
 		original = []ReportFinding{}
