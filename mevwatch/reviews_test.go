@@ -565,55 +565,328 @@ func TestReviewsBusyArchive(t *testing.T) {
 	}
 }
 
-func TestSubmitReviewConcurrentNoOverwrite(t *testing.T) {
-	dir := t.TempDir()
-	mustReplay(t, dir, twoFindingsInput)
+// contenderStatuses gives each racing submitter a status of its own; the
+// winner revision can then be proven to carry one submitter's complete
+// content with no fields mixed in from another contender.
+var contenderStatuses = []string{
+	ReviewStatusFalsePositive,
+	ReviewStatusReal,
+	ReviewStatusUnreviewed,
+}
 
-	const n = 12
+func raceSub(i int) ReviewSubmission {
+	return reviewSub("1", "0xa", "0xv", "sandwich",
+		fmt.Sprintf("race-%02d", i),
+		fmt.Sprintf("operator-%02d", i),
+		fmt.Sprintf("reason-%02d", i),
+		contenderStatuses[i%len(contenderStatuses)], 1)
+}
+
+type raceOutcome struct {
+	res SubmitReviewResult
+	err error
+}
+
+// runRejudgmentRace fires n contenders carrying the same valid
+// expectedVersion (1, against an object already at version 1) at the same
+// instant, each with a distinct submissionId/operator/reason/status, and
+// returns the per-submitter outcomes in submission order.
+func runRejudgmentRace(t *testing.T, dir string, n int) []raceOutcome {
+	t.Helper()
+	outcomes := make([]raceOutcome, n)
 	var wg sync.WaitGroup
-	errs := make([]error, n)
 	start := make(chan struct{})
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, errs[i] = SubmitReview(dir, reviewSub("1", "0xa", "0xv", "sandwich",
-				fmt.Sprintf("s-%d", i), "op", "r", ReviewStatusReal, 0))
+			outcomes[i].res, outcomes[i].err = SubmitReview(dir, raceSub(i))
 		}(i)
 	}
 	close(start)
 	wg.Wait()
+	return outcomes
+}
 
-	succeeded, busy, other := 0, 0, 0
-	for _, err := range errs {
+// verifyRaceSettlement proves the anti-overwrite rules against the history
+// actually persisted after a rejudgment race: exactly one contender created
+// a revision, the object advanced exactly one version, every stored bit of
+// the new revision comes from that winner alone, the original revision and
+// the archived conclusion/evidence are untouched, and every loser (busy or
+// version conflict) left no content behind.
+func verifyRaceSettlement(t *testing.T, dir string, outcomes []raceOutcome, original ReviewRevision) int {
+	t.Helper()
+	winner := -1
+	busyIdx, conflictIdx := -1, -1
+	for i, o := range outcomes {
 		switch {
-		case err == nil:
-			succeeded++
-		case errors.Is(err, ErrBusy):
-			busy++
+		case o.err == nil:
+			if !o.res.Created || o.res.Version != 2 {
+				t.Fatalf("submitter %d returned %+v, want created at version 2", i, o.res)
+			}
+			if winner != -1 {
+				t.Fatalf("two successful contenders: %d and %d", winner, i)
+			}
+			winner = i
+		case errors.Is(o.err, ErrBusy):
+			// The contender hit the lock while another submitter held it.
+			busyIdx = i
+		case errors.Is(o.err, ErrReviewConflict):
+			// The contender entered after the lock was released, read the
+			// already-bumped version and was rejected on the version check.
+			conflictIdx = i
 		default:
-			other++
-			t.Errorf("unexpected error: %v", err)
+			t.Fatalf("submitter %d got an outcome other than success/busy/conflict: %v", i, o.err)
 		}
 	}
-	if other != 0 {
-		t.FailNow()
+	if winner == -1 {
+		t.Fatal("no contender succeeded")
 	}
-	if succeeded != 1 {
-		t.Fatalf("got %d successes and %d busy, want exactly 1 success", succeeded, busy)
+	t.Logf("race settled: winner=%d, busy=%d, version-conflict=%d (either loser outcome is valid)",
+		winner, countOutcomes(outcomes, ErrBusy), countOutcomes(outcomes, ErrReviewConflict))
+
+	winSub := raceSub(winner)
+	wantRev := winSub.revision(2)
+	if !reflect.DeepEqual(outcomes[winner].res.Revision, wantRev) {
+		t.Fatalf("winner result revision = %+v, want %+v", outcomes[winner].res.Revision, wantRev)
+	}
+
+	hist, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 2 || hist.Status != winSub.Status {
+		t.Fatalf("current state = %q/%d, want %q/2 (the winner's rejudgment)",
+			hist.Status, hist.Version, winSub.Status)
+	}
+	if len(hist.Revisions) != 2 {
+		t.Fatalf("object holds %d revisions, want exactly 2 (losers must leave none): %+v",
+			len(hist.Revisions), hist.Revisions)
+	}
+	if !reflect.DeepEqual(hist.Revisions[0], original) {
+		t.Fatalf("original revision not retained first: %+v, want %+v", hist.Revisions[0], original)
+	}
+	if !reflect.DeepEqual(hist.Revisions[1], wantRev) {
+		t.Fatalf("appended revision = %+v, want the winner's %+v", hist.Revisions[1], wantRev)
+	}
+	// Defense in depth: no field of any loser may appear in the new
+	// revision, and no loser submission id may be stored anywhere. Status is
+	// deliberately excluded because only three legal statuses exist so two
+	// contenders may legitimately carry the same one; identity/operator/
+	// reason are unique per submitter and the full-revision DeepEqual above
+	// already pins the winner's status.
+	loserIDs := map[string]bool{}
+	for i := range outcomes {
+		if i == winner {
+			continue
+		}
+		s := raceSub(i)
+		loserIDs[s.SubmissionID] = true
+		stored := hist.Revisions[1]
+		if stored.SubmissionID == s.SubmissionID || stored.Operator == s.Operator ||
+			stored.Reason == s.Reason {
+			t.Fatalf("loser %d content mixed into the stored revision: %+v", i, stored)
+		}
+		if reflect.DeepEqual(stored, s.revision(2)) {
+			t.Fatalf("stored revision is identical to loser %d's content: %+v", i, stored)
+		}
+	}
+	for _, rev := range hist.Revisions {
+		if loserIDs[rev.SubmissionID] {
+			t.Fatalf("loser submission id %q left a revision", rev.SubmissionID)
+		}
+	}
+	// The original archived conclusion, its detection parameters and the
+	// raw swap evidence stay exactly as archived.
+	if hist.Original == nil ||
+		hist.Original.Finding.TxHash != "0xv" || hist.Original.Finding.Kind != "sandwich" ||
+		hist.Original.Finding.Severity != 3 || len(hist.Original.Finding.Evidence) != 3 {
+		t.Fatalf("original conclusion/evidence changed: %+v", hist.Original)
+	}
+	if hist.Original.Version.ID != BuiltinVersionID {
+		t.Fatalf("detection version changed: %+v", hist.Original.Version)
+	}
+
+	// After the race, resubmitting with the stale expected version must be a
+	// version conflict regardless of how the contender originally lost: a
+	// busy loss is not a completed rejudgment, and neither path may overwrite
+	// the winner.
+	recheck := func(idx int, label string) {
+		if idx < 0 {
+			return
+		}
+		if _, err := SubmitReview(dir, raceSub(idx)); !errors.Is(err, ErrReviewConflict) {
+			t.Fatalf("%s loser (submitter %d) replayed with original expected version: got %v, want ErrReviewConflict",
+				label, idx, err)
+		}
+	}
+	recheck(busyIdx, "busy")
+	recheck(conflictIdx, "conflict")
+	if _, err := SubmitReview(dir, reviewSub("1", "0xa", "0xv", "sandwich", "late", "op", "r", ReviewStatusReal, 1)); !errors.Is(err, ErrReviewConflict) {
+		t.Fatalf("fresh follower with stale base: got %v, want ErrReviewConflict", err)
+	}
+
+	// Deterministic late entrants: sequential submissions issued only after
+	// the object is provably at version 2 and the race lock is long released.
+	// Each acquires the free lock, reads the already-bumped version and must
+	// take the version-conflict path (never busy, since submissions are
+	// serialized here). This is the legitimate loser outcome the old
+	// regression assumed could never happen, and it must append nothing.
+	const lateN = 6
+	for j := 0; j < lateN; j++ {
+		_, err := SubmitReview(dir, reviewSub("1", "0xa", "0xv", "sandwich",
+			fmt.Sprintf("late-%02d", j),
+			fmt.Sprintf("late-operator-%02d", j),
+			fmt.Sprintf("late-reason-%02d", j),
+			contenderStatuses[j%len(contenderStatuses)], 1))
+		if !errors.Is(err, ErrReviewConflict) {
+			t.Fatalf("late entrant %d after lock release: got %v, want ErrReviewConflict", j, err)
+		}
+	}
+
+	// The follow-up conflict submissions appended nothing either.
+	final, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Version != 2 || len(final.Revisions) != 2 || !reflect.DeepEqual(final.Revisions, hist.Revisions) {
+		t.Fatalf("post-race conflict replays changed history: %+v", final)
+	}
+	return winner
+}
+
+func countOutcomes(outcomes []raceOutcome, target error) int {
+	n := 0
+	for _, o := range outcomes {
+		if errors.Is(o.err, target) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestSubmitReviewConcurrentRejudgmentSettlesOnce(t *testing.T) {
+	// Repeated races make the regression independent of scheduling: whether a
+	// contender hits the held lock or enters after release and loses on the
+	// version check, the settled history must be identical in shape. The loop
+	// is deterministic (no timing assumptions): every contender starts from a
+	// barrier and the settled state is derived from stored data, not from how
+	// many contenders reported busy versus conflict.
+	const racers, iterations = 12, 25
+	for iter := 0; iter < iterations; iter++ {
+		dir := t.TempDir()
+		mustReplay(t, dir, twoFindingsInput)
+		// An object that already carries one real risk judgment: the race is
+		// a concurrent rejudgment at expectedVersion 1, not a first submit.
+		first := submit(t, dir, reviewSub("1", "0xa", "0xv", "sandwich", "s-0", "alice", "first real call", ReviewStatusReal, 0))
+		if !first.Created || first.Version != 1 {
+			t.Fatalf("iter %d setup = %+v", iter, first)
+		}
+		outcomes := runRejudgmentRace(t, dir, racers)
+		verifyRaceSettlement(t, dir, outcomes, first.Revision)
+	}
+}
+
+// TestSubmitReviewBusyHoldsOffThenActualVersionDecides pins the two-phase
+// behavior deterministically (without relying on goroutine interleaving):
+// while the archive is occupied, a valid rejudgment returns busy and changes
+// nothing; once the lock is released the same submission is accepted or
+// rejected by the object's actual version, never because the busy attempt was
+// treated as a completed rejudgment.
+func TestSubmitReviewBusyHoldsOffThenActualVersionDecides(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	first := submit(t, dir, reviewSub("1", "0xa", "0xv", "sandwich", "hold-1", "alice", "confirmed bot war", ReviewStatusReal, 0))
+	if !first.Created || first.Version != 1 {
+		t.Fatalf("setup = %+v", first)
+	}
+	archiveBefore, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := os.OpenFile(filepath.Join(dir, lockFileName), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	// A legal rejudgment based on version 1: while occupied it must report
+	// busy and write nothing.
+	contender := reviewSub("1", "0xa", "0xv", "sandwich", "hold-2", "bob", "second look says false positive", ReviewStatusFalsePositive, 1)
+	res, err := SubmitReview(dir, contender)
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("occupied archive: got %v, want ErrBusy", err)
+	}
+	if res.Created || res.Version != 0 || res.Revision != (ReviewRevision{}) {
+		t.Fatalf("busy submission returned a non-empty result: %+v", res)
+	}
+	archiveDuring, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(archiveBefore, archiveDuring) {
+		t.Fatal("busy submission changed the archive while the lock was held")
+	}
+
+	// Release the occupation; existing review content must be intact.
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Status != ReviewStatusReal || held.Version != 1 || len(held.Revisions) != 1 {
+		t.Fatalf("busy loss altered review content: %+v", held)
+	}
+	if !reflect.DeepEqual(held.Revisions[0], first.Revision) {
+		t.Fatalf("original revision changed: %+v, want %+v", held.Revisions[0], first.Revision)
+	}
+
+	// Lock released but the object is still at version 1 (busy never
+	// completed the rejudgment): the same submission with its original
+	// expectedVersion 1 now succeeds as a fresh create — the busy attempt
+	// neither consumed the submission id nor counted as a stored revision.
+	retry, err := SubmitReview(dir, contender)
+	if err != nil {
+		t.Fatalf("retry after release: %v", err)
+	}
+	wantRev := contender.revision(2)
+	if !retry.Created || retry.Version != 2 || !reflect.DeepEqual(retry.Revision, wantRev) {
+		t.Fatalf("retry = %+v, want created at v2 with %+v", retry, wantRev)
 	}
 	hist, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hist.Version != 1 || len(hist.Revisions) != 1 {
-		t.Fatalf("concurrent submissions corrupted history: %+v", hist)
+	if hist.Status != ReviewStatusFalsePositive || hist.Version != 2 || len(hist.Revisions) != 2 {
+		t.Fatalf("object after retry = %q/%d with %d revisions", hist.Status, hist.Version, len(hist.Revisions))
 	}
-	// A follower that based its submission on version 0 now gets a conflict
-	// instead of silently overwriting the winner's revision.
-	if _, err := SubmitReview(dir, reviewSub("1", "0xa", "0xv", "sandwich", "late", "op", "r", ReviewStatusReal, 0)); !errors.Is(err, ErrReviewConflict) {
-		t.Fatalf("stale follower: got %v, want ErrReviewConflict", err)
+	if !reflect.DeepEqual(hist.Revisions[0], first.Revision) || !reflect.DeepEqual(hist.Revisions[1], wantRev) {
+		t.Fatalf("revisions after retry = %+v", hist.Revisions)
+	}
+
+	// Independently, if another rejudgment had committed while we waited,
+	// releasing the lock would not make the stale submission succeed: with
+	// the object now at version 2, a version-1 submission conflicts and
+	// leaves no revision.
+	late := reviewSub("1", "0xa", "0xv", "sandwich", "hold-3", "carol", "late arrival", ReviewStatusUnreviewed, 1)
+	if _, err := SubmitReview(dir, late); !errors.Is(err, ErrReviewConflict) {
+		t.Fatalf("stale submission after release: got %v, want ErrReviewConflict", err)
+	}
+	after, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Version != 2 || len(after.Revisions) != 2 || !reflect.DeepEqual(after.Revisions, hist.Revisions) {
+		t.Fatalf("post-release conflict appended a revision: %+v", after)
 	}
 }
 
