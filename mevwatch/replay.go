@@ -92,8 +92,8 @@ func parseBlock(text string) (Block, error) {
 	if err := dec.Decode(&raw); err != nil {
 		return Block{}, fmt.Errorf("invalid JSON: %w", err)
 	}
-	if dec.More() {
-		return Block{}, errors.New("invalid JSON: unexpected trailing data")
+	if err := blockTrailingData(text, int(dec.InputOffset())); err != nil {
+		return Block{}, err
 	}
 	if raw.ChainID == nil || *raw.ChainID == "" {
 		return Block{}, errors.New("chainId must be a non-empty string")
@@ -170,6 +170,20 @@ func parseBlock(text string) (Block, error) {
 		BlockNumber: *raw.BlockNumber,
 		Swaps:       swaps,
 	}, nil
+}
+
+// blockTrailingData names the first non-whitespace byte after the block
+// object on a replay line, so an unmatched '}' or ']' — or a second value
+// of any kind — is reported directly; only whitespace may follow the
+// object. dec.More cannot see this: after a complete top-level value it
+// only looks for the start of another value and treats stray closing
+// brackets as "nothing more".
+func blockTrailingData(text string, offset int) error {
+	rest := strings.TrimLeft(text[offset:], " \t\n\r")
+	if len(rest) > 0 {
+		return fmt.Errorf("invalid JSON: unexpected trailing data after block object: %s", trailingTokenName(rest[0]))
+	}
+	return nil
 }
 
 func swapsEqual(a, b []Swap) bool {
