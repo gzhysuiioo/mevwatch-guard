@@ -907,6 +907,126 @@ func TestKVRejectedReplicationKeepsApplyBoundary(t *testing.T) {
 	}
 }
 
+// replaceScenarioInitial 构造两条替换规则回归测试共用的初始状态：任期 4，
+// 日志 idx1..idx4 任期为 1、2、4、4；只有 idx1（set balance=100）已提交，
+// 后三条（set balance=200、delete balance、set legacy=old）均未提交。
+func replaceScenarioInitial() InitialState {
+	return InitialState{CurrentTerm: 4, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 4, "delete balance"),
+		entry(4, 4, "set legacy=old"),
+	}}
+}
+
+// TestKVTermConflictReplacesUncommittedSuffix 回归保障：新条目在某个未提交位置
+// 出现任期冲突后，该位置及其后的旧日志被整体替换——被丢弃后缀里的后续位置即使
+// 与新条目同任期、命令不同，也不再触发同任期命令冲突拒绝。本场景中 idx2 任期
+// 3 对旧任期 4 构成任期冲突，idx3 与旧 idx3 同为任期 4 但命令不同：请求必须
+// 被接受，已提交前缀完整保留，原 idx4 删除，提交与应用位置推进到 3，键值表只
+// 反映新日志的命令（旧后缀的 delete/set legacy 不得生效）。
+func TestKVTermConflictReplacesUncommittedSuffix(t *testing.T) {
+	initial := replaceScenarioInitial()
+	out := runKV(t, initial,
+		AppendRequest{Term: 4, PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 3,
+			Entries: []LogEntry{
+				entry(2, 3, "set balance=300"),
+				entry(3, 4, "set receipt=ok"),
+			}},
+	)
+
+	if len(out.Results) != 1 {
+		t.Fatalf("got %d results, want 1", len(out.Results))
+	}
+	result := out.Results[0]
+	if !result.Accepted || result.Reason != ReasonOK {
+		t.Fatalf("request should be accepted: %+v", result)
+	}
+	if result.Term != 4 || result.CommittedIndex != 3 {
+		t.Fatalf("result state = term %d ci %d, want term 4 ci 3", result.Term, result.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, result); got != 3 {
+		t.Fatalf("result appliedIndex = %d, want 3", got)
+	}
+	if result.ApplyError != nil {
+		t.Fatalf("unexpected apply error: %+v", result.ApplyError)
+	}
+
+	// 已提交前缀保留，idx2 起整段替换为新条目，原 idx4 被删除：最终只剩三条。
+	wantLog := []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 3, "set balance=300"),
+		entry(3, 4, "set receipt=ok"),
+	}
+	if !reflect.DeepEqual(out.FinalLog, wantLog) {
+		t.Fatalf("final log = %+v, want %+v", out.FinalLog, wantLog)
+	}
+	if out.FinalTerm != 4 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("final state = term %d ci %d, want term 4 ci 3", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if *out.FinalAppliedIndex != 3 {
+		t.Fatalf("final appliedIndex = %d, want 3", *out.FinalAppliedIndex)
+	}
+	// 键值表只来自新日志：balance=300、receipt=ok；旧后缀的 delete balance
+	// 与 set legacy=old 不得留下任何痕迹，也不能产生应用错误。
+	wantKV := map[string]string{"balance": "300", "receipt": "ok"}
+	if !reflect.DeepEqual(finalKVOf(t, out), wantKV) {
+		t.Fatalf("final kv = %v, want %v", out.FinalKV, wantKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("final apply error = %+v, want none", out.FinalApplyError)
+	}
+}
+
+// TestKVSameTermConflictOnKeptPrefixRejects 回归保障相反情形：同一个初始状态下，
+// idx2 新条目沿用旧任期 2 但命令不同——冲突位于仍需保留的旧日志位置（其前没有
+// 任期冲突触发截断），必须按同任期命令冲突拒绝整条请求：日志保持原有四条，
+// 提交与应用位置停在 1，键值表只有 balance=100。
+func TestKVSameTermConflictOnKeptPrefixRejects(t *testing.T) {
+	initial := replaceScenarioInitial()
+	out := runKV(t, initial,
+		AppendRequest{Term: 4, PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 3,
+			Entries: []LogEntry{
+				entry(2, 2, "set balance=300"), // 同任期同索引、命令不同
+				entry(3, 4, "set receipt=ok"),
+			}},
+	)
+
+	if len(out.Results) != 1 {
+		t.Fatalf("got %d results, want 1", len(out.Results))
+	}
+	result := out.Results[0]
+	if result.Accepted || result.Reason != ReasonCommandConflictSameTerm {
+		t.Fatalf("request should be rejected for same-term command conflict: %+v", result)
+	}
+	if result.Term != 4 || result.CommittedIndex != 1 {
+		t.Fatalf("result state = term %d ci %d, want term 4 ci 1", result.Term, result.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, result); got != 1 {
+		t.Fatalf("result appliedIndex = %d, want 1", got)
+	}
+	if result.ApplyError != nil {
+		t.Fatalf("rejection must not produce an apply error: %+v", result.ApplyError)
+	}
+
+	// 整条拒绝：日志、提交位置、应用位置与键值表全部保持原样。
+	if !reflect.DeepEqual(out.FinalLog, initial.Log) {
+		t.Fatalf("log changed after rejection: %+v", out.FinalLog)
+	}
+	if out.FinalTerm != 4 || out.FinalCommittedIndex != 1 {
+		t.Fatalf("final state = term %d ci %d, want term 4 ci 1", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if *out.FinalAppliedIndex != 1 {
+		t.Fatalf("final appliedIndex = %d, want 1", *out.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, out), map[string]string{"balance": "100"}) {
+		t.Fatalf("final kv = %v, want only balance=100", out.FinalKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("final apply error = %+v, want none", out.FinalApplyError)
+	}
+}
+
 func TestKVRoundTripFailedReuseKeepsPreviousResult(t *testing.T) {
 	original := runKV(t, InitialState{CurrentTerm: 1, CommittedIndex: 1, Log: []LogEntry{
 		entry(1, 1, "set x=1"),
