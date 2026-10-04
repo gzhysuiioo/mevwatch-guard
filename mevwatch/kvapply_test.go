@@ -261,6 +261,163 @@ func TestKVApplyFailureKeepsReplicationVerdict(t *testing.T) {
 	}
 }
 
+// TestKVPartialAckDoesNotCommitLongerTail 回归保障：成功的复制请求只确认部分
+// 日志时，跟随者本地保留的更长尾部不能被提交或应用。每一步都分别断言“请求
+// 答复”（accepted/reason/committedIndex/appliedIndex/applyError）与“最终状态”
+// （日志存在、提交位置、应用位置、键值表、应用错误），不能只凭最终键值表推断
+// 此前没有提前提交或提前报错：
+//   - 初始任期 2，索引 1..4 连续且任期均为 2，仅提交到 1：idx1 set
+//     balance=100 已应用，idx2 set balance=200、idx3 set balance（缺等号，
+//     格式错误）、idx4 delete balance 均未提交，错误不得提前出现；
+//   - 请求一（任期 2、前置索引 1）只携带与本地 idx2 完全相同的条目，却声明
+//     leaderCommit=4：请求成功、四条日志全部保留，但提交与应用只能到 2，
+//     键值表变为 balance=200，无应用错误；
+//   - 请求二前置索引 2、无新条目、leaderCommit 仍为 4：仍只确认到 2，不得
+//     删除尾部或暴露 idx3 的格式错误；
+//   - 请求三把前置位置确认到 4 并声明提交到 4：提交位置才推进到 4；此时 idx3
+//     的错误才被报告，应用位置停在 2，idx4 的删除不生效，balance 仍为 200；
+//     复制结果仍成功，完整日志不因应用失败而改变；
+//   - 后续合法请求的确认位置（空条目前置索引）或 leaderCommit 低于已提交
+//     索引时，既有提交与应用结果不得倒退。
+func TestKVPartialAckDoesNotCommitLongerTail(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 2, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 2, "set balance"), // 缺等号：未提交时格式错误不能提前出现
+		entry(4, 2, "delete balance"),
+	}}
+	fullLog := []LogEntry{
+		entry(1, 2, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 2, "set balance"),
+		entry(4, 2, "delete balance"),
+	}
+
+	// 起点断言：开始时键值表只有 balance=100，后三条尚未提交、尚未应用，
+	// idx3 的格式错误也不能提前出现。
+	start := runKV(t, initial)
+	if *start.FinalAppliedIndex != 1 {
+		t.Fatalf("initial appliedIndex = %d, want 1", *start.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, start), map[string]string{"balance": "100"}) {
+		t.Fatalf("initial kv = %v, want only balance=100", start.FinalKV)
+	}
+	if start.FinalApplyError != nil {
+		t.Fatalf("uncommitted bad entry surfaced early: %+v", start.FinalApplyError)
+	}
+
+	// 请求一：只确认 idx2（携带的唯一条目与本地 idx2 完全相同），却声明
+	// 已提交到 4。请求二：空条目、前置索引 2，leaderCommit 仍为 4。
+	partialAck := AppendRequest{Term: 2, PrevLogIndex: 1, PrevLogTerm: 2, LeaderCommit: 4,
+		Entries: []LogEntry{entry(2, 2, "set balance=200")}}
+	emptyHeartbeat := AppendRequest{Term: 2, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 4}
+
+	// 逐步检查前两步：每一步的答复都必须是正常成功，确认范围只到 2，
+	// 四条日志一条不丢，idx3 的错误仍未暴露。
+	stepwise := runKV(t, initial, partialAck, emptyHeartbeat)
+	if len(stepwise.Results) != 2 {
+		t.Fatalf("got %d results, want 2", len(stepwise.Results))
+	}
+	for i, r := range stepwise.Results {
+		if !r.Accepted || r.Reason != ReasonOK {
+			t.Fatalf("result %d must stay a normal success: %+v", i, r)
+		}
+		if r.Term != 2 || r.CommittedIndex != 2 {
+			t.Fatalf("result %d state = term %d ci %d, want term 2 ci 2",
+				i, r.Term, r.CommittedIndex)
+		}
+		if got := appliedIndexOf(t, r); got != 2 {
+			t.Fatalf("result %d appliedIndex = %d, want 2", i, got)
+		}
+		if r.ApplyError != nil {
+			t.Fatalf("result %d apply error surfaced early: %+v", i, r.ApplyError)
+		}
+	}
+	if !reflect.DeepEqual(stepwise.FinalLog, fullLog) {
+		t.Fatalf("longer tail must be retained after partial ack: got %+v", stepwise.FinalLog)
+	}
+	if stepwise.FinalCommittedIndex != 2 {
+		t.Fatalf("final committedIndex = %d, want 2", stepwise.FinalCommittedIndex)
+	}
+	if *stepwise.FinalAppliedIndex != 2 {
+		t.Fatalf("final appliedIndex = %d, want 2", *stepwise.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, stepwise), map[string]string{"balance": "200"}) {
+		t.Fatalf("kv = %v, want only balance=200", stepwise.FinalKV)
+	}
+	if stepwise.FinalApplyError != nil {
+		t.Fatalf("final apply error surfaced early: %+v", stepwise.FinalApplyError)
+	}
+
+	// 完整过程：前两次部分确认之后，请求三把前置位置确认到 4 并声明提交到 4，
+	// 提交位置才推进到 4，idx3 的错误此时才报告；请求四/五的确认位置或
+	// leaderCommit 低于已提交索引，提交与应用结果不得倒退。
+	fullAck := AppendRequest{Term: 2, PrevLogIndex: 4, PrevLogTerm: 2, LeaderCommit: 4}
+	staleAck := AppendRequest{Term: 2, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 2}
+	lowLeaderCommit := AppendRequest{Term: 2, PrevLogIndex: 4, PrevLogTerm: 2, LeaderCommit: 1}
+
+	out := runKV(t, initial, partialAck, emptyHeartbeat, fullAck, staleAck, lowLeaderCommit)
+	wantResults := []struct {
+		accepted bool
+		reason   string
+		commit   int
+		applied  int
+		errIdx   int // 0 表示 applyError 必须为 nil
+	}{
+		{true, ReasonOK, 2, 2, 0}, // 只确认 idx2：尾部保留，不提交不应用
+		{true, ReasonOK, 2, 2, 0}, // 空条目再确认一次：仍只到 2，不删尾部
+		{true, ReasonOK, 4, 2, 3}, // 确认到 4：提交推进到 4；idx3 报错，应用停在 2
+		{true, ReasonOK, 4, 2, 3}, // 确认位置回落到 2：提交与应用不倒退
+		{true, ReasonOK, 4, 2, 3}, // leaderCommit 回落到 1：同样不倒退
+	}
+	if len(out.Results) != len(wantResults) {
+		t.Fatalf("got %d results, want %d", len(out.Results), len(wantResults))
+	}
+	for i, want := range wantResults {
+		got := out.Results[i]
+		if got.Accepted != want.accepted || got.Reason != want.reason {
+			t.Fatalf("result %d = accepted=%v reason=%q, want accepted=%v reason=%q",
+				i, got.Accepted, got.Reason, want.accepted, want.reason)
+		}
+		if got.Term != 2 || got.CommittedIndex != want.commit {
+			t.Fatalf("result %d state = term %d ci %d, want term 2 ci %d",
+				i, got.Term, got.CommittedIndex, want.commit)
+		}
+		if applied := appliedIndexOf(t, got); applied != want.applied {
+			t.Fatalf("result %d appliedIndex = %d, want %d", i, applied, want.applied)
+		}
+		if want.errIdx == 0 {
+			if got.ApplyError != nil {
+				t.Fatalf("result %d unexpected apply error: %+v", i, got.ApplyError)
+			}
+		} else if got.ApplyError == nil || got.ApplyError.Index != want.errIdx ||
+			got.ApplyError.Reason != ApplyReasonSetMissingEquals {
+			t.Fatalf("result %d applyError = %+v, want index %d missing '='",
+				i, got.ApplyError, want.errIdx)
+		}
+	}
+
+	// 最终状态：四条日志完整保留（日志存在不因应用失败而改变），提交到 4，
+	// 应用停在 2，idx4 的删除不生效，balance 仍为 200。
+	if !reflect.DeepEqual(out.FinalLog, fullLog) {
+		t.Fatalf("final log = %+v, want all four entries retained", out.FinalLog)
+	}
+	if out.FinalTerm != 2 || out.FinalCommittedIndex != 4 {
+		t.Fatalf("final replication state = term %d ci %d, want term 2 ci 4",
+			out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if *out.FinalAppliedIndex != 2 {
+		t.Fatalf("final appliedIndex = %d, want 2 (stuck before bad entry)", *out.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, out), map[string]string{"balance": "200"}) {
+		t.Fatalf("final kv = %v, want balance=200 (delete at idx4 must not apply)", out.FinalKV)
+	}
+	if out.FinalApplyError == nil || out.FinalApplyError.Index != 3 ||
+		out.FinalApplyError.Reason != ApplyReasonSetMissingEquals {
+		t.Fatalf("finalApplyError = %+v, want index 3 missing '='", out.FinalApplyError)
+	}
+}
+
 func TestKVValueVerbatimAndKeyOverwrite(t *testing.T) {
 	out := runKV(t, InitialState{CurrentTerm: 1},
 		AppendRequest{Term: 1, PrevLogIndex: 0, PrevLogTerm: 0, LeaderCommit: 4,
