@@ -2,6 +2,7 @@ package mevwatch
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -904,6 +905,54 @@ func TestKVRejectedReplicationKeepsApplyBoundary(t *testing.T) {
 	}
 	if out.FinalApplyError != nil {
 		t.Fatalf("final apply error = %+v, want none", out.FinalApplyError)
+	}
+}
+
+// TestKVOverflowedEntryIndexAppliesNothing 回归整数回绕漏洞在开启 applyKV 时
+// 的边界：携带回绕条目的非法请求不能应用新命令、不能抬高任期；随后合法提交
+// 仍按现有规则应用，原已提交条目保留。
+func TestKVOverflowedEntryIndexAppliesNothing(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 2, "set kept=1"),
+	}}
+	out := runKV(t, initial,
+		// 字段非法：MaxInt+1 回绕为 MinInt 的条目索引，还携带高任期 9。
+		AppendRequest{Term: 9, PrevLogIndex: math.MaxInt, PrevLogTerm: 0, LeaderCommit: 2,
+			Entries: []LogEntry{entry(math.MinInt, 9, "set sneaky=2")}},
+		// 合法：从 idx1 之后追加 idx2 并提交到 2。
+		AppendRequest{Term: 3, PrevLogIndex: 1, PrevLogTerm: 2, LeaderCommit: 2,
+			Entries: []LogEntry{entry(2, 3, "set later=3")}},
+	)
+	if out.Results[0].Accepted || out.Results[0].Reason != ReasonEntryIndexGap {
+		t.Fatalf("invalid request should be rejected for index gap: %+v", out.Results[0])
+	}
+	// 非法请求：任期不抬、提交与应用位置不动，新命令不入表，也无应用错误。
+	if r := out.Results[0]; r.Term != 2 || r.CommittedIndex != 1 {
+		t.Fatalf("invalid request changed replication state: %+v", r)
+	}
+	if got := appliedIndexOf(t, out.Results[0]); got != 1 {
+		t.Fatalf("invalid request applied commands: appliedIndex = %d, want 1", got)
+	}
+	if out.Results[0].ApplyError != nil {
+		t.Fatalf("invalid request produced apply error: %+v", out.Results[0].ApplyError)
+	}
+	// 合法请求正常接受：任期 3、提交与应用位置推进到 2。
+	if !out.Results[1].Accepted {
+		t.Fatalf("legal request rejected: %+v", out.Results[1])
+	}
+	if r := out.Results[1]; r.Term != 3 || r.CommittedIndex != 2 {
+		t.Fatalf("legal request state = %+v, want term 3 ci 2", r)
+	}
+	if got := appliedIndexOf(t, out.Results[1]); got != 2 {
+		t.Fatalf("appliedIndex after legal commit = %d, want 2", got)
+	}
+	wantKV := map[string]string{"kept": "1", "later": "3"}
+	if !reflect.DeepEqual(finalKVOf(t, out), wantKV) {
+		t.Fatalf("final kv = %v, want %v (sneaky must never apply)", out.FinalKV, wantKV)
+	}
+	if out.FinalTerm != 3 || *out.FinalAppliedIndex != 2 || out.FinalApplyError != nil {
+		t.Fatalf("final state = term %d applied %v err %+v, want term 3 applied 2 no error",
+			out.FinalTerm, out.FinalAppliedIndex, out.FinalApplyError)
 	}
 }
 

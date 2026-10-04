@@ -85,7 +85,11 @@ Request fields:
   prevLogTerm   number  its term; index 0 with term 0 marks the log origin
                         (a sentinel, not a real entry)
   entries       array   entries to append, must be consecutive from
-                        prevLogIndex+1, may be empty
+                        prevLogIndex+1, may be empty; every position
+                        prevLogIndex+1 through prevLogIndex+len(entries)
+                        must be representable by the platform integer,
+                        so prevLogIndex at the maximum value is only
+                        legal when entries is empty
   leaderCommit  number  leader's committed index
 
 Processing rules:

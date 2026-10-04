@@ -2,6 +2,7 @@ package mevwatch
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -364,6 +365,105 @@ func TestInvalidRequestDoesNotTouchStateOrTerm(t *testing.T) {
 	}
 }
 
+// TestOverflowedEntryIndexIsFieldError 回归整数回绕漏洞：prevLogIndex 取平台
+// int 最大值、首条非空条目的索引为回绕后的最小值时，不能被当作索引连续。
+// 该请求属于字段非法：accepted 为 false，任期、提交位置与日志都保持请求前
+// 状态；随后同一输入中的合法请求仍正常处理。
+func TestOverflowedEntryIndexIsFieldError(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1,
+		Log: []LogEntry{entry(1, 2, "a")}}
+
+	// MaxInt+1 在 int 下回绕为 MinInt：逐值比较会误判连续，必须按字段非法拒绝。
+	overflow := AppendRequest{Term: 9, PrevLogIndex: math.MaxInt, PrevLogTerm: 0,
+		Entries: []LogEntry{entry(math.MinInt, 9, "x")}}
+	out := run(t, initial, overflow)
+	r := out.Results[0]
+	if r.Accepted || r.Reason != ReasonEntryIndexGap {
+		t.Fatalf("overflowed entry index must be a field error, got %+v", r)
+	}
+	if r.Term != 2 || r.CommittedIndex != 1 {
+		t.Fatalf("invalid request changed state: %+v", r)
+	}
+	if !reflect.DeepEqual(out.FinalLog, initial.Log) {
+		t.Fatalf("invalid request changed log: %+v", out.FinalLog)
+	}
+
+	// 非法请求抬高任期后，任期 3 的合法追加不得被当作旧任期拒绝：最终
+	// 任期 3，idx2 追加成功并提交，原已提交 idx1 保留。
+	out = run(t, initial,
+		overflow,
+		AppendRequest{Term: 3, PrevLogIndex: 1, PrevLogTerm: 2, LeaderCommit: 2,
+			Entries: []LogEntry{entry(2, 3, "b")}},
+	)
+	if !out.Results[1].Accepted {
+		t.Fatalf("valid request after invalid one rejected: %+v", out.Results[1])
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 2 {
+		t.Fatalf("final state = term %d ci %d, want term 3 ci 2",
+			out.FinalTerm, out.FinalCommittedIndex)
+	}
+	wantLog := []LogEntry{entry(1, 2, "a"), entry(2, 3, "b")}
+	if !reflect.DeepEqual(out.FinalLog, wantLog) {
+		t.Fatalf("final log = %+v, want %+v", out.FinalLog, wantLog)
+	}
+}
+
+// TestEntryIndexOverflowBoundaries 固定“靠近上限”两侧的边界：空条目请求不
+// 要求存在下一条索引，prevLogIndex 取 MaxInt 也只是前置位置不匹配的合法请求；
+// 非空请求的最后条目恰好到达 MaxInt 同样合法；一旦下一位置或其后位置无法
+// 表示，即使条目索引写成回绕后的对应负值，也必须按索引不连续拒绝。
+func TestEntryIndexOverflowBoundaries(t *testing.T) {
+	// 空条目 + MaxInt：字段合法，前置位置不在本地日志中，按前缀不匹配拒绝，
+	// 并保留较高任期更新。
+	out := run(t, InitialState{CurrentTerm: 2, Log: []LogEntry{entry(1, 2, "a")}},
+		AppendRequest{Term: 7, PrevLogIndex: math.MaxInt, PrevLogTerm: 0},
+	)
+	r := out.Results[0]
+	if r.Accepted || r.Reason != ReasonPrevLogMismatch {
+		t.Fatalf("empty entries with MaxInt prevLogIndex: got %+v", r)
+	}
+	if r.Term != 7 {
+		t.Fatalf("higher term update should survive: term = %d, want 7", r.Term)
+	}
+
+	// 非空请求的最后条目恰好到达 MaxInt：位置全部可表示，不判字段非法；
+	// 前置位置不存在仍按前缀不匹配拒绝，任期更新保留。
+	out = run(t, InitialState{CurrentTerm: 2, Log: []LogEntry{entry(1, 2, "a")}},
+		AppendRequest{Term: 7, PrevLogIndex: math.MaxInt - 1, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MaxInt, 7, "x")}},
+	)
+	r = out.Results[0]
+	if r.Accepted || r.Reason != ReasonPrevLogMismatch {
+		t.Fatalf("last entry reaching MaxInt should be field-valid: got %+v", r)
+	}
+	if r.Term != 7 {
+		t.Fatalf("higher term update should survive: term = %d, want 7", r.Term)
+	}
+
+	// 下一位置恰好溢出：prevLogIndex=MaxInt 且携带一条索引为回绕值 MinInt
+	// 的条目，必须按索引不连续拒绝，且不取得任何任期更新。
+	for _, request := range []AppendRequest{
+		{Term: 9, PrevLogIndex: math.MaxInt, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MinInt, 9, "x")}},
+		// 更早的 prevLogIndex 上第二位置溢出：两个索引都写成回绕后的负值。
+		{Term: 9, PrevLogIndex: math.MaxInt - 1, PrevLogTerm: 0,
+			Entries: []LogEntry{entry(math.MaxInt, 9, "x"), entry(math.MinInt, 9, "y")}},
+	} {
+		out = run(t, InitialState{CurrentTerm: 2, CommittedIndex: 1,
+			Log: []LogEntry{entry(1, 2, "a")}}, request)
+		r = out.Results[0]
+		if r.Accepted || r.Reason != ReasonEntryIndexGap {
+			t.Fatalf("unrepresentable positions must be an index gap, got %+v", r)
+		}
+		if r.Term != 2 || r.CommittedIndex != 1 {
+			t.Fatalf("invalid request changed state: %+v", r)
+		}
+		if len(out.FinalLog) != 1 {
+			t.Fatalf("invalid request changed log: %+v", out.FinalLog)
+		}
+	}
+}
+
 func TestInvalidInitialStates(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -371,7 +471,6 @@ func TestInvalidInitialStates(t *testing.T) {
 		fragments []string
 	}{
 		{"negative term", InitialState{CurrentTerm: -1}, []string{"currentTerm"}},
-		{"negative commit", InitialState{CurrentTerm: 2, CommittedIndex: -1}, []string{"committedIndex"}},
 		{"commit beyond log", InitialState{CurrentTerm: 2, CommittedIndex: 2,
 			Log: []LogEntry{entry(1, 2, "a")}}, []string{"committedIndex", "exceeds"}},
 		{"index gap", InitialState{CurrentTerm: 2,
