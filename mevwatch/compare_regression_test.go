@@ -622,61 +622,92 @@ func setupCorruptCompareArchive(t *testing.T) string {
 	return dir
 }
 
+// corruptVersionCases is the full matrix of ways a stored candidate
+// version document can stop satisfying the registration rules: missing,
+// null, wrong-typed or out-of-range fields on either rule (including a
+// rule explicitly disabled), and missing rule/rules objects. Both the
+// single-block comparison and the review-range evaluation must refuse the
+// whole operation with ErrCorruptVersion for every one of them.
+var corruptVersionCases = []struct {
+	name    string
+	mutate  func(t *testing.T, ver map[string]any)
+	wantErr string
+}{
+	{"multiplier missing", func(t *testing.T, v map[string]any) {
+		delete(storedRule(t, v, "displacement"), "multiplier")
+	}, "multiplier"},
+	{"multiplier zero", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["multiplier"] = 0
+	}, "multiplier"},
+	{"multiplier below range", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["multiplier"] = 1
+	}, "multiplier"},
+	{"multiplier above range", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["multiplier"] = 101
+	}, "multiplier"},
+	{"multiplier null", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["multiplier"] = nil
+	}, "multiplier"},
+	{"multiplier wrong type", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["multiplier"] = "2"
+	}, "multiplier"},
+	{"displacement severity missing", func(t *testing.T, v map[string]any) {
+		delete(storedRule(t, v, "displacement"), "severity")
+	}, "severity"},
+	{"displacement severity zero", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["severity"] = 0
+	}, "severity"},
+	{"displacement severity above range", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["severity"] = 6
+	}, "severity"},
+	{"displacement severity null", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["severity"] = nil
+	}, "severity"},
+	{"displacement enabled missing", func(t *testing.T, v map[string]any) {
+		delete(storedRule(t, v, "displacement"), "enabled")
+	}, "enabled"},
+	{"displacement enabled null", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["enabled"] = nil
+	}, "enabled"},
+	{"displacement enabled wrong type", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "displacement")["enabled"] = "true"
+	}, "enabled"},
+	// The sandwich rule is disabled in candC, but a disabled rule must
+	// still declare complete, in-range parameters; an explicit false is a
+	// legal off state and stays valid.
+	{"disabled sandwich severity zero", func(t *testing.T, v map[string]any) {
+		storedRule(t, v, "sandwich")["severity"] = 0
+	}, "severity"},
+	{"disabled sandwich enabled missing", func(t *testing.T, v map[string]any) {
+		delete(storedRule(t, v, "sandwich"), "enabled")
+	}, "enabled"},
+	{"sandwich object missing", func(t *testing.T, v map[string]any) {
+		delete(v["rules"].(map[string]any), "sandwich")
+	}, "sandwich"},
+	{"displacement object missing", func(t *testing.T, v map[string]any) {
+		delete(v["rules"].(map[string]any), "displacement")
+	}, "displacement"},
+	{"sandwich object null", func(t *testing.T, v map[string]any) {
+		v["rules"].(map[string]any)["sandwich"] = nil
+	}, "sandwich"},
+	{"rules object missing", func(t *testing.T, v map[string]any) {
+		delete(v, "rules")
+	}, "rules"},
+	{"rules null", func(t *testing.T, v map[string]any) {
+		v["rules"] = nil
+	}, "rules"},
+	// Unknown fields are rejected at registration, so a stored document
+	// that grew one is corrupt too.
+	{"unknown field", func(t *testing.T, v map[string]any) {
+		v["extra"] = 1
+	}, "extra"},
+	{"unknown rule", func(t *testing.T, v map[string]any) {
+		v["rules"].(map[string]any)["frontrun"] = map[string]any{"enabled": true, "severity": 1}
+	}, "frontrun"},
+}
+
 func TestCompareCorruptVersionRefused(t *testing.T) {
-	corruptions := []struct {
-		name    string
-		mutate  func(t *testing.T, ver map[string]any)
-		wantErr string
-	}{
-		{"multiplier missing", func(t *testing.T, v map[string]any) {
-			delete(storedRule(t, v, "displacement"), "multiplier")
-		}, "multiplier"},
-		{"multiplier zero", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "displacement")["multiplier"] = 0
-		}, "multiplier"},
-		{"multiplier below range", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "displacement")["multiplier"] = 1
-		}, "multiplier"},
-		{"multiplier above range", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "displacement")["multiplier"] = 101
-		}, "multiplier"},
-		{"multiplier null", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "displacement")["multiplier"] = nil
-		}, "multiplier"},
-		{"multiplier wrong type", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "displacement")["multiplier"] = "2"
-		}, "multiplier"},
-		{"displacement severity missing", func(t *testing.T, v map[string]any) {
-			delete(storedRule(t, v, "displacement"), "severity")
-		}, "severity"},
-		{"displacement severity zero", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "displacement")["severity"] = 0
-		}, "severity"},
-		{"displacement severity above range", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "displacement")["severity"] = 6
-		}, "severity"},
-		{"displacement enabled missing", func(t *testing.T, v map[string]any) {
-			delete(storedRule(t, v, "displacement"), "enabled")
-		}, "enabled"},
-		// The sandwich rule is disabled in candC, but a disabled rule must
-		// still declare complete, in-range parameters.
-		{"disabled sandwich severity zero", func(t *testing.T, v map[string]any) {
-			storedRule(t, v, "sandwich")["severity"] = 0
-		}, "severity"},
-		{"disabled sandwich enabled missing", func(t *testing.T, v map[string]any) {
-			delete(storedRule(t, v, "sandwich"), "enabled")
-		}, "enabled"},
-		{"sandwich object missing", func(t *testing.T, v map[string]any) {
-			delete(v["rules"].(map[string]any), "sandwich")
-		}, "sandwich"},
-		{"displacement object missing", func(t *testing.T, v map[string]any) {
-			delete(v["rules"].(map[string]any), "displacement")
-		}, "displacement"},
-		{"rules object missing", func(t *testing.T, v map[string]any) {
-			delete(v, "rules")
-		}, "rules"},
-	}
-	for _, tc := range corruptions {
+	for _, tc := range corruptVersionCases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := setupCorruptCompareArchive(t)
 			rewriteStoredVersion(t, dir, "candC", func(ver map[string]any) {

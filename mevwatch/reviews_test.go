@@ -1,6 +1,7 @@
 package mevwatch
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -545,6 +546,245 @@ func TestReviewsCorruptedArchive(t *testing.T) {
 	}
 	if _, err := EvaluateReviews(dir, "1", 0, 100, BuiltinVersionID); err == nil || !strings.Contains(err.Error(), "corrupted") {
 		t.Fatalf("evaluate: got %v, want corrupted error", err)
+	}
+}
+
+// setupReviewCorruptArchive archives the two-findings block (a sandwich
+// and a displacement hit under builtin) and registers a candidate whose
+// stored document is about to be damaged: mult3 (multiplier 3) still flags
+// the displacement 0xd (50 > 30), so the zero-multiplier corruption is one
+// that previously sent detection into a divide-less but zeroed rule.
+func setupReviewCorruptArchive(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	mustRegisterVersion(t, dir, mult3Spec)
+	return dir
+}
+
+// TestEvaluateCorruptVersionRefused runs the same corruption matrix the
+// single-block comparison enforces against the review-range evaluation:
+// every damaged candidate document fails the whole evaluation as a corrupt
+// archived rule version, never as an unknown version, and the message names
+// the requested version id and the offending rule or field.
+func TestEvaluateCorruptVersionRefused(t *testing.T) {
+	for _, tc := range corruptVersionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := setupReviewCorruptArchive(t)
+			submit(t, dir, reviewSub("1", "0xa", "0xd", "displacement", "f", "a", "fp", ReviewStatusFalsePositive, 0))
+			rewriteStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+				tc.mutate(t, ver)
+			})
+			_, err := EvaluateReviews(dir, "1", 0, 100, "mult3")
+			if err == nil {
+				t.Fatalf("corrupt version evaluated successfully")
+			}
+			if !errors.Is(err, ErrCorruptVersion) {
+				t.Fatalf("error = %v, want ErrCorruptVersion", err)
+			}
+			if errors.Is(err, ErrUnknownVersion) {
+				t.Fatalf("corruption must not be reported as an unknown version: %v", err)
+			}
+			if !strings.Contains(err.Error(), "mult3") {
+				t.Fatalf("error must name the requested version, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error must name the offending rule or field %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestEvaluateCorruptVersionIndependentOfRangeData pins that candidate
+// validation precedes every conclusion judgment: a corrupt candidate is
+// refused when the range has no blocks, when the only block has no swaps,
+// and when the range carries no valid manual review. The zero multiplier
+// in particular must surface as a clean corrupt-version error, never a
+// panic or stack trace.
+func TestEvaluateCorruptVersionIndependentOfRangeData(t *testing.T) {
+	// Range with no blocks at all.
+	t.Run("no blocks in range", func(t *testing.T) {
+		dir := setupReviewCorruptArchive(t)
+		rewriteStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+			storedRule(t, ver, "displacement")["multiplier"] = 0
+		})
+		_, err := EvaluateReviews(dir, "1", 1000, 2000, "mult3")
+		if !errors.Is(err, ErrCorruptVersion) {
+			t.Fatalf("got %v, want ErrCorruptVersion", err)
+		}
+	})
+	// A block with an empty swaps array would produce no conclusions under
+	// any version; the corrupt candidate is still refused.
+	t.Run("empty swaps block", func(t *testing.T) {
+		dir := t.TempDir()
+		mustReplay(t, dir, `{"chainId":"1","blockHash":"0empty","blockNumber":3,"swaps":[]}`)
+		mustRegisterVersion(t, dir, mult3Spec)
+		rewriteStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+			delete(storedRule(t, ver, "displacement"), "multiplier")
+		})
+		_, err := EvaluateReviews(dir, "1", 0, 100, "mult3")
+		if !errors.Is(err, ErrCorruptVersion) {
+			t.Fatalf("got %v, want ErrCorruptVersion", err)
+		}
+	})
+	// Blocks and conclusions exist but no review was ever submitted.
+	t.Run("no reviews", func(t *testing.T) {
+		dir := setupReviewCorruptArchive(t)
+		rewriteStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+			storedRule(t, ver, "displacement")["multiplier"] = 0
+		})
+		_, err := EvaluateReviews(dir, "1", 0, 100, "mult3")
+		if !errors.Is(err, ErrCorruptVersion) {
+			t.Fatalf("got %v, want ErrCorruptVersion", err)
+		}
+	})
+}
+
+// TestEvaluateCorruptVersionDistinctFromUnknown checks the boundary against
+// unregistered ids, whole-archive corruption and intact siblings: an
+// identifier that was never registered stays an unknown version, unreadable
+// archive JSON stays archive corruption, and a damaged unselected version
+// neither contaminates an intact candidate nor the built-in version.
+func TestEvaluateCorruptVersionDistinctFromUnknown(t *testing.T) {
+	dir := setupReviewCorruptArchive(t)
+	submit(t, dir, reviewSub("1", "0xa", "0xd", "displacement", "f", "a", "fp", ReviewStatusFalsePositive, 0))
+	rewriteStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+		delete(storedRule(t, ver, "displacement"), "multiplier")
+	})
+
+	// Never registered: unknown version, not corruption.
+	if _, err := EvaluateReviews(dir, "1", 0, 100, "ghost"); !errors.Is(err, ErrUnknownVersion) ||
+		errors.Is(err, ErrCorruptVersion) {
+		t.Fatalf("unknown version error = %v", err)
+	}
+	// The built-in version is unaffected by the corrupt sibling.
+	got, err := EvaluateReviews(dir, "1", 0, 100, BuiltinVersionID)
+	if err != nil {
+		t.Fatalf("evaluate under builtin failed: %v", err)
+	}
+	if got.StillHit != 1 || got.Pending != 1 {
+		t.Fatalf("builtin evaluation counts = %+v", got)
+	}
+	if got.Version.ID != BuiltinVersionID {
+		t.Fatalf("candidate version = %+v", got.Version)
+	}
+
+	// An intact second candidate still evaluates while the corrupt one sits
+	// unselected in the same archive.
+	mustRegisterVersion(t, dir, strictSpec)
+	strict, err := EvaluateReviews(dir, "1", 0, 100, "strict")
+	if err != nil {
+		t.Fatalf("evaluate under intact strict failed: %v", err)
+	}
+	// strict (mult 5) stops the displacement 0xd: the reviewed false
+	// positive is eliminated; the unreviewed sandwich still hits and is
+	// pending.
+	if strict.Eliminated != 1 || strict.Pending != 1 {
+		t.Fatalf("intact candidate counts = %+v", strict)
+	}
+
+	// Unreadable archive JSON is whole-archive corruption regardless of the
+	// named version.
+	path := filepath.Join(dir, archiveFileName)
+	if err := os.WriteFile(path, []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EvaluateReviews(dir, "1", 0, 100, BuiltinVersionID); err == nil ||
+		!strings.Contains(err.Error(), "archive is corrupted") {
+		t.Fatalf("unreadable archive error = %v, want archive corrupted", err)
+	}
+	if _, err := EvaluateReviews(dir, "1", 0, 100, "ghost"); err == nil ||
+		!strings.Contains(err.Error(), "archive is corrupted") {
+		t.Fatalf("unreadable archive must fail before version lookup: %v", err)
+	}
+}
+
+// TestEvaluateExplicitFalseIsValidOffState pins the rule that a disabled
+// rule still needs complete, valid parameters: an explicit false is a legal
+// close, so a candidate declaring both rules false with in-range severity
+// and multiplier evaluates successfully with no conclusions.
+func TestEvaluateExplicitFalseIsValidOffState(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	bothOff := `{"id":"off","rules":{"sandwich":{"enabled":false,"severity":1},"displacement":{"enabled":false,"severity":5,"multiplier":100}}}`
+	mustRegisterVersion(t, dir, bothOff)
+	submit(t, dir, reviewSub("1", "0xa", "0xv", "sandwich", "r", "a", "real", ReviewStatusReal, 0))
+	got, err := EvaluateReviews(dir, "1", 0, 100, "off")
+	if err != nil {
+		t.Fatalf("explicit false must be a valid off state: %v", err)
+	}
+	if got.Missed != 1 || got.Pending != 0 {
+		t.Fatalf("both rules off counts = %+v", got)
+	}
+}
+
+// TestEvaluateCorruptVersionReadOnly proves a refused evaluation rewrites
+// neither reports, reviews, the enabled version nor the archive bytes.
+func TestEvaluateCorruptVersionReadOnly(t *testing.T) {
+	dir := setupReviewCorruptArchive(t)
+	submit(t, dir, reviewSub("1", "0xa", "0xd", "displacement", "f", "a", "fp", ReviewStatusFalsePositive, 0))
+	before, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewriteStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+		storedRule(t, ver, "displacement")["multiplier"] = 0
+	})
+	corruptBytes, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EvaluateReviews(dir, "1", 0, 100, "mult3"); !errors.Is(err, ErrCorruptVersion) {
+		t.Fatalf("error = %v, want ErrCorruptVersion", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(corruptBytes, after) {
+		t.Fatalf("failed evaluation modified the archive:\nbefore=%s\nafter =%s", corruptBytes, after)
+	}
+	// Sanity: the setup snapshot is only used to prove nothing before the
+	// corruption was our doing.
+	if bytes.Equal(before, after) {
+		t.Fatalf("test setup failed to corrupt the stored document")
+	}
+	// The review revision stays stored and the enabled version is untouched.
+	hist, err := ReviewHistoryQuery(dir, "1", "0xa", "0xd", "displacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 1 || hist.Status != ReviewStatusFalsePositive {
+		t.Fatalf("review changed after refused evaluation: %+v", hist)
+	}
+}
+
+// TestEvaluateCorruptVersionDuplicateField writes the archive bytes
+// directly: a JSON object that names the same field twice is legal JSON
+// syntax, so a generic decode collapses it and the corruption would be
+// invisible to struct-based validation. Re-validating the stored document
+// with the registration parser must reject it the same way a fresh
+// registration with a duplicate field is rejected.
+func TestEvaluateCorruptVersionDuplicateField(t *testing.T) {
+	dir := t.TempDir()
+	archive := `{"records":[],"versions":[` +
+		`{"id":"dup","rules":{` +
+		`"sandwich":{"enabled":true,"enabled":false,"severity":3},` +
+		`"displacement":{"enabled":true,"severity":2,"multiplier":2}}}]}`
+	if err := os.WriteFile(filepath.Join(dir, archiveFileName), []byte(archive), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := EvaluateReviews(dir, "1", 0, 100, "dup")
+	if !errors.Is(err, ErrCorruptVersion) {
+		t.Fatalf("duplicate field error = %v, want ErrCorruptVersion", err)
+	}
+	if !strings.Contains(err.Error(), "dup") || !strings.Contains(err.Error(), "enabled") {
+		t.Fatalf("error must name the version and duplicated field, got %v", err)
+	}
+	dupSpec := `{"id":"dup","rules":{"sandwich":{"enabled":true,"enabled":false,"severity":3},` +
+		`"displacement":{"enabled":true,"severity":2,"multiplier":2}}}`
+	if _, err := ParseRuleVersion([]byte(dupSpec)); !errors.Is(err, ErrDuplicateField) {
+		t.Fatalf("sanity: duplicate document must fail registration with ErrDuplicateField, got %v", err)
 	}
 }
 

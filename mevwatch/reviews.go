@@ -592,7 +592,14 @@ func sortReviewDetails(details []ReviewDetail) {
 // review counts as pending, as does the new kind when the candidate changes
 // a tx's conclusion type; withdrawn objects behave as unreviewed. The call
 // is read-only: reports, the enabled version, reviews and alert records are
-// never modified. An empty range yields zero counts and an empty list.
+// never modified. An empty range yields zero counts and an empty list. The
+// named candidate's stored document must still satisfy the registration
+// rules in full — both rules declared with non-null, well-typed, in-range
+// parameters, including a rule explicitly disabled (enabled:false) — or the
+// whole evaluation fails with ErrCorruptVersion before any judgment, even
+// when the range contains no blocks; the corrupt content is never replaced
+// by defaults, the currently enabled version or the built-in rules. A
+// corrupt version the call does not name never blocks an intact candidate.
 func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, versionID string) (ReviewEvaluation, error) {
 	if strings.TrimSpace(chainID) == "" {
 		return ReviewEvaluation{}, errors.New("chainId must be a non-empty string")
@@ -630,23 +637,38 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with each registered version kept as its raw stored document,
+	// so a wrong-typed field in one version is that version's corruption,
+	// not whole-archive corruption, and the candidate's document can be
+	// re-validated from its bytes the same way a single-block comparison
+	// proves its version intact.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return ReviewEvaluation{}, err
 	}
-	candidate, err := findVersion(data, versionID)
+	var doc rawVersionArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return ReviewEvaluation{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	// The requested version must be intact in the archive: re-validate its
+	// stored document before judging anything, so a corrupt version fails
+	// the same way even when the range matches no blocks, has no swaps or
+	// carries no valid manual review.
+	candidate, err := intactVersion(doc.Versions, versionID)
 	if err != nil {
 		return ReviewEvaluation{}, err
 	}
 	result.Version = candidate
 
-	reviews := make(map[conclusionKey]*ReviewObject, len(data.Reviews))
-	for i := range data.Reviews {
-		reviews[data.Reviews[i].key()] = &data.Reviews[i]
+	reviews := make(map[conclusionKey]*ReviewObject, len(doc.Reviews))
+	for i := range doc.Reviews {
+		reviews[doc.Reviews[i].key()] = &doc.Reviews[i]
 	}
 
 	details := []ReviewDetail{}
-	for _, rec := range data.Records {
+	for _, rec := range doc.Records {
 		if rec.ChainID != chainID {
 			continue
 		}

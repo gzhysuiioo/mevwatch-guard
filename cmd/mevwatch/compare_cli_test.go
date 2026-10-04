@@ -525,3 +525,112 @@ func TestCLICompareCorruptVersion(t *testing.T) {
 		t.Fatalf("compare under builtin failed: %d %q", res.exitCode, res.stderr)
 	}
 }
+
+// setupReviewCLIArchive builds an archive with one block carrying a
+// sandwich and a displacement, registers a mult3 candidate (multiplier 3
+// still flags the displacement at 50 > 30), and stores one false-positive
+// review on the displacement. The original block input file is never
+// needed by reviews evaluate and is not even created here.
+func setupReviewCLIArchive(t *testing.T) (dir string) {
+	t.Helper()
+	dir = t.TempDir()
+	inputPath := filepath.Join(t.TempDir(), "blocks.jsonl")
+	if err := os.WriteFile(inputPath, []byte(cliBlockLine("1", "0xa", 10,
+		cliSwapRecord("0xf", "p1", "bot", 90, 0),
+		cliSwapRecord("0xv", "p1", "user", 10, 1),
+		cliSwapRecord("0+k", "p1", "bot", 80, 2),
+		cliSwapRecord("0+w", "p2", "whale", 50, 3),
+		cliSwapRecord("0xd", "p2", "user", 10, 4),
+	)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mevwatch.ReplayFile(inputPath, dir); err != nil {
+		t.Fatalf("ReplayFile: %v", err)
+	}
+	mult3 := `{"id":"mult3","rules":{"sandwich":{"enabled":true,"severity":3},"displacement":{"enabled":true,"severity":2,"multiplier":3}}}`
+	if _, _, err := mevwatch.RegisterVersion(dir, []byte(mult3)); err != nil {
+		t.Fatalf("RegisterVersion: %v", err)
+	}
+	sub := mevwatch.ReviewSubmission{
+		ChainID: "1", BlockHash: "0xa", TxHash: "0xd", Kind: "displacement",
+		SubmissionID: "f-1", Operator: "alice", Reason: "fp",
+		Status: mevwatch.ReviewStatusFalsePositive, ExpectedVersion: 0,
+	}
+	if _, err := mevwatch.SubmitReview(dir, sub); err != nil {
+		t.Fatalf("SubmitReview: %v", err)
+	}
+	if err := os.Remove(inputPath); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestCLIReviewEvaluateCorruptVersion(t *testing.T) {
+	dir := setupReviewCLIArchive(t)
+	// Damage the stored candidate document: the displacement multiplier
+	// vanishes, which previously decoded as zero and sent detection into a
+	// zeroed rule.
+	corruptStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+		delete(ver["rules"].(map[string]any)["displacement"].(map[string]any), "multiplier")
+	})
+
+	res := runCLI(t, "reviews", "evaluate", dir, "1", "0", "100", "mult3")
+	if res.exitCode != 1 {
+		t.Fatalf("exit = %d, want 1; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if res.stdout != "" {
+		t.Fatalf("corrupt version must print no success statistics JSON, got %q", res.stdout)
+	}
+	for _, want := range []string{"corrupt", "mult3", "multiplier"} {
+		if !strings.Contains(res.stderr, want) {
+			t.Fatalf("stderr = %q, want substring %q", res.stderr, want)
+		}
+	}
+	// The failure must be a clean message, never a panic with a Go stack.
+	if strings.Contains(res.stderr, "goroutine") || strings.Contains(res.stderr, "runtime error") {
+		t.Fatalf("evaluation crashed instead of failing cleanly: %q", res.stderr)
+	}
+
+	// An unregistered id stays a plain unknown-version failure.
+	res = runCLI(t, "reviews", "evaluate", dir, "1", "0", "100", "nope")
+	if res.exitCode != 1 || !strings.Contains(res.stderr, "unknown version: nope") ||
+		strings.Contains(res.stderr, "corrupt") {
+		t.Fatalf("unknown version failure changed shape: exit=%d stderr=%q", res.exitCode, res.stderr)
+	}
+
+	// The corrupt sibling does not contaminate intact versions: builtin
+	// still prints its statistics JSON and exits zero.
+	res = runCLI(t, "reviews", "evaluate", dir, "1", "0", "100", "builtin")
+	if res.exitCode != 0 {
+		t.Fatalf("evaluate under builtin failed: %d %q", res.exitCode, res.stderr)
+	}
+	var eval struct {
+		StillHit int `json:"stillHit"`
+		Pending  int `json:"pending"`
+		Version  struct {
+			ID string `json:"id"`
+		} `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(res.stdout), &eval); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, res.stdout)
+	}
+	if eval.Version.ID != "builtin" || eval.StillHit != 1 || eval.Pending != 1 {
+		t.Fatalf("builtin evaluation stats wrong: %s", res.stdout)
+	}
+}
+
+// TestCLIReviewEvaluateCorruptVersionEmptyRange proves the corrupt
+// candidate is refused even when the range matches no blocks: the failure
+// is about the archived rule version, not about the range contents.
+func TestCLIReviewEvaluateCorruptVersionEmptyRange(t *testing.T) {
+	dir := setupReviewCLIArchive(t)
+	corruptStoredVersion(t, dir, "mult3", func(ver map[string]any) {
+		ver["rules"].(map[string]any)["displacement"].(map[string]any)["multiplier"] = 0
+	})
+	res := runCLI(t, "reviews", "evaluate", dir, "1", "1000", "2000", "mult3")
+	if res.exitCode != 1 || res.stdout != "" || !strings.Contains(res.stderr, "corrupt") ||
+		!strings.Contains(res.stderr, "mult3") {
+		t.Fatalf("empty-range failure shape wrong: exit=%d stdout=%q stderr=%q",
+			res.exitCode, res.stdout, res.stderr)
+	}
+}

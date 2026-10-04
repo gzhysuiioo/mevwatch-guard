@@ -456,14 +456,17 @@ type CompareResult struct {
 	Changed          []FindingChange `json:"changed"`
 }
 
-// compareArchiveDoc mirrors the archive file the way a comparison reads
-// it: records fully decoded, but each registered version kept as its raw
-// stored document. A corrupt version entry — a wrong-typed field, say —
-// then cannot break the read or masquerade as whole-archive corruption;
-// it is judged on its own by intactVersion.
-type compareArchiveDoc struct {
+// rawVersionArchiveDoc mirrors the archive file the way a comparison and a
+// review-range evaluation read it: records and reviews are fully decoded,
+// but each registered version is kept as its raw stored document. A corrupt
+// version entry — a wrong-typed field, say — then cannot break the read or
+// masquerade as whole-archive corruption; it is judged on its own by
+// intactVersion, so a corrupt sibling never contaminates an intact
+// candidate or the built-in version.
+type rawVersionArchiveDoc struct {
 	Records  []record          `json:"records"`
 	Versions []json.RawMessage `json:"versions"`
+	Reviews  []ReviewObject    `json:"reviews"`
 }
 
 // Compare re-runs detection for one archived block under the given
@@ -490,7 +493,7 @@ func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if err != nil {
 		return CompareResult{}, err
 	}
-	var doc compareArchiveDoc
+	var doc rawVersionArchiveDoc
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return CompareResult{}, fmt.Errorf("archive is corrupted: %w", err)
