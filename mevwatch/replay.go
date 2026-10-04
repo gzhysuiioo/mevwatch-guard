@@ -63,13 +63,27 @@ type blockID struct {
 	blockHash string
 }
 
+// swapLine mirrors one swap record inside a block line. Pointers
+// distinguish a missing field (or an explicit null) from an explicit
+// zero value: a replay record must be complete on its own, so In, Out,
+// GasPrice and Index are all required and may not be null.
+type swapLine struct {
+	TxHash   *string `json:"TxHash"`
+	Pool     *string `json:"Pool"`
+	Trader   *string `json:"Trader"`
+	In       *int64  `json:"In"`
+	Out      *int64  `json:"Out"`
+	GasPrice *int64  `json:"GasPrice"`
+	Index    *int    `json:"Index"`
+}
+
 // blockLine mirrors one input line. Pointers distinguish a missing field
 // from an explicit zero value.
 type blockLine struct {
-	ChainID     *string `json:"chainId"`
-	BlockHash   *string `json:"blockHash"`
-	BlockNumber *int64  `json:"blockNumber"`
-	Swaps       *[]Swap `json:"swaps"`
+	ChainID     *string     `json:"chainId"`
+	BlockHash   *string     `json:"blockHash"`
+	BlockNumber *int64      `json:"blockNumber"`
+	Swaps       *[]swapLine `json:"swaps"`
 }
 
 func parseBlock(text string) (Block, error) {
@@ -101,30 +115,53 @@ func parseBlock(text string) (Block, error) {
 	byIndex := make(map[int]string)
 	swaps := []Swap{}
 	for i, s := range *raw.Swaps {
-		if s.TxHash == "" {
+		if s.TxHash == nil || *s.TxHash == "" {
 			return Block{}, fmt.Errorf("swaps[%d]: TxHash must not be empty", i)
 		}
-		if s.Pool == "" {
+		if s.Pool == nil || *s.Pool == "" {
 			return Block{}, fmt.Errorf("swaps[%d]: Pool must not be empty", i)
 		}
-		if s.Trader == "" {
+		if s.Trader == nil || *s.Trader == "" {
 			return Block{}, fmt.Errorf("swaps[%d]: Trader must not be empty", i)
 		}
-		if s.In < 0 || s.Out < 0 || s.GasPrice < 0 || s.Index < 0 {
+		// Every numeric field must be present and non-null in this very
+		// record; an explicit zero is a valid value, never a missing one.
+		// Values must not be borrowed from a neighbour, a same-hash record
+		// or a default, so an incomplete record is rejected before dedup
+		// even when a complete record with the same tx hash exists.
+		for _, f := range []struct {
+			name string
+			v    *int64
+		}{
+			{"In", s.In}, {"Out", s.Out}, {"GasPrice", s.GasPrice},
+		} {
+			if f.v == nil {
+				return Block{}, fmt.Errorf("swaps[%d]: %s is required and must not be null", i, f.name)
+			}
+		}
+		if s.Index == nil {
+			return Block{}, fmt.Errorf("swaps[%d]: Index is required and must not be null", i)
+		}
+		in, out, gasPrice, index := *s.In, *s.Out, *s.GasPrice, *s.Index
+		if in < 0 || out < 0 || gasPrice < 0 || index < 0 {
 			return Block{}, fmt.Errorf("swaps[%d]: In, Out, GasPrice and Index must be non-negative", i)
 		}
-		if prev, ok := byTx[s.TxHash]; ok {
-			if prev != s {
-				return Block{}, fmt.Errorf("swaps[%d]: conflicting records for tx %s", i, s.TxHash)
+		swap := Swap{
+			TxHash: *s.TxHash, Pool: *s.Pool, Trader: *s.Trader,
+			In: in, Out: out, GasPrice: gasPrice, Index: index,
+		}
+		if prev, ok := byTx[swap.TxHash]; ok {
+			if prev != swap {
+				return Block{}, fmt.Errorf("swaps[%d]: conflicting records for tx %s", i, swap.TxHash)
 			}
 			continue // exact duplicate, keep one copy
 		}
-		if other, ok := byIndex[s.Index]; ok {
-			return Block{}, fmt.Errorf("swaps[%d]: Index %d already used by tx %s", i, s.Index, other)
+		if other, ok := byIndex[swap.Index]; ok {
+			return Block{}, fmt.Errorf("swaps[%d]: Index %d already used by tx %s", i, swap.Index, other)
 		}
-		byTx[s.TxHash] = s
-		byIndex[s.Index] = s.TxHash
-		swaps = append(swaps, s)
+		byTx[swap.TxHash] = swap
+		byIndex[swap.Index] = swap.TxHash
+		swaps = append(swaps, swap)
 	}
 	sort.Slice(swaps, func(i, j int) bool { return swaps[i].Index < swaps[j].Index })
 	return Block{

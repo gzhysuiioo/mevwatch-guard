@@ -21,7 +21,7 @@ go run ./cmd/mevwatch replay <输入文件> <归档目录>
 go run ./cmd/mevwatch report <归档目录> <chainId> <blockHash>
 ```
 
-输入每行一个 JSON 对象：`chainId`、`blockHash`（非空字符串）、`blockNumber`（非负整数）、`swaps` 数组（可为空，空白行忽略）。交换记录使用 `TxHash`/`Pool`/`Trader`/`In`/`Out`/`GasPrice`/`Index` 字段。同一交易哈希的完全重复记录去重，字段冲突或不同交易占用同一 `Index` 会拒绝整个文件并指出行号。
+输入每行一个 JSON 对象：`chainId`、`blockHash`（非空字符串）、`blockNumber`（非负整数）、`swaps` 数组（可为空，空白行忽略但计入行号）。交换记录使用 `TxHash`/`Pool`/`Trader`/`In`/`Out`/`GasPrice`/`Index` 字段，其中每条交换的 `In`、`Out`、`GasPrice`、`Index` 都必须由该记录自身明确提供且不得为 `null`（缺字段与写 `null` 等同），明确填写的 `0` 是有效数值，不允许从相邻交易、同哈希的另一条记录或默认值补出数值；即使不完整记录与完整记录具有相同交易哈希，也不能靠去重放过。字段缺失或为 `null` 时按文件起始计数的实际行号拒绝整批输入，并指出 `swaps` 中第几条记录的哪个数值字段不完整。字段冲突或不同交易占用同一 `Index` 同样拒绝整个文件并指出行号。
 
 回放按 `Index` 排列同池交换并逐笔检查相邻交易：同一交易者前后夹击且 GasPrice 均更高为夹子（严重度 3），否则前一笔 GasPrice 严格超过两倍为位移（严重度 2）。报告含区块标识、高度、去重后交换数量与按严重度降序、交易哈希升序排列的结论，每条结论附参与判断的交换原始字段。
 

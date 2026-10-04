@@ -159,6 +159,167 @@ func TestReplayEmptySwapsAndBlankLines(t *testing.T) {
 	}
 }
 
+func swapJSON(tx string, i int, gas string) string {
+	return fmt.Sprintf(`{"TxHash":"%s","Pool":"p1","Trader":"t","In":1,"Out":1,%s"Index":%d}`, tx, gas, i)
+}
+
+func TestReplayIncompleteSwapFields(t *testing.T) {
+	// Each of the four numeric fields must be present and non-null; the
+	// error names the swaps entry and the field, and carries the real
+	// 1-based line number (blank lines counted, no trailing newline).
+	cases := []struct {
+		name       string
+		input      string
+		line       int
+		swapIndex  string
+		field      string
+	}{
+		{
+			"missing gasPrice",
+			"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p1\",\"Trader\":\"t\",\"In\":1,\"Out\":1,\"Index\":0}]}",
+			1, "swaps[0]", "GasPrice",
+		},
+		{
+			"null gasPrice",
+			"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p1\",\"Trader\":\"t\",\"In\":1,\"Out\":1,\"GasPrice\":null,\"Index\":0}]}",
+			1, "swaps[0]", "GasPrice",
+		},
+		{
+			"missing in",
+			"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p1\",\"Trader\":\"t\",\"Out\":1,\"GasPrice\":1,\"Index\":0}]}",
+			1, "swaps[0]", "In",
+		},
+		{
+			"null out",
+			"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p1\",\"Trader\":\"t\",\"In\":1,\"Out\":null,\"GasPrice\":1,\"Index\":0}]}",
+			1, "swaps[0]", "Out",
+		},
+		{
+			"null index",
+			"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p1\",\"Trader\":\"t\",\"In\":1,\"Out\":1,\"GasPrice\":1,\"Index\":null}]}",
+			1, "swaps[0]", "Index",
+		},
+		{
+			"missing index on later line after blanks",
+			"{\"chainId\":\"1\",\"blockHash\":\"0x1\",\"blockNumber\":1,\"swaps\":[]}\n\n" +
+				"{\"chainId\":\"1\",\"blockHash\":\"0x2\",\"blockNumber\":2,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p1\",\"Trader\":\"t\",\"In\":1,\"Out\":1,\"GasPrice\":1}]}",
+			3, "swaps[0]", "Index",
+		},
+		{
+			"missing gas on second swap of last line without trailing newline",
+			"\n" +
+				"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[" +
+				swapJSON("0xfront", 0, `"GasPrice":30,`) + "," +
+				`{"TxHash":"0xvic","Pool":"p1","Trader":"u","In":1,"Out":1,"Index":1}` +
+				"]}",
+			2, "swaps[1]", "GasPrice",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, err := Replay(strings.NewReader(tc.input), dir)
+			if err == nil {
+				t.Fatal("expected error for incomplete record")
+			}
+			var le *LineError
+			if !errors.As(err, &le) {
+				t.Fatalf("error %v is not a LineError", err)
+			}
+			if le.Line != tc.line {
+				t.Fatalf("error line = %d, want %d (%v)", le.Line, tc.line, err)
+			}
+			msg := le.Err.Error()
+			if !strings.Contains(msg, tc.swapIndex) || !strings.Contains(msg, tc.field) {
+				t.Fatalf("error %q must name %s and field %s", msg, tc.swapIndex, tc.field)
+			}
+			if !strings.Contains(strings.ToLower(msg), "null") && !strings.Contains(msg, "required") {
+				t.Fatalf("error %q must explain the field is missing or null", msg)
+			}
+			if _, serr := os.Stat(filepath.Join(dir, archiveFileName)); !errors.Is(serr, os.ErrNotExist) {
+				t.Fatalf("archive file exists after failed replay: %v", serr)
+			}
+		})
+	}
+}
+
+func TestReplayExplicitZeroIsComplete(t *testing.T) {
+	// Explicit zeros are real values, never missing ones: a victim with
+	// GasPrice 0 is a valid record and is judged under the normal rules.
+	dir := t.TempDir()
+	input := `{"chainId":"1","blockHash":"0z","blockNumber":1,"swaps":[{"TxHash":"0xf","Pool":"p1","Trader":"a","In":0,"Out":0,"GasPrice":30,"Index":0},{"TxHash":"0v","Pool":"p1","Trader":"b","In":0,"Out":0,"GasPrice":0,"Index":1}]}`
+	reports := replay(t, dir, input)
+	got := map[string]string{}
+	for _, f := range reports[0].Findings {
+		got[f.TxHash] = f.Kind
+	}
+	if got["0v"] != "displacement" {
+		t.Fatalf("victim with explicit gas 0 = %v, want displacement", got)
+	}
+}
+
+func TestReplayIncompleteRecordNotSavedByDuplicateHash(t *testing.T) {
+	// A complete record followed by an incomplete one with the same tx hash
+	// must not be pardoned by dedup: the record has to stand on its own.
+	dir := t.TempDir()
+	complete := `{"TxHash":"0x1","Pool":"p1","Trader":"t","In":1,"Out":1,"GasPrice":5,"Index":0}`
+	missingGas := `{"TxHash":"0x1","Pool":"p1","Trader":"t","In":1,"Out":1,"Index":0}`
+	input := fmt.Sprintf(`{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[%s,%s]}`, complete, missingGas)
+	if _, err := Replay(strings.NewReader(input), dir); err == nil {
+		t.Fatal("incomplete duplicate record must reject the whole file")
+	}
+	// Same when the two records live on different lines of the file.
+	input = fmt.Sprintf("{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[%s]}\n"+
+		"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":1,\"swaps\":[%s]}\n", complete, missingGas)
+	if _, err := Replay(strings.NewReader(input), dir); err == nil {
+		t.Fatal("incomplete record on later line must reject the whole file")
+	}
+}
+
+func TestReplayIncompleteSwapAllOrNothing(t *testing.T) {
+	dir := t.TempDir()
+	replay(t, dir, sandwichInput)
+	// A valid new block precedes the broken one: the valid block must not be
+	// archived and the existing archive must stay intact.
+	input := "{\"chainId\":\"2\",\"blockHash\":\"0xnew\",\"blockNumber\":1,\"swaps\":[]}\n" +
+		"{\"chainId\":\"1\",\"blockHash\":\"0x\",\"blockNumber\":2,\"swaps\":[{\"TxHash\":\"0x1\",\"Pool\":\"p1\",\"Trader\":\"t\",\"In\":1,\"Out\":1,\"Index\":0}]}"
+	if _, err := Replay(strings.NewReader(input), dir); err == nil {
+		t.Fatal("expected error for incomplete swap")
+	}
+	if _, err := Query(dir, "2", "0xnew"); !errors.Is(err, ErrUnknownBlock) {
+		t.Fatalf("valid earlier block leaked into archive: %v", err)
+	}
+	r, err := Query(dir, "1", "0xa")
+	if err != nil || r.BlockNumber != 10 || r.SwapCount != 3 {
+		t.Fatalf("pre-existing archive content damaged: %v %+v", err, r)
+	}
+}
+
+func TestReplayIncompleteSwapRejectedWithVersionAndDisabledRules(t *testing.T) {
+	dir := t.TempDir()
+	incomplete := `{"chainId":"1","blockHash":"0x","blockNumber":1,"swaps":[{"TxHash":"0x1","Pool":"p1","Trader":"t","In":1,"Out":1,"Index":0}]}`
+	// An explicit version replay rejects before version rules matter.
+	if _, err := ReplayWithVersion(strings.NewReader(incomplete), dir, BuiltinVersionID); err == nil {
+		t.Fatal("versioned replay must reject an incomplete record")
+	}
+	// A version with both rules disabled must not pardon it either.
+	off := `{"id":"off","rules":{"sandwich":{"enabled":false,"severity":1},"displacement":{"enabled":false,"severity":1,"multiplier":2}}}`
+	if _, _, err := RegisterVersion(dir, []byte(off)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReplayWithVersion(strings.NewReader(incomplete), dir, "off"); err == nil {
+		t.Fatal("replay under rules-off version must still reject an incomplete record")
+	}
+	// Same for a file-based replay entry point.
+	path := filepath.Join(t.TempDir(), "blocks.jsonl")
+	if err := os.WriteFile(path, []byte(incomplete), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReplayFileWithVersion(path, t.TempDir(), "builtin"); err == nil {
+		t.Fatal("ReplayFileWithVersion must reject an incomplete record")
+	}
+}
+
 func TestReplayValidationErrors(t *testing.T) {
 	cases := []struct {
 		name  string
