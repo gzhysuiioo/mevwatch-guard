@@ -769,6 +769,144 @@ func TestKVRoundTripLegacyResultWithoutApplyFields(t *testing.T) {
 // TestKVRoundTripFailedReuseKeepsPreviousResult 复用已有结果对象再次读入时，
 // 类型非法的 JSON 必须明确报错，且原有结果完整保留——即使错误藏在某条请求
 // 答复内，随后输出也不能混入这次读入的任何部分内容。
+// TestKVRejectedReplicationKeepsApplyBoundary 回归保障：启用 applyKV 后复制请求
+// 被拒绝时的状态边界——较高任期或较大 leaderCommit 都不能把未确认的命令写进
+// 键值表。场景含一个已提交前缀与未提交尾部：
+//   - 初始任期 2，idx1/idx2 任期均为 2，set balance=100 已提交而 set
+//     balance=200 未提交：键值表只有 balance=100，应用位置停在 1；
+//   - 任期 5 的请求把 idx2 任期错称为 3 并要求提交更后位置：因前缀不匹配被拒，
+//     任期升到 5，但日志、提交位置、应用位置与键值表保持原值，无应用错误；
+//   - 任期 9 但条目索引不连续的请求属于字段非法：整条拒绝且连任期都不得改变，
+//     不能与上一种拒绝混为同样的状态变化；
+//   - 之后任期 5、正确匹配 idx2 的合法请求追加 idx3 并提交到 3：按日志次序
+//     应用尚未应用的命令，balance=200、receipt=ok，提交与应用位置均为 3。
+func TestKVRejectedReplicationKeepsApplyBoundary(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 2, "set balance=100"),
+		entry(2, 2, "set balance=200"), // 未提交尾部：任何拒绝都不能让它被应用
+	}}
+	wantOriginalLog := []LogEntry{
+		entry(1, 2, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+	}
+
+	// 没有请求时：只应用初始已提交前缀，字符串值原样保留。
+	start := runKV(t, initial)
+	if *start.FinalAppliedIndex != 1 {
+		t.Fatalf("initial appliedIndex = %d, want 1", *start.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, start), map[string]string{"balance": "100"}) {
+		t.Fatalf("initial kv = %v, want only balance=100", start.FinalKV)
+	}
+	if start.FinalApplyError != nil {
+		t.Fatalf("unexpected initial apply error: %+v", start.FinalApplyError)
+	}
+
+	// 请求一：高任期 + 前缀任期不匹配 + 更大的 leaderCommit，其余字段全部合法。
+	mismatch := AppendRequest{Term: 5, PrevLogIndex: 2, PrevLogTerm: 3, LeaderCommit: 4,
+		Entries: []LogEntry{entry(3, 5, "set later=x")}}
+	// 请求二：任期 9，但条目索引没有从 prevLogIndex+1 开始——字段非法。
+	gap := AppendRequest{Term: 9, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 5,
+		Entries: []LogEntry{entry(4, 9, "set gap=y")}} // 期望索引 3
+	// 请求三：任期 5、正确匹配 idx2（任期 2）的合法追加。
+	legal := AppendRequest{Term: 5, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+		Entries: []LogEntry{entry(3, 5, "set receipt=ok")}}
+
+	// 若输入停在第一次拒绝处：任期升到 5，其余一切不动，未确认命令不入表。
+	stopped := runKV(t, initial, mismatch)
+	r := stopped.Results[0]
+	if r.Accepted || r.Reason != ReasonPrevLogMismatch {
+		t.Fatalf("first request should be rejected for prefix mismatch: %+v", r)
+	}
+	if r.Term != 5 {
+		t.Fatalf("higher term should survive rejection: term = %d, want 5", r.Term)
+	}
+	if r.CommittedIndex != 1 {
+		t.Fatalf("commit advanced on rejection: %d, want 1", r.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, r); got != 1 {
+		t.Fatalf("applied index advanced on rejection: %d, want 1", got)
+	}
+	if r.ApplyError != nil {
+		t.Fatalf("rejection must not produce an apply error: %+v", r.ApplyError)
+	}
+	if stopped.FinalTerm != 5 || stopped.FinalCommittedIndex != 1 {
+		t.Fatalf("final state after stop: term=%d ci=%d, want 5/1",
+			stopped.FinalTerm, stopped.FinalCommittedIndex)
+	}
+	if !reflect.DeepEqual(stopped.FinalLog, wantOriginalLog) {
+		t.Fatalf("log changed after rejection: %+v", stopped.FinalLog)
+	}
+	if *stopped.FinalAppliedIndex != 1 {
+		t.Fatalf("final appliedIndex = %d, want 1", *stopped.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, stopped), map[string]string{"balance": "100"}) {
+		t.Fatalf("kv changed after rejection: %v, want only balance=100", stopped.FinalKV)
+	}
+	if stopped.FinalApplyError != nil {
+		t.Fatalf("unexpected final apply error: %+v", stopped.FinalApplyError)
+	}
+
+	// 完整过程：两种拒绝之后合法请求仍能追加并提交。
+	out := runKV(t, initial, mismatch, gap, legal)
+	wantResults := []struct {
+		accepted bool
+		reason   string
+		term     int
+		commit   int
+		applied  int
+	}{
+		{false, ReasonPrevLogMismatch, 5, 1, 1}, // 任期更新保留，其余不动
+		{false, ReasonEntryIndexGap, 5, 1, 1},   // 字段非法：连任期都停在 5
+		{true, ReasonOK, 5, 3, 3},               // 追加 idx3，提交并应用到 3
+	}
+	if len(out.Results) != len(wantResults) {
+		t.Fatalf("got %d results, want %d", len(out.Results), len(wantResults))
+	}
+	for i, want := range wantResults {
+		got := out.Results[i]
+		if got.Accepted != want.accepted || got.Reason != want.reason {
+			t.Fatalf("result %d = accepted=%v reason=%q, want accepted=%v reason=%q",
+				i, got.Accepted, got.Reason, want.accepted, want.reason)
+		}
+		if got.Term != want.term || got.CommittedIndex != want.commit {
+			t.Fatalf("result %d state = term %d ci %d, want term %d ci %d",
+				i, got.Term, got.CommittedIndex, want.term, want.commit)
+		}
+		if applied := appliedIndexOf(t, got); applied != want.applied {
+			t.Fatalf("result %d appliedIndex = %d, want %d", i, applied, want.applied)
+		}
+		if got.ApplyError != nil {
+			t.Fatalf("result %d unexpected apply error: %+v", i, got.ApplyError)
+		}
+	}
+
+	// 最终状态：任期 5、提交 3；日志为原两条加 idx3，未提交尾部命令原样保留。
+	wantLog := []LogEntry{
+		entry(1, 2, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 5, "set receipt=ok"),
+	}
+	if out.FinalTerm != 5 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("final replication state = term %d ci %d, want term 5 ci 3",
+			out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if !reflect.DeepEqual(out.FinalLog, wantLog) {
+		t.Fatalf("final log = %+v, want %+v", out.FinalLog, wantLog)
+	}
+	if *out.FinalAppliedIndex != 3 {
+		t.Fatalf("final appliedIndex = %d, want 3", *out.FinalAppliedIndex)
+	}
+	// 按原日志顺序应用：idx2 把 balance 改成 200，idx3 写入 receipt。
+	wantKV := map[string]string{"balance": "200", "receipt": "ok"}
+	if !reflect.DeepEqual(finalKVOf(t, out), wantKV) {
+		t.Fatalf("final kv = %v, want %v", out.FinalKV, wantKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("final apply error = %+v, want none", out.FinalApplyError)
+	}
+}
+
 func TestKVRoundTripFailedReuseKeepsPreviousResult(t *testing.T) {
 	original := runKV(t, InitialState{CurrentTerm: 1, CommittedIndex: 1, Log: []LogEntry{
 		entry(1, 1, "set x=1"),
