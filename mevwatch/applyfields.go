@@ -4,6 +4,7 @@
 package mevwatch
 
 import (
+	"bytes"
 	"encoding/json"
 )
 
@@ -19,11 +20,13 @@ import (
 // 填已应用索引、键值表与应用错误；没有复制请求时最终结果同样反映初始已
 // 提交前缀的应用状态。
 //
-// 读入：按该层 JSON 中是否出现任一应用字段恢复开关。出现任一字段即视为
-// 启用应用的结果，再次输出时带上该层完整应用字段；完全未出现则不补上。
-// 两层各自独立判断，互不推断。读入会用解码出的新值完整替换结果对象，不
-// 残留上一次读入的键值表、应用位置或错误；字段类型不合法照常返回解码
-// 错误，不会把错误内容当作零值接受。
+// 读入：按该层 JSON 中是否出现任一应用字段恢复开关，判定与解码接受的键名
+// 规则一致：字段名只改字母大小写（如 "ApplyError"、"FINALKV"）也按出现处理，
+// 与其值是否为空无关；与应用字段名只是相似的无关键不触发。出现任一字段即视
+// 为启用应用的结果，再次输出时带上该层完整应用字段；完全未出现则不补上。
+// 两层各自独立判断，互不推断。读入会用解码出的新值完整替换结果对象，不残留
+// 上一次读入的键值表、应用位置或错误；JSON 无法解析或字段类型不合法照常返回
+// 解码错误，结果对象保持读入前的内容，不会把错误内容当作零值接受。
 
 // appendResultApplyKeys 是 AppendResult 一层用于判定应用字段是否出现的键名。
 var appendResultApplyKeys = []string{"appliedIndex", "applyError"}
@@ -56,15 +59,20 @@ func unmarshalApplyFields[T any](data []byte, dst *T, keys []string) (present bo
 	return present, nil
 }
 
-// jsonHasAnyKey 报告 JSON 对象中是否出现任一给定键。
+// jsonHasAnyKey 报告 JSON 对象中是否出现任一给定键。判定与 encoding/json
+// 解码时的字段匹配规则一致：键名比较按 Unicode 大小写折叠（等价于
+// bytes.EqualFold），因此只改字母大小写的应用字段名（如 "ApplyError"）
+// 同样算出现；与字段名只是相似的其他键不会命中。
 func jsonHasAnyKey(data []byte, keys ...string) (bool, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return false, err
 	}
-	for _, key := range keys {
-		if _, ok := raw[key]; ok {
-			return true, nil
+	for presentKey := range raw {
+		for _, key := range keys {
+			if bytes.EqualFold([]byte(presentKey), []byte(key)) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
@@ -119,9 +127,10 @@ func (r AppendResult) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON 按共用规则读入应用字段：出现 appendResultApplyKeys 中任一键
-// 即视为启用键值应用的结果，再次编码会原样保留这些字段（含 0、null）；未
-// 出现时按未启用处理。整个对象被完整替换，不会残留上一次读入的应用状态。
-// 字段类型错误照常返回解码错误。
+// （键名只改字母大小写也算，与解码的字段匹配规则一致）即视为启用键值应用的
+// 结果，再次编码会原样保留这些字段（含 0、null）；未出现时按未启用处理。
+// 整个对象被完整替换，不会残留上一次读入的应用状态。字段类型错误照常返回
+// 解码错误，结果保持读入前的内容。
 func (r *AppendResult) UnmarshalJSON(data []byte) error {
 	type alias AppendResult
 	var decoded alias
@@ -153,10 +162,11 @@ func (o ReplicateOutput) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON 按共用规则读入应用字段，语义同 AppendResult.UnmarshalJSON：
-// 出现 replicateOutputApplyKeys 中任一键时再次编码保留 finalAppliedIndex、
-// finalKV（空表为 {}）与 finalApplyError（无错误为 null）；未出现时整个对象
-// 被完整替换，不残留上一次读入的键值表、错误或应用位置。Results 中每条请求
-// 结果由 AppendResult.UnmarshalJSON 各自恢复。字段类型错误照常返回解码错误。
+// 出现 replicateOutputApplyKeys 中任一键（键名只改字母大小写也算）时再次编码
+// 保留 finalAppliedIndex、finalKV（空表为 {}）与 finalApplyError（无错误为
+// null）；未出现时整个对象被完整替换，不残留上一次读入的键值表、错误或应用
+// 位置。Results 中每条请求结果由 AppendResult.UnmarshalJSON 各自恢复。字段
+// 类型错误照常返回解码错误，结果保持读入前的内容。
 func (o *ReplicateOutput) UnmarshalJSON(data []byte) error {
 	type alias ReplicateOutput
 	var decoded alias
