@@ -30,9 +30,9 @@ var ErrVersionConflict = errors.New("version already registered with different p
 // multiplier is out of range. The decoded struct cannot tell a missing
 // field from an explicit zero value, so such an archive would otherwise
 // run under silently zeroed parameters (a zero displacement multiplier
-// even crashes detection). A comparison, review-range evaluation or replay
-// naming a corrupt version is refused; the corrupt content is never
-// replaced by the enabled version, the built-in rules or defaults.
+// even crashes detection). Showing, comparing, evaluating or replaying a
+// corrupt version is refused; the corrupt content is never replaced by the
+// enabled version, the built-in rules or defaults.
 var ErrCorruptVersion = errors.New("archived rule version is corrupted")
 
 // SandwichRule configures the sandwich rule: whether it runs and the
@@ -254,20 +254,6 @@ func ParseRuleVersion(raw []byte) (RuleVersion, error) {
 			Displacement: DisplacementRule{Enabled: dispOn, Severity: dispSev, Multiplier: *mult},
 		},
 	}, nil
-}
-
-// findVersion resolves id against the built-in version and the archive's
-// registered versions.
-func findVersion(data archiveData, id string) (RuleVersion, error) {
-	if id == BuiltinVersionID {
-		return BuiltinVersion(), nil
-	}
-	for _, v := range data.Versions {
-		if v.ID == id {
-			return v, nil
-		}
-	}
-	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
 }
 
 // intactVersion resolves id for a comparison and proves the version's
@@ -519,7 +505,27 @@ func ListVersions(dir string) (versions []RuleVersion, enabled string, err error
 	return versions, enabled, nil
 }
 
-// GetVersion returns one version's full parameters by ID.
+// GetVersion returns one version's full parameters by ID. The requested
+// version's stored archive document must still satisfy every registration
+// rule in full — re-validated from its raw bytes with the same parser
+// registrations pass — before its parameters are returned: the decoded
+// struct cannot tell a missing enabled, severity or multiplier from an
+// explicitly declared one, so a corrupt declaration would otherwise be
+// shown with silently zeroed or defaulted parameters. An explicit
+// enabled:false is a legal off state, but a disabled rule still has to
+// carry complete, in-range parameters; a missing or null rule object or
+// field, a wrong type, an out-of-range number, an unknown or duplicate
+// field all fail with ErrCorruptVersion naming the version and the
+// offending rule or field — never completed from defaults, the enabled
+// version or the built-in rules. Only the requested version is judged: a
+// corrupt sibling — even the currently enabled one — does not block
+// showing an intact version, and an id that no stored declaration carries
+// stays an ErrUnknownVersion failure (the id string is matched exactly,
+// never case-folded or trimmed). The built-in version is constructed in
+// code and always queryable, whether or not the archive directory exists.
+// A wholly unparseable archive still fails as archive corruption. The
+// query is read-only: version declarations, the enabled marker and the
+// archived reports are never modified.
 func GetVersion(dir, id string) (RuleVersion, error) {
 	if id == BuiltinVersionID {
 		return BuiltinVersion(), nil
@@ -533,11 +539,21 @@ func GetVersion(dir, id string) (RuleVersion, error) {
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with each registered version kept as its raw stored document,
+	// the same shape a replay or an enable uses: a wrong-typed field in one
+	// version is that version's corruption rather than whole-archive
+	// corruption, and a corrupt sibling cannot block an intact candidate.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return RuleVersion{}, err
 	}
-	return findVersion(data, id)
+	data := replayArchiveDoc{Records: []record{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return RuleVersion{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	return intactVersion(data.Versions, id)
 }
 
 // FindingChange pairs the archived and compared conclusions for one
