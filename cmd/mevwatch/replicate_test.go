@@ -493,6 +493,226 @@ func TestCLIApplyKVFirstEntryTermBridgeFieldError(t *testing.T) {
 	}
 }
 
+// incrSuffixReplacementInput 构造一个以 incr count=10 为已提交前缀（计数 "10"）、
+// 未提交后缀为 incr count=100 与一条非法增量 incr count=1.5 的初始状态，并附上
+// 一条从后缀起点 idx2 替换的请求（具体条目与提交位置由参数决定），用于端到端
+// 锁定任期冲突替换 incr 后缀时的公开 JSON 输出。
+func incrSuffixReplacementInput(requestJSON string) string {
+	return `{
+  "currentTerm": 2,
+  "committedIndex": 1,
+  "log": [
+    {"index": 1, "term": 1, "command": "incr count=10"},
+    {"index": 2, "term": 1, "command": "incr count=100"},
+    {"index": 3, "term": 1, "command": "incr count=1.5"}
+  ],
+  "applyKV": true,
+  "requests": [
+    ` + requestJSON + `
+  ]
+}`
+}
+
+// runReplicateJSON 执行一次 replicate，断言正常完成（退出码 0、stderr 为空），
+// 并把 stdout 解码为结果。
+func runReplicateJSON(t *testing.T, input string) mevwatch.ReplicateOutput {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("normal completion must leave stderr empty, got %q", stderr.String())
+	}
+	var out mevwatch.ReplicateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	return out
+}
+
+// TestCLIApplyKVIncrTermConflictReplacesSuffix 端到端锁定任务主场景的公开 JSON：
+// 初始已提交 incr count=10（计数 "10"），未提交后缀含 incr count=100 与
+// incr count=1.5。请求匹配前置 idx1，在 idx2 以不同任期（旧 1、新 2）只带一条
+// incr count=-3 并提交到 2。最终计数应为 "7"，旧后缀两条从 finalLog 消失；
+// 被丢弃的合法增量与非法增量都不影响计数，且没有应用错误。
+func TestCLIApplyKVIncrTermConflictReplacesSuffix(t *testing.T) {
+	input := incrSuffixReplacementInput(
+		`{"term": 2, "prevLogIndex": 1, "prevLogTerm": 1, "leaderCommit": 2,
+	     "entries": [{"index": 2, "term": 2, "command": "incr count=-3"}]}`)
+	out := runReplicateJSON(t, input)
+	if len(out.Results) != 1 {
+		t.Fatalf("expected 1 result, got %+v", out.Results)
+	}
+	result := out.Results[0]
+	if !result.Accepted || result.Reason != mevwatch.ReasonOK {
+		t.Fatalf("different-term replacement must be accepted: %+v", result)
+	}
+	if result.Conflict != nil {
+		t.Fatalf("accepted replacement must not carry a conflict hint: %+v", result.Conflict)
+	}
+	if result.Term != 2 || result.CommittedIndex != 2 {
+		t.Fatalf("result state = term %d ci %d, want term 2 ci 2", result.Term, result.CommittedIndex)
+	}
+	if result.AppliedIndex == nil || *result.AppliedIndex != 2 {
+		t.Fatalf("result appliedIndex = %+v, want 2", result.AppliedIndex)
+	}
+	if result.ApplyError != nil {
+		t.Fatalf("replacement incr must apply cleanly: %+v", result.ApplyError)
+	}
+	if out.FinalTerm != 2 || out.FinalCommittedIndex != 2 {
+		t.Fatalf("unexpected final state: %+v", out)
+	}
+	if len(out.FinalLog) != 2 ||
+		out.FinalLog[0] != (mevwatch.LogEntry{Index: 1, Term: 1, Command: "incr count=10"}) ||
+		out.FinalLog[1] != (mevwatch.LogEntry{Index: 2, Term: 2, Command: "incr count=-3"}) {
+		t.Fatalf("final log must drop the old suffix and keep the committed prefix: %+v", out.FinalLog)
+	}
+	if out.FinalAppliedIndex == nil || *out.FinalAppliedIndex != 2 {
+		t.Fatalf("final appliedIndex = %+v, want 2", out.FinalAppliedIndex)
+	}
+	if len(out.FinalKV) != 1 || out.FinalKV["count"] != "7" {
+		t.Fatalf("finalKV = %v, want count=7 (10 on the committed prefix, then -3)", out.FinalKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("unexpected final apply error: %+v", out.FinalApplyError)
+	}
+}
+
+// TestCLIApplyKVIncrSameTermConflictRejects 端到端锁定区分情形一：冲突位置的
+// 索引与任期都与旧条目相同（idx2 仍是任期 1），只是命令变成 incr count=-3。
+// 整条请求按现有同任期命令冲突拒绝：accepted=false 并给出具体原因，无 conflict
+// 键；旧后缀不能被提交、新命令不能被应用；日志、计数 "10"、提交与应用位置保持
+// 原样；较高请求任期 3 仍按现有规则保留。
+func TestCLIApplyKVIncrSameTermConflictRejects(t *testing.T) {
+	input := incrSuffixReplacementInput(
+		`{"term": 3, "prevLogIndex": 1, "prevLogTerm": 1, "leaderCommit": 3,
+	     "entries": [
+	       {"index": 2, "term": 1, "command": "incr count=-3"},
+	       {"index": 3, "term": 3, "command": "set other=x"}
+	     ]}`)
+	out := runReplicateJSON(t, input)
+	result := out.Results[0]
+	if result.Accepted || result.Reason != mevwatch.ReasonCommandConflictSameTerm {
+		t.Fatalf("expected same-term command conflict rejection, got %+v", result)
+	}
+	if result.Conflict != nil {
+		t.Fatalf("command conflict must not carry a conflict hint: %+v", result.Conflict)
+	}
+	if result.Term != 3 {
+		t.Fatalf("higher request term must survive rejection, term = %d, want 3", result.Term)
+	}
+	if result.CommittedIndex != 1 {
+		t.Fatalf("commit moved on rejection: %d, want 1", result.CommittedIndex)
+	}
+	if result.AppliedIndex == nil || *result.AppliedIndex != 1 || result.ApplyError != nil {
+		t.Fatalf("result apply state = %+v %+v, want appliedIndex 1 and no error",
+			result.AppliedIndex, result.ApplyError)
+	}
+	if len(out.FinalLog) != 3 ||
+		out.FinalLog[0] != (mevwatch.LogEntry{Index: 1, Term: 1, Command: "incr count=10"}) ||
+		out.FinalLog[1] != (mevwatch.LogEntry{Index: 2, Term: 1, Command: "incr count=100"}) ||
+		out.FinalLog[2] != (mevwatch.LogEntry{Index: 3, Term: 1, Command: "incr count=1.5"}) {
+		t.Fatalf("log must be unchanged after the atomic rejection: %+v", out.FinalLog)
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 1 {
+		t.Fatalf("unexpected final state: %+v", out)
+	}
+	if out.FinalAppliedIndex == nil || *out.FinalAppliedIndex != 1 {
+		t.Fatalf("final appliedIndex = %+v, want 1", out.FinalAppliedIndex)
+	}
+	if len(out.FinalKV) != 1 || out.FinalKV["count"] != "10" {
+		t.Fatalf("finalKV = %v, want only count=10", out.FinalKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("unexpected final apply error: %+v", out.FinalApplyError)
+	}
+}
+
+// TestCLIApplyKVIncrTermConflictBadDeltaApplyError 端到端锁定区分情形二：不同
+// 任期的替换本身合法（idx2 旧任期 1、新任期 3），但新条目 incr count=x 的增量
+// 不是整数。复制与提交成功（接受、提交位置到 2、日志完成替换，旧后缀消失），
+// 只有提交后的应用在正常 JSON 中报告错误：appliedIndex 停在 1，applyError 指向
+// idx2 并给出具体原因，计数保留 "10"。调用正常完成（退出码 0、stderr 为空）。
+func TestCLIApplyKVIncrTermConflictBadDeltaApplyError(t *testing.T) {
+	input := incrSuffixReplacementInput(
+		`{"term": 3, "prevLogIndex": 1, "prevLogTerm": 1, "leaderCommit": 2,
+	     "entries": [{"index": 2, "term": 3, "command": "incr count=x"}]}`)
+	out := runReplicateJSON(t, input)
+	result := out.Results[0]
+	if !result.Accepted || result.Reason != mevwatch.ReasonOK {
+		t.Fatalf("replication of the legal replacement must succeed: %+v", result)
+	}
+	if result.Term != 3 || result.CommittedIndex != 2 {
+		t.Fatalf("result state = term %d ci %d, want term 3 ci 2", result.Term, result.CommittedIndex)
+	}
+	if result.AppliedIndex == nil || *result.AppliedIndex != 1 {
+		t.Fatalf("result appliedIndex = %+v, want 1 (stopped before the bad new entry)", result.AppliedIndex)
+	}
+	if result.ApplyError == nil || result.ApplyError.Index != 2 ||
+		result.ApplyError.Reason != mevwatch.ApplyReasonIncrBadDelta {
+		t.Fatalf("result applyError = %+v, want index 2 bad delta", result.ApplyError)
+	}
+	if len(out.FinalLog) != 2 ||
+		out.FinalLog[0] != (mevwatch.LogEntry{Index: 1, Term: 1, Command: "incr count=10"}) ||
+		out.FinalLog[1] != (mevwatch.LogEntry{Index: 2, Term: 3, Command: "incr count=x"}) {
+		t.Fatalf("final log must reflect the successful replacement: %+v", out.FinalLog)
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 2 {
+		t.Fatalf("unexpected final state: %+v", out)
+	}
+	if out.FinalAppliedIndex == nil || *out.FinalAppliedIndex != 1 {
+		t.Fatalf("final appliedIndex = %+v, want 1", out.FinalAppliedIndex)
+	}
+	if len(out.FinalKV) != 1 || out.FinalKV["count"] != "10" {
+		t.Fatalf("finalKV = %v, want only count=10 (bad new incr leaves the table unchanged)", out.FinalKV)
+	}
+	if out.FinalApplyError == nil || out.FinalApplyError.Index != 2 ||
+		out.FinalApplyError.Reason != mevwatch.ApplyReasonIncrBadDelta {
+		t.Fatalf("final applyError = %+v, want index 2 bad delta", out.FinalApplyError)
+	}
+}
+
+// TestCLIApplyKVIncrTermConflictDisabledShape 不开启 applyKV 时，不同任期替换
+// 照常进行，但 incr 只是普通字符串：输出保持现状形状，没有任何应用字段。
+func TestCLIApplyKVIncrTermConflictDisabledShape(t *testing.T) {
+	input := `{
+  "currentTerm": 2,
+  "committedIndex": 1,
+  "log": [
+    {"index": 1, "term": 1, "command": "incr count=10"},
+    {"index": 2, "term": 1, "command": "incr count=100"},
+    {"index": 3, "term": 1, "command": "incr count=1.5"}
+  ],
+  "requests": [
+    {"term": 2, "prevLogIndex": 1, "prevLogTerm": 1, "leaderCommit": 2,
+     "entries": [{"index": 2, "term": 2, "command": "incr count=-3"}]}
+  ]
+}`
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var out mevwatch.ReplicateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	if !out.Results[0].Accepted || out.FinalCommittedIndex != 2 || len(out.FinalLog) != 2 {
+		t.Fatalf("replication should succeed without applyKV: %+v", out)
+	}
+	body := stdout.String()
+	for _, field := range []string{"appliedIndex", "applyError", "finalAppliedIndex", "finalKV", "finalApplyError"} {
+		if strings.Contains(body, field) {
+			t.Fatalf("applyKV disabled: output must not contain %q:\n%s", field, body)
+		}
+	}
+	if !strings.Contains(body, "incr count=-3") {
+		t.Fatalf("incr command must be replicated verbatim:\n%s", body)
+	}
+}
+
 func TestCLIErrors(t *testing.T) {
 	cases := []string{
 		`not json`,
