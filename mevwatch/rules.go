@@ -481,8 +481,106 @@ func EnableVersion(dir, id string) (RuleVersion, error) {
 	return v, nil
 }
 
+// identifiableVersionID recovers the best human-recognizable identifier a
+// stored version document still carries for an error message: the last
+// string occurrence of its id key, recognising it the way the decoder folds
+// field names — "id", "ID" and "ıd"-style compatibility spellings all
+// count. The last occurrence is what a plain unmarshal surfaces, so a
+// decayed document that repeats the id key ("id":"x","id":"y") is reported
+// under the id a reader sees in the decoded file rather than claimed to be
+// the earlier one. A document that is not an object, or carries no string
+// id at all, has no identifiable version; its corruption is still reported
+// (ParseRuleVersion judges the document), just without a made-up name.
+func identifiableVersionID(entry json.RawMessage) string {
+	const unidentifiable = "unidentifiable version"
+	dec := json.NewDecoder(bytes.NewReader(entry))
+	first, err := dec.Token()
+	if err != nil {
+		return unidentifiable
+	}
+	if d, ok := first.(json.Delim); !ok || d != '{' {
+		return unidentifiable
+	}
+	idField := foldName("id")
+	last := ""
+	found := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return unidentifiable
+		}
+		key, _ := keyTok.(string)
+		valTok, err := dec.Token()
+		if err != nil {
+			return unidentifiable
+		}
+		if _, isDelim := valTok.(json.Delim); isDelim {
+			// Consume the container the id (or another key) points at; an
+			// object/array id is a wrong type, not an identifier.
+			depth := 1
+			for depth > 0 {
+				tok, err := dec.Token()
+				if err != nil {
+					return unidentifiable
+				}
+				if dd, ok := tok.(json.Delim); ok {
+					if dd == '{' || dd == '[' {
+						depth++
+					} else {
+						depth--
+					}
+				}
+			}
+			continue
+		}
+		if foldName(key) == idField {
+			if s, ok := valTok.(string); ok && s != "" {
+				last, found = s, true
+			}
+		}
+	}
+	if !found {
+		return unidentifiable
+	}
+	return last
+}
+
 // ListVersions returns the built-in version plus every version registered
 // in the archive, along with the currently enabled version ID.
+//
+// Every registered version's stored archive document must still satisfy
+// the registration rules in full — sandwich and displacement each
+// declaring enabled and severity, displacement also multiplier, severity
+// an integer 1-5 and multiplier an integer 2-100 — re-validated from its
+// raw bytes with the same parser registration, enable, comparison, replay
+// and show use, before a single version is returned. The decoded struct
+// cannot tell a missing or null enabled, severity or multiplier from an
+// explicitly declared one (a missing enabled renders as false, a missing
+// multiplier as 0), and a wrong-typed field fails the whole-archive decode
+// before any judgment can run; listing off the structs directly would
+// therefore display a decayed declaration with silently zeroed parameters,
+// erasing the difference between a genuinely switched-off rule and a lost
+// field. Unknown rules or fields and repeated fields in one object
+// (including the case-folded and escaped spellings registration rejects)
+// are damage of the same kind. One corrupt registered version therefore
+// fails the whole listing with ErrCorruptVersion — whether or not it is
+// the enabled one, wherever it sits in the archive — naming the version's
+// identifiable stored id and the offending rule or field; no full or
+// partial list is returned, and the corrupt entry is never skipped past,
+// repaired, completed or replaced by the enabled version, the built-in
+// rules or defaults.
+//
+// An explicitly declared enabled:false is a legal off state: such a
+// version, including one with both rules disabled, is listed normally
+// with its complete parameters. The built-in version leads the list,
+// registered versions follow in stored order with their id strings
+// verbatim, and the enabled marker is reported as builtin when the
+// archive names none. A missing archive directory or a legacy archive
+// without versions and an enabled marker yields just the built-in
+// version with its original parameters; a wholly unparseable archive
+// stays an archive-corruption error rather than "no versions". The
+// query is read-only: it never repairs, completes, deletes or rewrites
+// any stored declaration or anything else in the archive.
 func ListVersions(dir string) (versions []RuleVersion, enabled string, err error) {
 	if _, serr := os.Stat(dir); errors.Is(serr, os.ErrNotExist) {
 		return []RuleVersion{BuiltinVersion()}, BuiltinVersionID, nil
@@ -493,11 +591,31 @@ func ListVersions(dir string) (versions []RuleVersion, enabled string, err error
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with each registered version kept as its raw stored document,
+	// the same shape every other version query uses: a wrong-typed field in
+	// one version is that version's corruption rather than whole-archive
+	// corruption, and every entry is judged on its own before the list is
+	// returned — listing never zero-fills, completes or drops an entry.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, "", err
 	}
-	versions = append([]RuleVersion{BuiltinVersion()}, data.Versions...)
+	data := replayArchiveDoc{Records: []record{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, "", fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+
+	versions = make([]RuleVersion, 0, len(data.Versions)+1)
+	versions = append(versions, BuiltinVersion())
+	for _, entry := range data.Versions {
+		v, perr := ParseRuleVersion(entry)
+		if perr != nil {
+			return nil, "", fmt.Errorf("%w: %s: %w", ErrCorruptVersion, identifiableVersionID(entry), perr)
+		}
+		versions = append(versions, v)
+	}
 	enabled = data.EnabledVersion
 	if enabled == "" {
 		enabled = BuiltinVersionID
