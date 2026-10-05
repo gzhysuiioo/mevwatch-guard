@@ -363,6 +363,21 @@ func entryDeclaresID(entry json.RawMessage, id string) bool {
 // succeeds without adding a version (created is false); the same ID with
 // different parameters is rejected. The built-in version ID is reserved.
 // Any failure leaves the archive untouched.
+//
+// Registration only ever adds the version this run submitted; it never
+// repairs, completes, reorders or drops a stored declaration. The archive
+// is therefore decoded with every registered version kept as its raw stored
+// document, the same shape a replay or an enable uses: a corrupt sibling —
+// a missing or null field, a wrong type, an out-of-range number, an unknown
+// or duplicate field — is that version's damage, not whole-archive
+// corruption, and neither blocks a legal new registration nor gets silently
+// completed (a missing enabled would otherwise come back as an explicit
+// false) or stripped of its unknown fields by one. When the submitted ID is
+// already taken, the stored declaration must still satisfy the registration
+// rules in full before any judgment about it: a corrupt one fails with
+// ErrCorruptVersion naming the version and the offending rule or field —
+// never created:false against the decayed parameters, never overwritten by
+// the new ones, never misreported as a parameter conflict.
 func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err error) {
 	v, err = ParseRuleVersion(raw)
 	if err != nil {
@@ -380,19 +395,34 @@ func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err e
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	data := replayArchiveDoc{Records: []record{}}
+	archiveRaw, err := readArchiveBytes(dir)
 	if err != nil {
 		return RuleVersion{}, false, err
 	}
-	for _, existing := range data.Versions {
-		if existing.ID == v.ID {
-			if existing.Rules == v.Rules {
-				return existing, false, nil
-			}
-			return RuleVersion{}, false, fmt.Errorf("%w: %s", ErrVersionConflict, v.ID)
+	if archiveRaw != nil {
+		if err := json.Unmarshal(archiveRaw, &data); err != nil {
+			return RuleVersion{}, false, fmt.Errorf("archive is corrupted: %w", err)
 		}
 	}
-	data.Versions = append(data.Versions, v)
+	for _, entry := range data.Versions {
+		if !entryDeclaresID(entry, v.ID) {
+			continue
+		}
+		existing, perr := ParseRuleVersion(entry)
+		if perr != nil {
+			return RuleVersion{}, false, fmt.Errorf("%w: %s: %w", ErrCorruptVersion, v.ID, perr)
+		}
+		if existing.Rules == v.Rules {
+			return existing, false, nil
+		}
+		return RuleVersion{}, false, fmt.Errorf("%w: %s", ErrVersionConflict, v.ID)
+	}
+	// The new version is appended as the exact document this run submitted
+	// and validated; every other section — the stored versions in order, the
+	// enabled marker, records, suppressions, alert records and reviews — is
+	// written back unchanged.
+	data.Versions = append(data.Versions, json.RawMessage(raw))
 	if err := writeArchiveAtomic(dir, data); err != nil {
 		return RuleVersion{}, false, err
 	}
