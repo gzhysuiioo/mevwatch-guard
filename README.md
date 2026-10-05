@@ -106,6 +106,7 @@ go run ./cmd/mevwatch reviews evaluate <归档目录> <chainId> <起始高度> <
 提交规格示例：`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"confirmed bot war","status":"real","expectedVersion":0}`。
 
 - 提交必须带归档内唯一的 `submissionId`、`operator`、`reason`、`status` 与非负整数 `expectedVersion`；`kind` 仅支持 `sandwich` 与 `displacement`，空标识、空白操作者/原因、非法状态、版本号或不存在的原结论一律拒绝。
+- 每次输入只能包含一个完整 JSON 对象（前后允许空格、制表符与换行）：空输入、只有空白、数组、`null`、其他单独的 JSON 值、未闭合的对象、第二个对象、多余的 `}` 或 `]` 及任何非空白尾随字符一律拒绝并指出尾随内容；字符串中的括号属于字段内容，不算对象边界。字段名大小写兼容保持不变，字符串值不做大小写转换或去除首尾空白。
 - 首次提交预期版本为 0，成功后对象版本加 1；改判与撤回（`unreviewed`）都**新增修订**，旧修订完整保留。
 - 相同 `submissionId` 与字段值重试返回**原修订**（`created:false`），即使对象后来已改判也不追加；相同标识内容不同报冲突（`submission id already used with different content`），预期版本落后报版本冲突（`review version conflict`）。并发提交由文件锁串行化，过期的并发提交只能拿到冲突，不会覆盖他人修订；写入失败不留下半条修订。
 - `reviews history` 返回当前状态、版本及按版本升序排列的全部修订（每版保留提交内容，含预期版本），并附原结论、检测版本完整参数与原始交换证据；没有归档结论时原结论为 `null`。

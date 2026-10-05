@@ -207,6 +207,136 @@ func TestParseReviewSubmissionValidation(t *testing.T) {
 	}
 }
 
+func TestParseReviewSubmissionSingleCompleteObject(t *testing.T) {
+	good := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"alice","reason":"r","status":"real","expectedVersion":0}`
+	// Leading/trailing spaces, tabs and newlines are fine.
+	if _, err := ParseReviewSubmission([]byte(" \n\t" + good + "\t\n ")); err != nil {
+		t.Fatalf("whitespace-padded spec rejected: %v", err)
+	}
+	// Brackets inside string values are field content, never object
+	// boundaries or trailing data.
+	bracketsInString := strings.Replace(good, `"reason":"r"`, `"reason":"weird } ] { ["`, 1)
+	sub, err := ParseReviewSubmission([]byte(bracketsInString))
+	if err != nil {
+		t.Fatalf("brackets inside a string rejected: %v", err)
+	}
+	if sub.Reason != "weird } ] { [" {
+		t.Fatalf("string value not preserved verbatim: %q", sub.Reason)
+	}
+	bad := []struct {
+		name string
+		spec string
+		want string // substring the error must carry (syntax failures only need non-nil)
+	}{
+		{"empty", ``, "empty input"},
+		{"whitespace only", "  \n\t\r ", "empty input"},
+		{"array", `[]`, "array"},
+		{"array of object", `[` + good + `]`, "array"},
+		{"null", `null`, "null"},
+		{"scalar", `7`, ""},
+		{"boolean", `true`, ""},
+		{"string", `"x"`, ""},
+		{"incomplete object", `{"chainId":"1"`, "invalid review spec"},
+		{"extra closing brace", good + `}`, "trailing"},
+		{"extra closing bracket", good + `]`, "trailing"},
+		{"second object", good + ` ` + good, "trailing"},
+		{"trailing value", good + ` 7`, "trailing"},
+		{"trailing null", good + ` null`, "trailing"},
+		{"trailing array", good + ` []`, "trailing"},
+		{"trailing text", good + ` extra`, "trailing"},
+		{"trailing brace no space", good + `}}`, "trailing"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseReviewSubmission([]byte(tc.spec))
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// TestParseReviewSubmissionTrailingBracketsNameToken pins that stray
+// brackets after the object are reported as trailing content naming the
+// token, not as a generic syntax error, a version conflict or anything
+// business related.
+func TestParseReviewSubmissionTrailingBracketsNameToken(t *testing.T) {
+	good := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"alice","reason":"r","status":"real","expectedVersion":0}`
+	for _, tc := range []struct {
+		suffix string
+		token  string
+	}{
+		{`}`, "closing brace"},
+		{`]`, "closing bracket"},
+		{` {"x":1}`, "object"},
+		{`[1]`, "array"},
+		{`"x"`, "string"},
+	} {
+		_, err := ParseReviewSubmission([]byte(good + tc.suffix))
+		if !errors.Is(err, ErrReviewTrailingData) {
+			t.Fatalf("suffix %q: got %v, want ErrReviewTrailingData", tc.suffix, err)
+		}
+		if !strings.Contains(err.Error(), tc.token) {
+			t.Fatalf("suffix %q: error %q must name %s", tc.suffix, err.Error(), tc.token)
+		}
+	}
+}
+
+// TestSubmitReviewCorruptSpecChangesNothing proves the trailing-data
+// failure happens entirely in parsing, before any archive state is touched:
+// no revision is appended, no version moves, and the submission id stays
+// free for a later complete, legal document.
+func TestSubmitReviewCorruptSpecChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	good := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":"real","expectedVersion":0}`
+
+	for _, suffix := range []string{`}`, `]`, ` ` + good, ` x`} {
+		if _, err := ParseReviewSubmission([]byte(good + suffix)); err == nil {
+			t.Fatalf("corrupt spec %q parsed", suffix)
+		}
+	}
+	hist, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 0 || hist.Status != ReviewStatusUnreviewed || len(hist.Revisions) != 0 {
+		t.Fatalf("rejected inputs changed review state: %+v", hist)
+	}
+
+	// The rejected id is not consumed: the complete legal document with the
+	// same id creates version 1 normally.
+	sub, err := ParseReviewSubmission([]byte(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := SubmitReview(dir, sub)
+	if err != nil {
+		t.Fatalf("legal resubmit after rejection: %v", err)
+	}
+	if !res.Created || res.Version != 1 {
+		t.Fatalf("legal resubmit = %+v, want created at version 1", res)
+	}
+
+	// Reusing a stored id with a structurally corrupt document still fails
+	// parsing: it must never come back as the idempotent created:false retry.
+	for _, suffix := range []string{`}`, `]`, ` ` + good} {
+		if _, err := ParseReviewSubmission([]byte(good + suffix)); err == nil {
+			t.Fatalf("corrupt spec reusing stored id %q parsed", suffix)
+		}
+	}
+	hist, err = ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 1 || len(hist.Revisions) != 1 {
+		t.Fatalf("corrupt reuse mutated history: %+v", hist)
+	}
+}
+
 func TestReviewHistoryQuery(t *testing.T) {
 	dir := t.TempDir()
 	mustReplay(t, dir, twoFindingsInput)

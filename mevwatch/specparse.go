@@ -49,7 +49,9 @@ type specPolicy struct {
 	wrap func(err error) error
 	// duplicate reports a repeated field. For known fields field is the
 	// canonical name; for an exact unknown-key repeat it is the key itself.
-	// first is the earlier spelling, spelling the current one.
+	// first is the earlier spelling, spelling the current one. A nil hook
+	// disables duplicate detection entirely: the scanner then proves shape
+	// (one object, balanced brackets, no trailing content) only.
 	duplicate func(obj, field, first, spelling string) error
 	// trailing reports content after the closing brace, given the raw
 	// document and the byte offset just past it.
@@ -91,21 +93,23 @@ func scanObject(dec *json.Decoder, p specPolicy, known map[string]string, obj st
 			return p.wrap(fmt.Errorf("object key is %s, want string", jsonTokenName(keyTok)))
 		}
 		target, knownKey := known[foldName(key)]
-		if p.rejectExactUnknown {
-			// An exact repeat of a decoded key name (known or unknown) is a
-			// duplicate; escapes are decoded first, so "id" == "id".
-			if first, dup := spellings[key]; dup {
-				return p.duplicate(obj, key, first, key)
+		if p.duplicate != nil {
+			if p.rejectExactUnknown {
+				// An exact repeat of a decoded key name (known or unknown) is a
+				// duplicate; escapes are decoded first, so "id" == "id".
+				if first, dup := spellings[key]; dup {
+					return p.duplicate(obj, key, first, key)
+				}
+				spellings[key] = key
 			}
-			spellings[key] = key
-		}
-		if knownKey {
-			// Another spelling of the same known field is the same field:
-			// "Severity", "severity" and "ſeverity" cannot share one object.
-			if first, dup := seen[target]; dup {
-				return p.duplicate(obj, target, first, key)
+			if knownKey {
+				// Another spelling of the same known field is the same field:
+				// "Severity", "severity" and "ſeverity" cannot share one object.
+				if first, dup := seen[target]; dup {
+					return p.duplicate(obj, target, first, key)
+				}
+				seen[target] = key
 			}
-			seen[target] = key
 		}
 		start, err := dec.Token()
 		if err != nil {

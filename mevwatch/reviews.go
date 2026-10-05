@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -236,19 +237,89 @@ func (v *reviewViolation) submitError() error {
 	}
 }
 
-// ParseReviewSubmission validates one submission document. Identity fields
-// and operator/reason/submissionId must be non-empty, the status must be
-// one of real, false_positive or unreviewed, expectedVersion must be a
-// non-negative integer, and the kind must be a known conclusion kind.
+// ErrReviewTrailingData reports non-whitespace content after the single JSON
+// object that makes up a review submission: a second object, an unmatched
+// } or ], another JSON value or any other character.
+var ErrReviewTrailingData = errors.New("unexpected trailing data after review spec")
+
+// reviewFields lists every field name a review submission document may
+// declare, in the struct's JSON spelling. The scanner only needs the table
+// to know which values are ordinary scalars; a review document is flat, so
+// no nested table exists.
+var reviewFields = []string{
+	"chainId", "blockHash", "txHash", "kind",
+	"submissionId", "operator", "reason", "status", "expectedVersion",
+}
+
+// reviewScanPolicy validates the shape of a review document with the shared
+// scanner, the same machine rule-version and suppression registrations use.
+// Duplicate-field detection stays with the typed decoder below: the scanner
+// proves exactly one balanced object surrounded by nothing but whitespace.
+var reviewScanPolicy = specPolicy{
+	topObject:          "review spec",
+	known:              fieldTable(reviewFields...),
+	rejectExactUnknown: false,
+	firstTokenError: func(err error) error {
+		if errors.Is(err, io.EOF) {
+			return errors.New("review spec must be a JSON object, got empty input")
+		}
+		return fmt.Errorf("invalid review spec: %w", err)
+	},
+	nonObject: func(tok json.Token) error {
+		if tok == nil {
+			return errors.New("review spec must be a single JSON object, got null")
+		}
+		if d, ok := tok.(json.Delim); ok && d == '[' {
+			return errors.New("review spec must be a single JSON object, got array")
+		}
+		return fmt.Errorf("review spec must be a single JSON object, got %s", jsonTokenName(tok))
+	},
+	wrap: func(err error) error {
+		return fmt.Errorf("invalid review spec: %w", err)
+	},
+	trailing: reviewTrailingData,
+}
+
+// reviewTrailingData names the first non-whitespace byte after the closed
+// object, so an unmatched '}' or ']' is reported as trailing content rather
+// than as a syntax error; only whitespace may follow the object.
+func reviewTrailingData(raw []byte, offset int) error {
+	rest := bytes.TrimLeft(raw[offset:], " \t\n\r")
+	if len(rest) > 0 {
+		return fmt.Errorf("%w: %s after closing object", ErrReviewTrailingData, trailingTokenName(rest[0]))
+	}
+	return nil
+}
+
+// validateReviewDocument proves raw holds exactly one complete JSON object
+// — leading and trailing whitespace is fine, but empty input, whitespace
+// only, arrays, null, scalars and unclosed objects are not — and that no
+// byte other than whitespace follows the closing brace. Brackets inside
+// string values are field content, not structure: the tokenizer only treats
+// delimiters outside strings as object boundaries.
+func validateReviewDocument(raw []byte) error {
+	return scanJSONObject(raw, reviewScanPolicy)
+}
+
+// ParseReviewSubmission validates one submission document. The document
+// must contain exactly one complete JSON object (leading and trailing
+// spaces, tabs and newlines allowed): empty input, whitespace only, an
+// array, null, any other standalone value or an unclosed object fail, and
+// a second object or value, an unmatched } or ] or any other non-whitespace
+// byte after the closing brace fails as trailing data — the valid prefix is
+// never accepted on its own. Identity fields and operator/reason/
+// submissionId must be non-empty, the status must be one of real,
+// false_positive or unreviewed, expectedVersion must be a non-negative
+// integer, and the kind must be a known conclusion kind.
 func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
+	if err := validateReviewDocument(raw); err != nil {
+		return ReviewSubmission{}, err
+	}
 	var spec reviewSpec
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&spec); err != nil {
 		return ReviewSubmission{}, fmt.Errorf("invalid review spec: %w", err)
-	}
-	if dec.More() {
-		return ReviewSubmission{}, errors.New("invalid review spec: unexpected trailing data")
 	}
 	// A field the document never declares decodes as a nil pointer and
 	// reaches the shared business check as the empty value. The document's
