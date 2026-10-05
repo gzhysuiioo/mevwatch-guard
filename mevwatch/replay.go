@@ -353,6 +353,13 @@ func writeArchiveAtomic(dir string, data archiveData) error {
 	if err != nil {
 		return err
 	}
+	return writeArchiveBytesAtomic(dir, raw)
+}
+
+// writeArchiveBytesAtomic replaces the archive file in one rename, so a
+// crash can only expose the previous or the next complete commit, never a
+// half written file.
+func writeArchiveBytesAtomic(dir string, raw []byte) error {
 	tmp := filepath.Join(dir, archiveFileName+".tmp")
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -433,13 +440,18 @@ func parseBlocks(r io.Reader) ([]parsedBlock, error) {
 // ReplayFile imports the line-delimited blocks in inputPath into the
 // archive at dir and returns one report per distinct block, in order of
 // first appearance. New blocks are judged under the archive's currently
-// enabled rule version.
+// enabled rule version. The selected version's stored document must still
+// satisfy the full registration declaration; a corrupt one fails the whole
+// replay with ErrCorruptVersion before any report is produced.
 func ReplayFile(inputPath, dir string) ([]Report, error) {
 	return replayFile(inputPath, dir, "")
 }
 
 // ReplayFileWithVersion is ReplayFile under an explicitly registered rule
-// version instead of the archive's enabled one.
+// version instead of the archive's enabled one. As with ReplayFile, the
+// named version is re-validated from its stored document and a corrupt one
+// fails the whole replay with ErrCorruptVersion, never as an unknown
+// version and never replaced by defaults or the built-in rules.
 func ReplayFileWithVersion(inputPath, dir, versionID string) ([]Report, error) {
 	if versionID == "" {
 		return nil, errors.New("version id must not be empty")
@@ -459,13 +471,19 @@ func replayFile(inputPath, dir, versionID string) ([]Report, error) {
 // Replay parses, validates and archives blocks from r under the archive's
 // currently enabled rule version. Every line is checked before anything is
 // written; any failure leaves the archive untouched. New reports are
-// committed together in a single atomic write.
+// committed together in a single atomic write. The selected version's
+// stored document is re-validated from its raw bytes first, so a corrupt
+// version fails the whole run with ErrCorruptVersion even when the input is
+// blank, has no swaps or only re-imports archived blocks.
 func Replay(input io.Reader, dir string) ([]Report, error) {
 	return doReplay(input, dir, "")
 }
 
 // ReplayWithVersion is Replay under an explicitly registered rule version
-// instead of the archive's enabled one.
+// instead of the archive's enabled one. The named version must still
+// satisfy the full registration declaration in the archive; a corrupt one
+// fails with ErrCorruptVersion rather than substituting defaults, the
+// enabled version or the built-in rules.
 func ReplayWithVersion(input io.Reader, dir, versionID string) ([]Report, error) {
 	if versionID == "" {
 		return nil, errors.New("version id must not be empty")
@@ -509,19 +527,36 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Read each registered version as its raw stored document, so a
+	// wrong-typed, null or missing field is judged as that version's
+	// corruption rather than failing the archive decode or silently
+	// becoming a zero value (a zero displacement multiplier even crashes
+	// detection).
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, err
+	}
+	var doc replayArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, fmt.Errorf("archive is corrupted: %w", err)
+		}
 	}
 	// Resolve the version once, while the exclusive lock is held: every
 	// new block in this run is judged under the same rules even if another
-	// process enables a different version right after we finish.
-	version, err := resolveReplayVersion(data, versionID)
+	// process enables a different version right after we finish. The
+	// selected version's stored document must still satisfy every
+	// registration rule; this is decided before any block is judged or any
+	// report produced, so a corrupt version fails the whole replay even
+	// for an empty-swaps block, a block already archived or blank input,
+	// and the corrupt content is never replaced by the enabled version,
+	// the built-in rules or defaults.
+	version, err := resolveReplayVersion(doc, versionID)
 	if err != nil {
 		return nil, err
 	}
-	archived := make(map[blockID]int, len(data.Records))
-	for i, rec := range data.Records {
+	archived := make(map[blockID]int, len(doc.Records))
+	for i, rec := range doc.Records {
 		archived[rec.id()] = i
 	}
 
@@ -530,7 +565,7 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 	for _, occ := range order {
 		id := blockID{occ.block.ChainID, occ.block.BlockHash}
 		if idx, ok := archived[id]; ok {
-			rec := data.Records[idx]
+			rec := doc.Records[idx]
 			if !sameContent(rec.BlockNumber, rec.Swaps, occ.block) {
 				return nil, &LineError{Line: occ.line, Err: fmt.Errorf(
 					"block %s/%s conflicts with the archived record", id.chainID, id.blockHash)}
@@ -547,13 +582,13 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 			Findings:    DetectBlockWithRules(occ.block.Swaps, version.Rules),
 			Version:     &version,
 		}
-		archived[id] = len(data.Records)
-		data.Records = append(data.Records, rec)
+		archived[id] = len(doc.Records)
+		doc.Records = append(doc.Records, rec)
 		reports = append(reports, rec.report())
 		changed = true
 	}
 	if changed {
-		if err := writeArchiveAtomic(dir, data); err != nil {
+		if err := writeReplayArchive(dir, doc); err != nil {
 			return nil, err
 		}
 	}
@@ -561,12 +596,23 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 }
 
 // resolveReplayVersion picks the rule version for one replay run: the
-// explicitly requested one, or the archive's currently enabled version.
-func resolveReplayVersion(data archiveData, versionID string) (RuleVersion, error) {
+// explicitly requested one, or the archive's currently enabled version
+// (which is the built-in rules in archives written before rule versions
+// existed). Either way the chosen registered version's stored document is
+// re-validated from its raw bytes with the same parser registrations pass,
+// so a document missing a rule object or required field, carrying null, a
+// wrong type or an out-of-range number fails the run as a corrupt version
+// — never as an unknown one, and never replaced by the built-in rules or
+// defaults. An explicitly declared enabled:false is a valid off state and
+// passes like any other in-range value.
+func resolveReplayVersion(doc replayArchiveDoc, versionID string) (RuleVersion, error) {
 	if versionID != "" {
-		return findVersion(data, versionID)
+		return intactVersion(doc.Versions, versionID)
 	}
-	return data.enabledVersion()
+	if doc.EnabledVersion == "" {
+		return BuiltinVersion(), nil
+	}
+	return intactVersion(doc.Versions, doc.EnabledVersion)
 }
 
 // Query returns the archived report for one block identity. It only reads

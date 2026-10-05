@@ -29,10 +29,11 @@ var ErrVersionConflict = errors.New("version already registered with different p
 // field is missing or null, a value has the wrong type, or a severity or
 // multiplier is out of range. The decoded struct cannot tell a missing
 // field from an explicit zero value, so such an archive would otherwise
-// compare under silently zeroed parameters (a zero displacement
-// multiplier even crashes detection). A comparison naming a corrupt
-// version is refused; the corrupt content is never replaced by the
-// enabled version, the built-in rules or defaults.
+// compare or replay under silently zeroed parameters (a zero displacement
+// multiplier even crashes detection). A comparison, a review-range
+// evaluation or a replay naming (or enabling) a corrupt version is refused
+// before any new report exists; the corrupt content is never replaced by
+// the enabled version, the built-in rules or defaults.
 var ErrCorruptVersion = errors.New("archived rule version is corrupted")
 
 // SandwichRule configures the sandwich rule: whether it runs and the
@@ -301,16 +302,6 @@ func intactVersion(versions []json.RawMessage, id string) (RuleVersion, error) {
 	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
 }
 
-// enabledVersion resolves the archive's currently enabled version. Archives
-// written before rule versions existed have no marker and run the built-in
-// rules.
-func (d archiveData) enabledVersion() (RuleVersion, error) {
-	if d.EnabledVersion == "" {
-		return BuiltinVersion(), nil
-	}
-	return findVersion(d, d.EnabledVersion)
-}
-
 // RegisterVersion validates raw as a rule version spec and stores it in the
 // archive at dir. Re-registering the same ID with identical parameters
 // succeeds without adding a version (created is false); the same ID with
@@ -467,6 +458,35 @@ type rawVersionArchiveDoc struct {
 	Records  []record          `json:"records"`
 	Versions []json.RawMessage `json:"versions"`
 	Reviews  []ReviewObject    `json:"reviews"`
+}
+
+// replayArchiveDoc mirrors the archive file the way a replay reads and
+// rewrites it. Every registered version is kept as its raw stored document:
+// a wrong-typed or null field in one version is that version's corruption,
+// judged on its own by intactVersion, rather than failing the whole-archive
+// decode or silently decoding to a zero value. Field order and omitempty
+// mirror archiveData, so committing a replay serializes byte-identically to
+// the typed writer for intact archives; the raw version documents survive a
+// commit untouched (only re-indented), which keeps a corrupt sibling that
+// the run did not select exactly as stored.
+type replayArchiveDoc struct {
+	Records        []record           `json:"records"`
+	Versions       []json.RawMessage  `json:"versions,omitempty"`
+	EnabledVersion string             `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression      `json:"suppressions,omitempty"`
+	AlertRecords   []ProcessingRecord `json:"alerts,omitempty"`
+	Reviews        []ReviewObject     `json:"reviews,omitempty"`
+}
+
+// writeReplayArchive commits a replay that appended records while keeping
+// every registered version's raw stored document and the alert/review
+// history intact.
+func writeReplayArchive(dir string, doc replayArchiveDoc) error {
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeArchiveBytesAtomic(dir, raw)
 }
 
 // Compare re-runs detection for one archived block under the given
