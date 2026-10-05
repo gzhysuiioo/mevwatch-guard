@@ -716,6 +716,247 @@ func TestConflictHintReflectsLogAtRequestTime(t *testing.T) {
 	}
 }
 
+// TestFirstEntryTermBelowPrevLogTermIsFieldError 回归保障任期衔接规则：非空请求
+// 除了条目自身任期不下降，第一条日志的任期也不能低于请求声明的前置任期。这种
+// 错误属于字段非法：即使请求携带更高任期、leaderCommit 更大、甚至前置日志本身
+// 也匹配不上，都必须在任期更新与前缀核对之前拒绝——原因固定为
+// "entry terms are not non-decreasing"，不输出 conflict，任期、日志、提交位置
+// 全部保持请求前状态。
+func TestFirstEntryTermBelowPrevLogTermIsFieldError(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+	}}
+	original := append([]LogEntry(nil), initial.Log...)
+	cases := []struct {
+		name    string
+		request AppendRequest
+	}{
+		{
+			// 任务主场景：任期 7、前置 idx2/任期2 与本地一致，首条 idx3 任期 1
+			// 低于声明的前置任期 2；leaderCommit 再大也无济于事。
+			"matching prev, higher term, huge leaderCommit",
+			AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 9,
+				Entries: []LogEntry{entry(3, 1, "x")}},
+		},
+		{
+			// 声明的前置任期与本地日志不一致（本地 idx2 任期 2，声明 5），但
+			// 首条任期 1 仍低于声明值：仍是同一条字段错误，不能改成前置日志
+			// 不匹配，也不能留下较高任期更新。
+			"declared prev term mismatches local too",
+			AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 5, LeaderCommit: 9,
+				Entries: []LogEntry{entry(3, 1, "x")}},
+		},
+		{
+			// 前置索引越过本地日志末尾，首条索引随之合法地落在日志之后：衔接
+			// 错误仍先于前缀核对，不附带重发建议。
+			"prev index beyond log",
+			AppendRequest{Term: 8, PrevLogIndex: 5, PrevLogTerm: 3, LeaderCommit: 0,
+				Entries: []LogEntry{entry(6, 2, "x")}},
+		},
+		{
+			// 首条任期等于……严格低于才非法：这里首条比前置任期低 1，且声明
+			// 前置任期与本地不同，字段错误判定只看声明值。
+			"first term one below declared prev term",
+			AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 3, LeaderCommit: 4,
+				Entries: []LogEntry{entry(3, 2, "x")}},
+		},
+		{
+			// 多条目自身任期不下降（1 -> 7），但首条低于前置任期 2：条目内部
+			// 规则通过，衔接规则单独拒绝；第二条的高任期同样不能留下更新。
+			"multiple entries internally non-decreasing but bridge too low",
+			AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 4,
+				Entries: []LogEntry{entry(3, 1, "x"), entry(4, 7, "y")}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := run(t, initial, tc.request)
+			result := out.Results[0]
+			if result.Accepted {
+				t.Fatalf("request should be rejected: %+v", result)
+			}
+			if result.Reason != ReasonEntryTermDecreases {
+				t.Fatalf("reason = %q, want exact %q", result.Reason, ReasonEntryTermDecreases)
+			}
+			if !strings.Contains(result.Reason, "entry terms are not non-decreasing") {
+				t.Fatalf("reason text changed: %q", result.Reason)
+			}
+			if result.Conflict != nil {
+				t.Fatalf("field error must not be treated as a replication conflict: %+v", result.Conflict)
+			}
+			if result.Term != 2 {
+				t.Fatalf("higher term must not survive a field error, term = %d, want 2", result.Term)
+			}
+			if result.CommittedIndex != 1 {
+				t.Fatalf("commit changed: %d, want 1", result.CommittedIndex)
+			}
+			if out.FinalTerm != 2 || out.FinalCommittedIndex != 1 {
+				t.Fatalf("final state changed: term=%d ci=%d", out.FinalTerm, out.FinalCommittedIndex)
+			}
+			if !reflect.DeepEqual(out.FinalLog, original) {
+				t.Fatalf("log changed: %+v", out.FinalLog)
+			}
+			// 输出约定：该拒绝的 JSON 中不出现 conflict 键。
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "conflict") {
+				t.Fatalf("rejection JSON must omit conflict: %s", encoded)
+			}
+		})
+	}
+}
+
+// TestFirstEntryTermEqualPrevLogTermIsLegal 首条任期恰好等于前置任期是合法衔接，
+// 包括领导者任期更高、首条沿用旧任期的情形。
+func TestFirstEntryTermEqualPrevLogTermIsLegal(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "a"), entry(2, 2, "b"),
+	}}
+	out := run(t, initial,
+		// 同任期追加：首条任期 2 == 前置任期 2。
+		AppendRequest{Term: 2, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+			Entries: []LogEntry{entry(3, 2, "c")}},
+	)
+	if !out.Results[0].Accepted || out.Results[0].Reason != ReasonOK {
+		t.Fatalf("equal-term bridge should be accepted: %+v", out.Results[0])
+	}
+
+	// 更高任期的领导者携带一条旧任期条目：首条任期 2 仍等于前置任期 2，
+	// 合法；随后条目任期升到 3 同样合法。
+	out = run(t, initial,
+		AppendRequest{Term: 3, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 4,
+			Entries: []LogEntry{entry(3, 2, "c"), entry(4, 3, "d")}},
+	)
+	result := out.Results[0]
+	if !result.Accepted || result.Reason != ReasonOK {
+		t.Fatalf("equal-term bridge under higher leader term should be accepted: %+v", result)
+	}
+	want := []LogEntry{
+		entry(1, 1, "a"), entry(2, 2, "b"), entry(3, 2, "c"), entry(4, 3, "d"),
+	}
+	if !reflect.DeepEqual(out.FinalLog, want) {
+		t.Fatalf("log = %+v, want %+v", out.FinalLog, want)
+	}
+	if result.Term != 3 || result.CommittedIndex != 4 {
+		t.Fatalf("state = term %d ci %d, want term 3 ci 4", result.Term, result.CommittedIndex)
+	}
+}
+
+// TestEmptyEntriesHaveNoFirstTermBridge 空条目请求没有首条日志，不能因此报任期
+// 下降：前置不匹配时仍按前置日志不匹配拒绝、附带 conflict 并保留较高任期更新；
+// 前置匹配时就是正常心跳。
+func TestEmptyEntriesHaveNoFirstTermBridge(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "a"), entry(2, 2, "b"),
+	}}
+	out := run(t, initial,
+		// 前置任期与本地不一致：拒绝原因是前置不匹配，不是条目任期下降。
+		AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 5, LeaderCommit: 9},
+		// 前置索引越过日志末尾：同样是前置不匹配。
+		AppendRequest{Term: 8, PrevLogIndex: 5, PrevLogTerm: 3},
+		// 前置匹配的空条目心跳：接受，leaderCommit 再大也只确认到前置索引。
+		AppendRequest{Term: 8, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 9},
+	)
+	first := out.Results[0]
+	if first.Accepted || first.Reason != ReasonPrevLogMismatch {
+		t.Fatalf("empty request should be a prev mismatch, got %+v", first)
+	}
+	if first.Term != 7 {
+		t.Fatalf("higher term should survive mismatch, term = %d, want 7", first.Term)
+	}
+	if first.Conflict == nil || *first.Conflict != (ConflictHint{Index: 2, Term: 2}) {
+		t.Fatalf("conflict = %+v, want {2 2}", first.Conflict)
+	}
+	second := out.Results[1]
+	if second.Accepted || second.Reason != ReasonPrevLogMismatch {
+		t.Fatalf("beyond-end empty request should be a prev mismatch, got %+v", second)
+	}
+	if second.Conflict == nil || *second.Conflict != (ConflictHint{Index: 3, Term: 0}) {
+		t.Fatalf("conflict = %+v, want {3 0}", second.Conflict)
+	}
+	heartbeat := out.Results[2]
+	if !heartbeat.Accepted || heartbeat.Reason != ReasonOK {
+		t.Fatalf("matching heartbeat should be accepted: %+v", heartbeat)
+	}
+	if heartbeat.CommittedIndex != 2 {
+		t.Fatalf("heartbeat confirmed only index 2, commit = %d, want 2", heartbeat.CommittedIndex)
+	}
+	if len(out.FinalLog) != 2 {
+		t.Fatalf("heartbeat must not change the log: %+v", out.FinalLog)
+	}
+}
+
+// TestStaleTermPrecedesFirstTermBridge 低任期请求沿用现有的拒绝顺序：即使它同时
+// 满足“首条任期低于前置任期”，拒绝原因仍是低任期，且不附带 conflict。
+func TestStaleTermPrecedesFirstTermBridge(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "a"), entry(2, 2, "b"),
+	}}
+	out := run(t, initial,
+		AppendRequest{Term: 1, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+			Entries: []LogEntry{entry(3, 1, "c")}},
+	)
+	result := out.Results[0]
+	if result.Accepted || result.Reason != ReasonStaleTerm {
+		t.Fatalf("expected stale-term rejection, got %+v", result)
+	}
+	if result.Conflict != nil {
+		t.Fatalf("stale-term rejection must not carry conflict: %+v", result.Conflict)
+	}
+	if result.Term != 2 || result.CommittedIndex != 1 {
+		t.Fatalf("state changed: %+v", result)
+	}
+	if !reflect.DeepEqual(out.FinalLog, initial.Log) {
+		t.Fatalf("log changed: %+v", out.FinalLog)
+	}
+}
+
+// TestFirstEntryTermBridgeFieldErrorThenValidRecovery 非法衔接请求被拒后节点保持
+// 原状态，随后到达的合法请求按原状态继续处理：任期 3、正确匹配索引 2，追加索引
+// 3、任期 2 的条目并提交到 3。
+func TestFirstEntryTermBridgeFieldErrorThenValidRecovery(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+	}}
+	bad := AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 9,
+		Entries: []LogEntry{entry(3, 1, "set evil=1")}}
+	legal := AppendRequest{Term: 3, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+		Entries: []LogEntry{entry(3, 2, "set receipt=ok")}}
+	out := run(t, initial, bad, legal)
+
+	first := out.Results[0]
+	if first.Accepted || first.Reason != ReasonEntryTermDecreases {
+		t.Fatalf("first request should be the term-bridge field error, got %+v", first)
+	}
+	if first.Conflict != nil || first.Term != 2 || first.CommittedIndex != 1 {
+		t.Fatalf("first request changed state: %+v", first)
+	}
+	second := out.Results[1]
+	if !second.Accepted || second.Reason != ReasonOK {
+		t.Fatalf("valid follow-up request must be processed from the original state: %+v", second)
+	}
+	if second.Term != 3 || second.CommittedIndex != 3 {
+		t.Fatalf("second result state = term %d ci %d, want term 3 ci 3",
+			second.Term, second.CommittedIndex)
+	}
+	want := []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 2, "set receipt=ok"),
+	}
+	if !reflect.DeepEqual(out.FinalLog, want) {
+		t.Fatalf("final log = %+v, want %+v", out.FinalLog, want)
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("final state = term %d ci %d, want term 3 ci 3",
+			out.FinalTerm, out.FinalCommittedIndex)
+	}
+}
+
 // conflict 只在前置日志不匹配的结果里出现在 JSON 中，其余结果不输出该键。
 func TestConflictHintJSONShape(t *testing.T) {
 	out := run(t, InitialState{CurrentTerm: 2, Log: []LogEntry{entry(1, 2, "a")}},

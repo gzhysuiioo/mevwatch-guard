@@ -1060,6 +1060,172 @@ func TestKVPartialConfirmationKeepsTailUncommitted(t *testing.T) {
 	}
 }
 
+// termBridgeInitial 是任期衔接回归场景的初始状态：当前任期 2，索引 1、2 的任期
+// 分别为 1、2（set balance=100 已提交、set balance=200 未提交）。
+func termBridgeInitial() InitialState {
+	return InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"), // 未提交尾部：任何拒绝都不能让它生效
+	}}
+}
+
+// TestKVFirstEntryTermBridgeFieldErrorAppliesNothing 回归保障任期衔接字段错误与
+// 键值应用交汇时的现有行为：
+//   - 任期 7、前置索引 2/前置任期 2（与本地一致）、leaderCommit 再大，但携带
+//     索引 3、任期 1 的条目（首条任期低于声明的前置任期），且命令本身格式错误：
+//     按字段错误拒绝，原因固定为 entry terms are not non-decreasing，不是前置
+//     日志不匹配，不输出 conflict；
+//   - 声明的前置任期与本地不一致（本地 idx2 任期 2、声明 5）、首条任期仍低于
+//     声明值时，属于同一条字段错误，不能留下较高任期更新；
+//   - 拒绝后任期仍为 2，日志与提交位置原样，应用位置停在 1，键值表只有
+//     balance=100：未提交的 balance=200 不能借大 leaderCommit 生效，被拒请求中
+//     格式错误的命令也不产生 applyError；
+//   - 随后任期 3、正确匹配索引 2 的合法请求追加索引 3、任期 2 的
+//     set receipt=ok 并提交到 3：成功，balance 变 200、receipt 变 ok，提交与
+//     应用位置都到 3。
+func TestKVFirstEntryTermBridgeFieldErrorAppliesNothing(t *testing.T) {
+	initial := termBridgeInitial()
+	originalLog := append([]LogEntry(nil), initial.Log...)
+
+	// 请求一：前置与本地一致，首条任期低于前置任期，命令还缺等号。
+	badMatching := AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 9,
+		Entries: []LogEntry{entry(3, 1, "set broken")}}
+	// 请求二：声明的前置任期与本地不一致，首条任期 1 仍低于声明值 5。
+	badMismatch := AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 5, LeaderCommit: 9,
+		Entries: []LogEntry{entry(3, 1, "set broken")}}
+	// 请求三：任期 3、正确匹配 idx2，追加 idx3 任期 2 的合法写入并提交到 3。
+	legal := AppendRequest{Term: 3, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+		Entries: []LogEntry{entry(3, 2, "set receipt=ok")}}
+
+	// 只停在第一次拒绝处：应用边界完全不动，被拒命令的格式错误不可见。
+	stopped := runKV(t, initial, badMatching)
+	r := stopped.Results[0]
+	if r.Accepted || r.Reason != ReasonEntryTermDecreases {
+		t.Fatalf("bad request should be the term-bridge field error: %+v", r)
+	}
+	if r.Conflict != nil {
+		t.Fatalf("field error must not be reported as a replication conflict: %+v", r.Conflict)
+	}
+	if r.Term != 2 || r.CommittedIndex != 1 {
+		t.Fatalf("rejection changed replication state: %+v", r)
+	}
+	if got := appliedIndexOf(t, r); got != 1 {
+		t.Fatalf("applied index advanced on rejection: %d, want 1", got)
+	}
+	if r.ApplyError != nil {
+		t.Fatalf("rejected malformed command must not produce an apply error: %+v", r.ApplyError)
+	}
+	if !reflect.DeepEqual(stopped.FinalLog, originalLog) {
+		t.Fatalf("log changed after rejection: %+v", stopped.FinalLog)
+	}
+	if stopped.FinalTerm != 2 || stopped.FinalCommittedIndex != 1 {
+		t.Fatalf("final replication state changed: term=%d ci=%d",
+			stopped.FinalTerm, stopped.FinalCommittedIndex)
+	}
+	if *stopped.FinalAppliedIndex != 1 {
+		t.Fatalf("final appliedIndex = %d, want 1", *stopped.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, stopped), map[string]string{"balance": "100"}) {
+		t.Fatalf("kv = %v, want only balance=100 (uncommitted tail must not apply)", stopped.FinalKV)
+	}
+	if stopped.FinalApplyError != nil {
+		t.Fatalf("unexpected final apply error: %+v", stopped.FinalApplyError)
+	}
+	// 被拒条目既未进日志，其命令也不应出现在输出中。
+	encoded, err := json.Marshal(stopped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "broken") {
+		t.Fatalf("rejected entry command leaked into output: %s", encoded)
+	}
+
+	// 完整过程：两种字段错误之后合法请求仍按原状态继续处理。
+	out := runKV(t, initial, badMatching, badMismatch, legal)
+	wantResults := []struct {
+		accepted bool
+		reason   string
+		term     int
+		commit   int
+		applied  int
+	}{
+		{false, ReasonEntryTermDecreases, 2, 1, 1}, // 高任期不保留，一切不动
+		{false, ReasonEntryTermDecreases, 2, 1, 1}, // 前置任期也不一致：仍是字段错误
+		{true, ReasonOK, 3, 3, 3},                  // 追加 idx3 并提交、应用到 3
+	}
+	if len(out.Results) != len(wantResults) {
+		t.Fatalf("got %d results, want %d", len(out.Results), len(wantResults))
+	}
+	for i, want := range wantResults {
+		got := out.Results[i]
+		if got.Accepted != want.accepted || got.Reason != want.reason {
+			t.Fatalf("result %d = accepted=%v reason=%q, want accepted=%v reason=%q",
+				i, got.Accepted, got.Reason, want.accepted, want.reason)
+		}
+		if got.Conflict != nil {
+			t.Fatalf("result %d must not carry conflict: %+v", i, got.Conflict)
+		}
+		if got.Term != want.term || got.CommittedIndex != want.commit {
+			t.Fatalf("result %d state = term %d ci %d, want term %d ci %d",
+				i, got.Term, got.CommittedIndex, want.term, want.commit)
+		}
+		if applied := appliedIndexOf(t, got); applied != want.applied {
+			t.Fatalf("result %d appliedIndex = %d, want %d", i, applied, want.applied)
+		}
+		if got.ApplyError != nil {
+			t.Fatalf("result %d unexpected apply error: %+v", i, got.ApplyError)
+		}
+	}
+
+	// 最终状态：任期 3、提交与应用位置均为 3；未提交尾部在合法请求确认后才按
+	// 日志次序生效——balance 变 200，receipt 写入 ok。
+	wantLog := []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 2, "set receipt=ok"),
+	}
+	if !reflect.DeepEqual(out.FinalLog, wantLog) {
+		t.Fatalf("final log = %+v, want %+v", out.FinalLog, wantLog)
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("final replication state = term %d ci %d, want term 3 ci 3",
+			out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if *out.FinalAppliedIndex != 3 {
+		t.Fatalf("final appliedIndex = %d, want 3", *out.FinalAppliedIndex)
+	}
+	wantKV := map[string]string{"balance": "200", "receipt": "ok"}
+	if !reflect.DeepEqual(finalKVOf(t, out), wantKV) {
+		t.Fatalf("final kv = %v, want %v", out.FinalKV, wantKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("final apply error = %+v, want none", out.FinalApplyError)
+	}
+
+	// 未开启 applyKV 的同一拒绝继续省略全部应用字段，拒绝原因与无 conflict
+	// 的输出约定不变。
+	plain, err := Replicate(initial, []AppendRequest{badMatching, badMismatch, legal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainJSON, err := json.Marshal(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(plainJSON)
+	for _, field := range []string{"appliedIndex", "applyError", "finalAppliedIndex", "finalKV", "finalApplyError"} {
+		if strings.Contains(body, field) {
+			t.Fatalf("applyKV disabled: output must not contain %q: %s", field, body)
+		}
+	}
+	if strings.Count(body, ReasonEntryTermDecreases) != 2 {
+		t.Fatalf("expected exactly two field-error reasons in %s", body)
+	}
+	if strings.Contains(body, "conflict") {
+		t.Fatalf("field-error rejections must omit conflict: %s", body)
+	}
+}
+
 // uncommittedSuffixInitial 是两个替换规则回归测试共享的初始状态：任期 4，
 // 日志索引 1..4 的任期依次为 1、2、4、4；只有 idx1（set balance=100）已提交，
 // 后三条（set balance=200、delete balance、set legacy=old）是未提交旧后缀。

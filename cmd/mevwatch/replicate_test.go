@@ -396,6 +396,103 @@ func TestCLIApplyKVConflictWithMalformedReplacement(t *testing.T) {
 	}
 }
 
+// TestCLIApplyKVFirstEntryTermBridgeFieldError 端到端锁定任期衔接规则的输出约定：
+// 当前任期 2、idx1/idx2 任期 1/2（balance=100 已提交、balance=200 未提交）。
+// 任期 7 的请求首条日志任期 1 低于声明的前置任期 2，即使 leaderCommit 很大、
+// 命令本身格式错误，也按字段错误拒绝：reason 固定为完整的
+// "invalid request: entry terms are not non-decreasing"，不输出 conflict，任期
+// 不抬高，未提交尾部不生效，错误命令不产生 applyError。声明的前置任期与本地也
+// 不一致时仍是同一条字段错误。随后任期 3 的合法请求追加并提交到 3。
+func TestCLIApplyKVFirstEntryTermBridgeFieldError(t *testing.T) {
+	input := `{
+	  "currentTerm": 2,
+	  "committedIndex": 1,
+	  "log": [
+	    {"index": 1, "term": 1, "command": "set balance=100"},
+	    {"index": 2, "term": 2, "command": "set balance=200"}
+	  ],
+	  "applyKV": true,
+	  "requests": [
+	    {"term": 7, "prevLogIndex": 2, "prevLogTerm": 2, "leaderCommit": 9,
+	     "entries": [{"index": 3, "term": 1, "command": "set broken"}]},
+	    {"term": 7, "prevLogIndex": 2, "prevLogTerm": 5, "leaderCommit": 9,
+	     "entries": [{"index": 3, "term": 1, "command": "set broken"}]},
+	    {"term": 3, "prevLogIndex": 2, "prevLogTerm": 2, "leaderCommit": 3,
+	     "entries": [{"index": 3, "term": 2, "command": "set receipt=ok"}]}
+	  ]
+	}`
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("replication rejection is normal output, stderr must be empty, got %q", stderr.String())
+	}
+	var out mevwatch.ReplicateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	if len(out.Results) != 3 {
+		t.Fatalf("expected 3 results, got %+v", out.Results)
+	}
+	for i := 0; i < 2; i++ {
+		r := out.Results[i]
+		if r.Accepted {
+			t.Fatalf("result %d must be rejected, got %+v", i, r)
+		}
+		if r.Reason != "invalid request: entry terms are not non-decreasing" {
+			t.Fatalf("result %d reason = %q, want the exact field-error reason", i, r.Reason)
+		}
+		if r.Conflict != nil {
+			t.Fatalf("result %d must not carry a conflict hint: %+v", i, r.Conflict)
+		}
+		if r.Term != 2 || r.CommittedIndex != 1 {
+			t.Fatalf("result %d state = term %d ci %d, want term 2 ci 1", i, r.Term, r.CommittedIndex)
+		}
+		if r.AppliedIndex == nil || *r.AppliedIndex != 1 {
+			t.Fatalf("result %d appliedIndex = %+v, want 1", i, r.AppliedIndex)
+		}
+		if r.ApplyError != nil {
+			t.Fatalf("result %d must not surface the rejected command's format error: %+v", i, r.ApplyError)
+		}
+	}
+	legal := out.Results[2]
+	if !legal.Accepted || legal.Reason != mevwatch.ReasonOK {
+		t.Fatalf("valid follow-up request must succeed: %+v", legal)
+	}
+	if legal.Term != 3 || legal.CommittedIndex != 3 {
+		t.Fatalf("legal result state = term %d ci %d, want term 3 ci 3", legal.Term, legal.CommittedIndex)
+	}
+	if legal.AppliedIndex == nil || *legal.AppliedIndex != 3 || legal.ApplyError != nil {
+		t.Fatalf("legal result apply state = %+v %+v, want appliedIndex 3 and no error",
+			legal.AppliedIndex, legal.ApplyError)
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("unexpected final state: term=%d ci=%d", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if len(out.FinalLog) != 3 ||
+		out.FinalLog[0] != (mevwatch.LogEntry{Index: 1, Term: 1, Command: "set balance=100"}) ||
+		out.FinalLog[1] != (mevwatch.LogEntry{Index: 2, Term: 2, Command: "set balance=200"}) ||
+		out.FinalLog[2] != (mevwatch.LogEntry{Index: 3, Term: 2, Command: "set receipt=ok"}) {
+		t.Fatalf("final log = %+v, want original two plus receipt entry", out.FinalLog)
+	}
+	if len(out.FinalKV) != 2 || out.FinalKV["balance"] != "200" || out.FinalKV["receipt"] != "ok" {
+		t.Fatalf("finalKV = %v, want balance=200 and receipt=ok", out.FinalKV)
+	}
+	if out.FinalAppliedIndex == nil || *out.FinalAppliedIndex != 3 || out.FinalApplyError != nil {
+		t.Fatalf("final apply state = %+v %+v, want appliedIndex 3 and no error",
+			out.FinalAppliedIndex, out.FinalApplyError)
+	}
+	body := stdout.String()
+	if strings.Contains(body, "conflict") {
+		t.Fatalf("output must not contain a conflict hint:\n%s", body)
+	}
+	if strings.Contains(body, "set broken") {
+		t.Fatalf("the rejected entry's command must not appear in output:\n%s", body)
+	}
+}
+
 func TestCLIErrors(t *testing.T) {
 	cases := []string{
 		`not json`,
