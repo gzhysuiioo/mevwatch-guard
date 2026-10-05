@@ -39,17 +39,14 @@ type kvOperation struct {
 
 // parseKVCommand 把一条命令解释为键值操作，失败时返回具体原因。
 // 命令区分大小写，命令名后必须恰好有一个普通空格；键不能为空、不能含空白
-// 或等号；set 以键后的第一个等号分隔值，值按原文保留（可为空、含空格、
-// 中文及额外等号）；incr 以同样方式分隔增量，增量必须是有符号 64 位十进制
+// 或等号；set 与 incr 共用同一套“键后第一个等号分隔参数”的格式规则（见
+// splitKVKeyArgument），缺少等号时各自报告自己的原因；set 的值按原文保留
+// （可为空、含空格、中文及额外等号），incr 的增量必须是有符号 64 位十进制
 // 整数（允许负号与前导零，其余形式一律非法）。命令两端不做任何空白裁剪。
 func parseKVCommand(command string) (kvOperation, string) {
 	if rest, ok := strings.CutPrefix(command, "set "); ok {
-		eq := strings.IndexByte(rest, '=')
-		if eq < 0 {
-			return kvOperation{}, ApplyReasonSetMissingEquals
-		}
-		key, value := rest[:eq], rest[eq+1:]
-		if reason := validateKVKey(key); reason != "" {
+		key, value, reason := splitKVKeyArgument(rest, ApplyReasonSetMissingEquals)
+		if reason != "" {
 			return kvOperation{}, reason
 		}
 		return kvOperation{key: key, value: value}, ""
@@ -61,12 +58,8 @@ func parseKVCommand(command string) (kvOperation, string) {
 		return kvOperation{isDelete: true, key: rest}, ""
 	}
 	if rest, ok := strings.CutPrefix(command, "incr "); ok {
-		eq := strings.IndexByte(rest, '=')
-		if eq < 0 {
-			return kvOperation{}, ApplyReasonIncrMissingEquals
-		}
-		key, deltaText := rest[:eq], rest[eq+1:]
-		if reason := validateKVKey(key); reason != "" {
+		key, deltaText, reason := splitKVKeyArgument(rest, ApplyReasonIncrMissingEquals)
+		if reason != "" {
 			return kvOperation{}, reason
 		}
 		delta, ok := parseKVInt(deltaText)
@@ -76,6 +69,22 @@ func parseKVCommand(command string) (kvOperation, string) {
 		return kvOperation{isIncr: true, key: key, delta: delta}, ""
 	}
 	return kvOperation{}, ApplyReasonUnknownCommand
+}
+
+// splitKVKeyArgument 按 set 与 incr 共有的格式规则把命令名后的余下部分分成
+// 键与参数原文：以键后的第一个等号分隔，等号后的一切（含额外等号与空白）
+// 都属于参数；随后校验键。缺少等号时返回调用方给出的该命令特定原因，
+// 键非法时先报告键的原因（先于参数本身的解释）。
+func splitKVKeyArgument(rest, missingEqualsReason string) (key, argument, reason string) {
+	eq := strings.IndexByte(rest, '=')
+	if eq < 0 {
+		return "", "", missingEqualsReason
+	}
+	key, argument = rest[:eq], rest[eq+1:]
+	if reason := validateKVKey(key); reason != "" {
+		return "", "", reason
+	}
+	return key, argument, ""
 }
 
 // validateKVKey 校验键：不能为空、不能含空白或等号。
@@ -151,43 +160,53 @@ func (a *kvApplier) applyUpTo(log []LogEntry, committedIndex int) {
 	for a.appliedIndex < committedIndex {
 		next := a.appliedIndex + 1
 		op, reason := parseKVCommand(log[next-1].Command)
+		if reason == "" {
+			reason = op.apply(a.kv)
+		}
 		if reason != "" {
 			// 保留此前已成功应用的结果，已应用索引停在出错位置的前一条。
 			a.err = &ApplyError{Index: next, Reason: reason}
 			return
 		}
-		switch {
-		case op.isDelete:
-			delete(a.kv, op.key) // 删除不存在的键同样算成功，该位置照常标记已应用
-		case op.isIncr:
-			newValue, reason := a.incrValue(op)
-			if reason != "" {
-				// 当前值非法或相加溢出：本条命令不改变键值表，应用停在此处。
-				a.err = &ApplyError{Index: next, Reason: reason}
-				return
-			}
-			a.kv[op.key] = newValue
-		default:
-			a.kv[op.key] = op.value
-		}
 		a.appliedIndex = next
 	}
 }
 
-// incrValue 计算一次增量后的新值：键不存在时当前值按 0 处理（并因此创建
+// apply 把一条解析成功的命令应用到键值表，返回失败原因（成功为空）：
+// set 写入原文值，delete 删除键（删除不存在的键同样算成功），incr 按增量
+// 累加。识别结果自带执行方式，调用方不再按命令种类分派。失败时键值表保持
+// 不变。
+func (op kvOperation) apply(kv map[string]string) string {
+	switch {
+	case op.isDelete:
+		delete(kv, op.key)
+	case op.isIncr:
+		newValue, reason := incrKVValue(kv, op.key, op.delta)
+		if reason != "" {
+			// 当前值非法或相加溢出：本条命令不改变键值表。
+			return reason
+		}
+		kv[op.key] = newValue
+	default:
+		kv[op.key] = op.value
+	}
+	return ""
+}
+
+// incrKVValue 计算一次增量后的新值：键不存在时当前值按 0 处理（并因此创建
 // 该键）；当前值必须是有符号 64 位十进制整数，相加结果也不得超出该范围。
 // 成功时返回不带前导零的规范十进制形式（零统一为 "0"），增量为 0 同样
 // 写回规范形式；失败时返回具体原因，键值表保持不变。
-func (a *kvApplier) incrValue(op kvOperation) (string, string) {
+func incrKVValue(kv map[string]string, key string, delta int64) (string, string) {
 	current := int64(0)
-	if existing, ok := a.kv[op.key]; ok {
+	if existing, ok := kv[key]; ok {
 		value, valid := parseKVInt(existing)
 		if !valid {
 			return "", ApplyReasonIncrBadCurrent
 		}
 		current = value
 	}
-	sum, ok := addKVInt(current, op.delta)
+	sum, ok := addKVInt(current, delta)
 	if !ok {
 		return "", ApplyReasonIncrOverflow
 	}
