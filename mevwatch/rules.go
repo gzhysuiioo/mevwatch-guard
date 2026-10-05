@@ -30,9 +30,10 @@ var ErrVersionConflict = errors.New("version already registered with different p
 // multiplier is out of range. The decoded struct cannot tell a missing
 // field from an explicit zero value, so such an archive would otherwise
 // run under silently zeroed parameters (a zero displacement multiplier
-// even crashes detection). A comparison, review-range evaluation or replay
-// naming a corrupt version is refused; the corrupt content is never
-// replaced by the enabled version, the built-in rules or defaults.
+// even crashes detection). A comparison, review-range evaluation, replay,
+// enable or single-version view naming a corrupt version is refused; the
+// corrupt content is never replaced by the enabled version, the built-in
+// rules or defaults.
 var ErrCorruptVersion = errors.New("archived rule version is corrupted")
 
 // SandwichRule configures the sandwich rule: whether it runs and the
@@ -256,23 +257,10 @@ func ParseRuleVersion(raw []byte) (RuleVersion, error) {
 	}, nil
 }
 
-// findVersion resolves id against the built-in version and the archive's
-// registered versions.
-func findVersion(data archiveData, id string) (RuleVersion, error) {
-	if id == BuiltinVersionID {
-		return BuiltinVersion(), nil
-	}
-	for _, v := range data.Versions {
-		if v.ID == id {
-			return v, nil
-		}
-	}
-	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
-}
-
-// intactVersion resolves id for a comparison and proves the version's
-// stored archive document still satisfies every registration rule,
-// re-validating the raw document with the same parser registrations pass.
+// intactVersion resolves id for a comparison, a single-version view and
+// every other named-version lookup, and proves the version's stored
+// archive document still satisfies every registration rule, re-validating
+// the raw document with the same parser registrations pass.
 // The decoded struct cannot do this: a missing enabled, severity or
 // multiplier field unmarshals as the zero value and is indistinguishable
 // from an explicitly declared one, and a wrong-typed field fails the
@@ -519,7 +507,24 @@ func ListVersions(dir string) (versions []RuleVersion, enabled string, err error
 	return versions, enabled, nil
 }
 
-// GetVersion returns one version's full parameters by ID.
+// GetVersion returns one version's full parameters by ID. The named
+// version's stored archive document must still satisfy every registration
+// rule in full — re-validated from its raw bytes with the same parser
+// registrations pass — before any parameter is returned: the decoded
+// struct cannot tell a missing enabled, severity or multiplier from an
+// explicit value, so a corrupt declaration fails with ErrCorruptVersion
+// naming the version and the offending rule or field rather than coming
+// back under zeroed, default, enabled-version or built-in parameters. An
+// explicitly declared enabled:false is a legal off state as long as the
+// disabled rule still carries complete, in-range severity and multiplier.
+// A version that was never registered stays an ErrUnknownVersion failure,
+// matched by exact id (no case folding or trimming); a corrupt sibling the
+// call does not name never blocks the intact candidate. The built-in
+// version is constructed in code, needs no registration and is always
+// intact, even with no archive directory, no versions section or a corrupt
+// sibling in the file. GetVersion only reads the archive: a failure never
+// completes or repairs the declaration, moves the enabled marker or
+// touches reports and history.
 func GetVersion(dir, id string) (RuleVersion, error) {
 	if id == BuiltinVersionID {
 		return BuiltinVersion(), nil
@@ -533,11 +538,23 @@ func GetVersion(dir, id string) (RuleVersion, error) {
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with each registered version kept as its raw stored document,
+	// the same shape a comparison, enable and replay use: a wrong-typed
+	// field in one version is that version's corruption rather than
+	// whole-archive corruption, a corrupt sibling cannot contaminate the
+	// named intact candidate, and the named document is judged on its own
+	// from its bytes instead of being completed by zero values.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return RuleVersion{}, err
 	}
-	return findVersion(data, id)
+	var doc rawVersionArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return RuleVersion{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	return intactVersion(doc.Versions, id)
 }
 
 // FindingChange pairs the archived and compared conclusions for one
