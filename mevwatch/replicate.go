@@ -115,8 +115,8 @@ type replicateState struct {
 
 // ReplicateOptions 控制 Replicate 的可选行为。零值保持原有处理与输出。
 type ReplicateOptions struct {
-	// ApplyKV 为 true 时把已提交命令解释为键值操作（set/delete），在本次
-	// 调用内从空键值表开始，随提交位置推进按日志次序逐条应用；为 false
+	// ApplyKV 为 true 时把已提交命令解释为键值操作（set/delete/incr），在
+	// 本次调用内从空键值表开始，随提交位置推进按日志次序逐条应用；为 false
 	// 时命令仍是不加解释的任意字符串。
 	ApplyKV bool
 }

@@ -45,8 +45,9 @@ JSON（每条请求的接收结果、处理后的任期与已提交索引、最�
    一直未提交。
 3. **键值命令已经生效**：仅在 `applyKV: true` 时存在。已提交条目按索引顺序
    真正作用到键值表，体现在 `appliedIndex`（已应用到哪条）与 `finalKV`
-   （键值表内容）上。未提交的条目不应用；已提交但格式错误的命令会产生
-   `applyError`，应用位置停在出错条目之前。
+   （键值表内容）上。未提交的条目不应用；已提交但无法应用的命令（格式错误，
+   或 `incr` 的当前值、增量非法与相加溢出）会产生 `applyError`，应用位置停在
+   出错条目之前。
 
 全部字段含义与复制处理规则见 `go run ./cmd/mevwatch help replicate`。
 
@@ -284,7 +285,7 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
 }
 ```
 
-### set / delete 命令格式
+### set / delete / incr 命令格式
 
 命令区分大小写，命令名后必须恰好有一个普通空格，命令首尾不做任何裁剪：
 
@@ -294,12 +295,47 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
   键 `msg`、值 `hello world 你好=a=b`。
 - `delete <key>`：删除一个键。**删除不存在的键仍算成功**，该位置照常标记
   为已应用。
+- `incr <key>=<delta>`：把键的当前值与增量都按**有符号 64 位十进制整数**
+  解释后相加，结果以**规范十进制**（无前导零，零统一为 `0`）作为字符串写回。
+  键不存在时当前值按 `0` 计算并创建该键，因此 `incr visits=1` 作用于新键
+  得到 `"1"`，随后 `incr visits=-3` 得到 `"-2"`。增量为 `0` 同样成功：结果
+  被重写为规范形式，该位置照常推进应用位置。
+  - 整数文本允许负号与前导零（`-2`、`007`、`-0` 都合法）；**不接受**正号、
+    空白、小数、指数形式或非 ASCII 数字（如 `+1`、`" 1"`、`1.0`、`1e3`、
+    `１２`），空字符串也不是整数。取值范围为
+    `-9223372036854775808..9223372036854775807`。
+  - 与 `set` 一样以键后的第一个等号分隔，因此 `incr x=1 =2` 的增量是
+    `1 =2`（含空格，非法）；命令名与键的规则同 `set`/`delete`，不裁剪。
 - 键不能为空、不能含空白字符、不能含等号。注意区分：`set empty=` 是
   **空值**（合法），`set =` 是**空键**（报错 `invalid command: key is
   empty`）；`set a b=1` 的键含空格，同样报错。
 - 其他任何形状（无法识别的命令名、`set` 后没有等号、缺空格等）都是格式
   错误。未提交条目的格式错误不可见；只有已提交命令出错时才生成
   `applyError`。
+
+#### incr 的成功与失败如何读取
+
+增量是在命令**轮到应用时**才结合键值表判定的，因此看结果时先看
+`appliedIndex` 是否越过该日志索引：
+
+- **成功**：`appliedIndex`（每条请求结果）与 `finalAppliedIndex` 前进到该
+  索引，`applyError` / `finalApplyError` 为 `null`，新值以规范字符串出现在
+  `finalKV` 中。例如 `set count=7` 之后应用 `incr count=-2`，`finalKV` 中
+  `"count"` 为 `"5"`。
+- **失败**：该条命令**不改变键值表**，应用位置停在失败条目**之前**，
+  `applyError` / `finalApplyError` 的 `index` 指向失败日志索引，`reason`
+  区分三种原因，之后的条目本次调用内不再应用：
+  - `invalid incr: current value is not a signed 64-bit decimal integer`
+    （键的当前值非法）；
+  - `invalid incr: delta is not a signed 64-bit decimal integer`
+    （增量非法）；
+  - `invalid incr: current value plus delta overflows signed 64-bit integer`
+    （两者各自合法但相加超出范围）。
+
+  即使增量失败，复制本身仍然成功：`accepted` 为 `true`、日志与
+  `committedIndex` 照常推进、退出码仍为 0。同一日志中先前已经生效的
+  `set`/`delete`/`incr` 决定当前值；未提交的增量既不会提前改值，也不会
+  提前暴露数值错误。
 
 下例一次提交四条命令，前三条应用成功（含空值、原文保留的值、删除不存在的
 键），第四条空键出错，应用停在 3：
@@ -335,6 +371,35 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
     "reason": "invalid command: key is empty"
   }
 ```
+
+下面这条输入演示增量的累加、缺失键按 0 创建、规范输出与溢出失败（一次提交
+五条，前四条成功，第五条停住）：
+
+```json
+{
+  "currentTerm": 1,
+  "committedIndex": 0,
+  "log": [],
+  "applyKV": true,
+  "requests": [
+    {"term": 1, "prevLogIndex": 0, "prevLogTerm": 0, "leaderCommit": 5,
+     "entries": [
+       {"index": 1, "term": 1, "command": "set count=7"},
+       {"index": 2, "term": 1, "command": "incr count=-2"},
+       {"index": 3, "term": 1, "command": "incr fresh=0001"},
+       {"index": 4, "term": 1, "command": "incr count=0"},
+       {"index": 5, "term": 1, "command": "incr count=9223372036854775807"}
+     ]}
+  ]
+}
+```
+
+- 索引 2 后 `count` 为 `"5"`；索引 3 创建 `fresh`，`0001` 规范化为 `"1"`；
+  索引 4 增量为 0，`count` 被重写为规范形式 `"5"`；
+- 索引 5 中 `5 + 9223372036854775807` 超出有符号 64 位范围：该条不改表，
+  `finalAppliedIndex` 停在 4，`finalKV` 为
+  `{"count": "5", "fresh": "1"}`，`finalApplyError` 为
+  `{"index": 5, "reason": "invalid incr: current value plus delta overflows signed 64-bit integer"}`。
 
 ### 应用错误不等于调用失败
 
