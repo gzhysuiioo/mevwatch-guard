@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -247,7 +248,13 @@ func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
 	if err := dec.Decode(&spec); err != nil {
 		return ReviewSubmission{}, fmt.Errorf("invalid review spec: %w", err)
 	}
-	if dec.More() {
+	// The document must be exactly one JSON object: after it, only
+	// whitespace may remain. dec.More() cannot see a stray closing
+	// delimiter ('}' or ']') at the top level, so decode once more and
+	// require io.EOF; anything else — another value, a delimiter or
+	// broken syntax — means the input carried trailing content.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
 		return ReviewSubmission{}, errors.New("invalid review spec: unexpected trailing data")
 	}
 	// A field the document never declares decodes as a nil pointer and

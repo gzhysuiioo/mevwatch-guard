@@ -178,6 +178,15 @@ func TestParseReviewSubmissionValidation(t *testing.T) {
 	}{
 		{"not json", `{"chainId":`},
 		{"trailing garbage", good + ` extra`},
+		{"trailing brace", good + ` }`},
+		{"trailing bracket", good + `]`},
+		{"trailing object", good + ` {"chainId":"2"}`},
+		{"trailing value", good + ` 1`},
+		{"empty input", ``},
+		{"whitespace only", "  \t\n "},
+		{"bare array", `[1,2]`},
+		{"bare null", `null`},
+		{"bare string", `"x"`},
 		{"missing chain", `{"blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`},
 		{"blank block", `{"chainId":"1","blockHash":"  ","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`},
 		{"blank tx", `{"chainId":"1","blockHash":"0xa","txHash":"","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`},
@@ -199,6 +208,16 @@ func TestParseReviewSubmissionValidation(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+	// Surrounding whitespace is fine, and braces inside string values are
+	// field content, not object boundaries or trailing data.
+	padded := " \t\n" + good + "\n\t "
+	if _, err := ParseReviewSubmission([]byte(padded)); err != nil {
+		t.Fatalf("whitespace-padded spec rejected: %v", err)
+	}
+	braced := strings.Replace(good, `"reason":"r"`, `"reason":"a } and ] here"`, 1)
+	if _, err := ParseReviewSubmission([]byte(braced)); err != nil {
+		t.Fatalf("braces inside strings rejected: %v", err)
 	}
 	// The unreviewed status is a valid first submission too.
 	withdraw := strings.Replace(good, `"status":"real"`, `"status":"unreviewed"`, 1)
