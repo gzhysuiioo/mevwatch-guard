@@ -30,9 +30,9 @@ var ErrVersionConflict = errors.New("version already registered with different p
 // multiplier is out of range. The decoded struct cannot tell a missing
 // field from an explicit zero value, so such an archive would otherwise
 // run under silently zeroed parameters (a zero displacement multiplier
-// even crashes detection). Showing, comparing, evaluating or replaying a
-// corrupt version is refused; the corrupt content is never replaced by the
-// enabled version, the built-in rules or defaults.
+// even crashes detection). Listing, showing, comparing, evaluating or
+// replaying a corrupt version is refused; the corrupt content is never
+// replaced by the enabled version, the built-in rules or defaults.
 var ErrCorruptVersion = errors.New("archived rule version is corrupted")
 
 // SandwichRule configures the sandwich rule: whether it runs and the
@@ -294,13 +294,44 @@ func intactVersion(versions []json.RawMessage, id string) (RuleVersion, error) {
 // unknown. Entries that are not JSON objects, or whose id has no string
 // occurrence equal to target, do not match.
 func entryDeclaresID(entry json.RawMessage, id string) bool {
+	found := false
+	scanEntryIDs(entry, func(s string) bool {
+		if s == id {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// entryID returns the first string value the raw version entry declares
+// under an id key, for naming the entry in an error. The second result is
+// false when no occurrence is a string — a missing, null or wrong-typed
+// id — so the caller can fall back to naming the entry by its position.
+func entryID(entry json.RawMessage) (string, bool) {
+	var id string
+	ok := false
+	scanEntryIDs(entry, func(s string) bool {
+		id, ok = s, true
+		return false
+	})
+	return id, ok
+}
+
+// scanEntryIDs walks the top-level fields of a raw stored version entry and
+// calls visit with every string value carried by an id key, recognising the
+// key the way the decoder folds field names. Returning false from visit
+// stops the walk. Entries that are not JSON objects yield nothing, and an
+// id pointing at an object or array is a wrong type, not an identity.
+func scanEntryIDs(entry json.RawMessage, visit func(string) bool) {
 	dec := json.NewDecoder(bytes.NewReader(entry))
 	first, err := dec.Token()
 	if err != nil {
-		return false
+		return
 	}
 	if d, ok := first.(json.Delim); !ok || d != '{' {
-		return false
+		return
 	}
 	// foldName folds to the smallest rune in each case-folding orbit, so the
 	// folded spelling of "id" is "ID"; fold the key the same way rather than
@@ -309,12 +340,12 @@ func entryDeclaresID(entry json.RawMessage, id string) bool {
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return false
+			return
 		}
 		key, _ := keyTok.(string)
 		valTok, err := dec.Token()
 		if err != nil {
-			return false
+			return
 		}
 		if _, isDelim := valTok.(json.Delim); isDelim {
 			// Consume the container the id (or another key) points at; an
@@ -323,7 +354,7 @@ func entryDeclaresID(entry json.RawMessage, id string) bool {
 			for depth > 0 {
 				tok, err := dec.Token()
 				if err != nil {
-					return false
+					return
 				}
 				if dd, ok := tok.(json.Delim); ok {
 					if dd == '{' || dd == '[' {
@@ -336,12 +367,11 @@ func entryDeclaresID(entry json.RawMessage, id string) bool {
 			continue
 		}
 		if foldName(key) == idField {
-			if s, ok := valTok.(string); ok && s == id {
-				return true
+			if s, ok := valTok.(string); ok && !visit(s) {
+				return
 			}
 		}
 	}
-	return false
 }
 
 // RegisterVersion validates raw as a rule version spec and stores it in the
@@ -482,7 +512,29 @@ func EnableVersion(dir, id string) (RuleVersion, error) {
 }
 
 // ListVersions returns the built-in version plus every version registered
-// in the archive, along with the currently enabled version ID.
+// in the archive, along with the currently enabled version ID. Every
+// registered version's stored archive document must still satisfy the
+// registration rules in full — re-validated from its raw bytes with the
+// same parser registrations pass — before the list is returned: the
+// decoded struct cannot tell a missing enabled, severity or multiplier
+// from an explicitly declared one, so a corrupt declaration would
+// otherwise be listed with silently zeroed parameters, indistinguishable
+// from a rule the operator actually turned off. An explicit enabled:false
+// is a legal off state, but a disabled rule still has to carry complete,
+// in-range parameters; a missing or null rule object or field, a wrong
+// type, an out-of-range number, an unknown or duplicate field in any one
+// stored version fails the whole query with ErrCorruptVersion naming the
+// version and the offending rule or field — even when that version is not
+// the enabled one. The corrupt entry is never skipped, never listed with
+// zeroed or defaulted parameters, and never replaced by the enabled
+// version or the built-in rules. A wholly unparseable archive still fails
+// as archive corruption, never as an empty version list. When every
+// stored declaration is intact, the built-in version comes first and the
+// registered versions follow in stored order with their id strings
+// verbatim. A missing archive directory, or a legacy archive with no
+// versions section, lists the built-in version alone. The query is
+// read-only: version declarations, the enabled marker and the archived
+// reports are never modified, whether the query succeeds or fails.
 func ListVersions(dir string) (versions []RuleVersion, enabled string, err error) {
 	if _, serr := os.Stat(dir); errors.Is(serr, os.ErrNotExist) {
 		return []RuleVersion{BuiltinVersion()}, BuiltinVersionID, nil
@@ -493,16 +545,44 @@ func ListVersions(dir string) (versions []RuleVersion, enabled string, err error
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with each registered version kept as its raw stored document,
+	// the same shape a replay or an enable uses: a wrong-typed field in one
+	// version is that version's corruption rather than whole-archive
+	// corruption, and every entry is judged on its own below.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, "", err
 	}
-	versions = append([]RuleVersion{BuiltinVersion()}, data.Versions...)
+	data := replayArchiveDoc{Records: []record{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, "", fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	versions = []RuleVersion{BuiltinVersion()}
+	for i, entry := range data.Versions {
+		v, perr := ParseRuleVersion(entry)
+		if perr != nil {
+			return nil, "", fmt.Errorf("%w: %s: %w", ErrCorruptVersion, versionLabel(entry, i), perr)
+		}
+		versions = append(versions, v)
+	}
 	enabled = data.EnabledVersion
 	if enabled == "" {
 		enabled = BuiltinVersionID
 	}
 	return versions, enabled, nil
+}
+
+// versionLabel names a stored version entry in a corruption error: its
+// declared id when the entry carries one as a string, and otherwise its
+// position in the versions array, so a version whose id itself decayed is
+// still pointed at.
+func versionLabel(entry json.RawMessage, index int) string {
+	if id, ok := entryID(entry); ok {
+		return id
+	}
+	return fmt.Sprintf("versions[%d]", index)
 }
 
 // GetVersion returns one version's full parameters by ID. The requested
