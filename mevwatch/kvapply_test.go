@@ -908,6 +908,136 @@ func TestKVRejectedReplicationKeepsApplyBoundary(t *testing.T) {
 	}
 }
 
+// TestKVEntryTermBelowPrevLogTermKeepsApplyBoundary 回归保障：首条任期低于请求
+// 声明的前置任期是字段错误，与较高任期更新、前置日志匹配交汇时不改变节点状态，
+// 也不触碰键值应用。场景：任期 2 的跟随者，idx1（term 1，set balance=100）已
+// 提交，idx2（term 2，set balance=200）是未提交尾部。
+//   - 任期 7、前置 (2,2) 的请求携带 idx3 任期 1 的条目：首条任期低于前置任期，
+//     按 entry terms are not non-decreasing 拒绝，不输出 conflict，任期保持 2；
+//     请求中格式错误的命令与再大的 leaderCommit 都不能留下效果；
+//   - 声明前置任期 3（与本地 idx2 不一致）但首条任期 2 仍低于声明值：同一字段
+//     错误，不能改成前置日志不匹配，也不留下较高任期更新；
+//   - 随后任期 3、正确匹配 idx2 的合法请求追加 idx3（term 2，set receipt=ok）
+//     并提交到 3：balance 变为 200、receipt=ok，提交与应用位置都到 3。
+func TestKVEntryTermBelowPrevLogTermKeepsApplyBoundary(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"), // 未提交尾部：任何拒绝都不能让它被应用
+	}}
+	original := append([]LogEntry(nil), initial.Log...)
+
+	// 请求一：首条任期 1 低于声明的前置任期 2；命令本身格式错误（缺 '='），
+	// leaderCommit 声明到 9——两者都不能在拒绝后留下效果。
+	drop := AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 9,
+		Entries: []LogEntry{entry(3, 1, "set bad")}}
+	// 请求二：声明的前置任期 3 与本地 idx2（任期 2）不一致，首条任期 2 仍低于
+	// 声明值——同一字段错误而非前置日志不匹配。
+	misdeclared := AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 3, LeaderCommit: 9,
+		Entries: []LogEntry{entry(3, 2, "set also bad")}}
+	// 请求三：合法衔接，追加 idx3 并提交到 3。
+	legal := AppendRequest{Term: 3, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+		Entries: []LogEntry{entry(3, 2, "set receipt=ok")}}
+
+	// 若输入停在第一次拒绝处：键值表仍只有 balance=100，应用位置仍为 1，格式
+	// 错误的命令不产生应用错误，日志、提交位置与任期全部保持原值。
+	stopped := runKV(t, initial, drop)
+	r := stopped.Results[0]
+	if r.Accepted || r.Reason != ReasonEntryTermDecreases {
+		t.Fatalf("first request should be a field error, got %+v", r)
+	}
+	if r.Conflict != nil {
+		t.Fatalf("field error must not carry conflict: %+v", r.Conflict)
+	}
+	if r.Term != 2 || r.CommittedIndex != 1 {
+		t.Fatalf("field error changed replication state: %+v", r)
+	}
+	if got := appliedIndexOf(t, r); got != 1 {
+		t.Fatalf("applied index advanced on rejection: %d, want 1", got)
+	}
+	if r.ApplyError != nil {
+		t.Fatalf("rejected request must not produce an apply error: %+v", r.ApplyError)
+	}
+	if stopped.FinalTerm != 2 || stopped.FinalCommittedIndex != 1 {
+		t.Fatalf("final state after stop: term=%d ci=%d, want 2/1",
+			stopped.FinalTerm, stopped.FinalCommittedIndex)
+	}
+	if !reflect.DeepEqual(stopped.FinalLog, original) {
+		t.Fatalf("log changed after rejection: %+v", stopped.FinalLog)
+	}
+	if *stopped.FinalAppliedIndex != 1 {
+		t.Fatalf("final appliedIndex = %d, want 1", *stopped.FinalAppliedIndex)
+	}
+	if !reflect.DeepEqual(finalKVOf(t, stopped), map[string]string{"balance": "100"}) {
+		t.Fatalf("kv changed after rejection: %v, want only balance=100", stopped.FinalKV)
+	}
+	if stopped.FinalApplyError != nil {
+		t.Fatalf("unexpected final apply error: %+v", stopped.FinalApplyError)
+	}
+
+	// 完整过程：两种字段错误之后合法请求仍能追加并提交。
+	out := runKV(t, initial, drop, misdeclared, legal)
+	if len(out.Results) != 3 {
+		t.Fatalf("got %d results, want 3", len(out.Results))
+	}
+	for i := 0; i < 2; i++ {
+		result := out.Results[i]
+		if result.Accepted || result.Reason != ReasonEntryTermDecreases {
+			t.Fatalf("result %d = accepted=%v reason=%q, want field error %q",
+				i, result.Accepted, result.Reason, ReasonEntryTermDecreases)
+		}
+		if result.Conflict != nil {
+			t.Fatalf("result %d must not carry conflict: %+v", i, result.Conflict)
+		}
+		if result.Term != 2 || result.CommittedIndex != 1 {
+			t.Fatalf("result %d changed replication state: %+v", i, result)
+		}
+		if got := appliedIndexOf(t, result); got != 1 {
+			t.Fatalf("result %d appliedIndex = %d, want 1", i, got)
+		}
+		if result.ApplyError != nil {
+			t.Fatalf("result %d unexpected apply error: %+v", i, result.ApplyError)
+		}
+	}
+	third := out.Results[2]
+	if !third.Accepted || third.Reason != ReasonOK {
+		t.Fatalf("legal request after field errors rejected: %+v", third)
+	}
+	if third.Term != 3 || third.CommittedIndex != 3 {
+		t.Fatalf("result 2 state = term %d ci %d, want term 3 ci 3", third.Term, third.CommittedIndex)
+	}
+	if got := appliedIndexOf(t, third); got != 3 {
+		t.Fatalf("result 2 appliedIndex = %d, want 3", got)
+	}
+	if third.ApplyError != nil {
+		t.Fatalf("result 2 unexpected apply error: %+v", third.ApplyError)
+	}
+
+	// 最终状态：任期 3、提交 3；日志为原两条加 idx3，按日志次序应用后
+	// balance=200、receipt=ok，无应用错误。
+	wantLog := []LogEntry{
+		entry(1, 1, "set balance=100"),
+		entry(2, 2, "set balance=200"),
+		entry(3, 2, "set receipt=ok"),
+	}
+	if !reflect.DeepEqual(out.FinalLog, wantLog) {
+		t.Fatalf("final log = %+v, want %+v", out.FinalLog, wantLog)
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("final state = term %d ci %d, want term 3 ci 3",
+			out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if *out.FinalAppliedIndex != 3 {
+		t.Fatalf("final appliedIndex = %d, want 3", *out.FinalAppliedIndex)
+	}
+	wantKV := map[string]string{"balance": "200", "receipt": "ok"}
+	if !reflect.DeepEqual(finalKVOf(t, out), wantKV) {
+		t.Fatalf("final kv = %v, want %v", out.FinalKV, wantKV)
+	}
+	if out.FinalApplyError != nil {
+		t.Fatalf("final apply error = %+v, want none", out.FinalApplyError)
+	}
+}
+
 // partialConfirmationInitial 是“部分确认不提交尾部”回归测试的初始状态：任期 2，
 // 日志索引 1..4 的任期均为 2，只有 idx1（set balance=100）已提交；idx2 把
 // balance 改成 200，idx3 是缺少等号的 set 命令，idx4 删除 balance——后三条都是

@@ -576,6 +576,121 @@ func TestNonPositiveEntryIndexIsFieldError(t *testing.T) {
 	}
 }
 
+// 日志任期衔接：非空请求除了条目自身任期不下降，第一条的任期也不能低于请求声明
+// 的前置任期。这属于字段规则，在任期更新与前置日志核对之前检查：非法请求不能借
+// 高任期改变节点，也不能被当成需要重发的复制冲突（不携带 conflict）。
+func TestFirstEntryTermBelowPrevLogTermIsFieldError(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "set balance=100"), entry(2, 2, "set balance=200"),
+	}}
+	original := append([]LogEntry(nil), initial.Log...)
+	out := run(t, initial,
+		// 任期 7、前置 (2,2) 与本地一致，但首条 idx3 任期 1 低于前置任期 2。
+		AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+			Entries: []LogEntry{entry(3, 1, "set balance=300")}},
+		// 声明的前置任期 3 与本地 idx2（任期 2）不一致，但首条任期 2 仍低于
+		// 声明值：仍是同一字段错误，不能改成前置日志不匹配。
+		AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 3, LeaderCommit: 3,
+			Entries: []LogEntry{entry(3, 2, "set balance=300")}},
+	)
+	for i, result := range out.Results {
+		if result.Accepted || result.Reason != ReasonEntryTermDecreases {
+			t.Fatalf("result %d: expected entry-term field error, got %+v", i, result)
+		}
+		if result.Conflict != nil {
+			t.Fatalf("result %d: field error must not carry conflict, got %+v", i, result.Conflict)
+		}
+		if result.Term != 2 || result.CommittedIndex != 1 {
+			t.Fatalf("result %d changed state: %+v", i, result)
+		}
+	}
+	if out.FinalTerm != 2 || out.FinalCommittedIndex != 1 {
+		t.Fatalf("final state changed: term=%d ci=%d", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	if !reflect.DeepEqual(out.FinalLog, original) {
+		t.Fatalf("log changed: %+v", out.FinalLog)
+	}
+	// 未开启 applyKV：拒绝结果既不输出 conflict，也不出现应用字段。
+	encoded, err := json.Marshal(out.Results[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"conflict", "appliedIndex", "applyError"} {
+		if strings.Contains(string(encoded), field) {
+			t.Fatalf("rejected result must omit %q: %s", field, encoded)
+		}
+	}
+
+	// 非法请求没有留下任期更新：随后任期 3 的合法请求按原状态正常处理——若任期
+	// 已被抬到 7，这条请求会被当作低任期拒绝。
+	out = run(t, initial,
+		AppendRequest{Term: 7, PrevLogIndex: 2, PrevLogTerm: 2,
+			Entries: []LogEntry{entry(3, 1, "set balance=300")}},
+		AppendRequest{Term: 3, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+			Entries: []LogEntry{entry(3, 2, "set receipt=ok")}},
+	)
+	if out.Results[0].Accepted || out.Results[0].Reason != ReasonEntryTermDecreases {
+		t.Fatalf("first request should be a field error, got %+v", out.Results[0])
+	}
+	if !out.Results[1].Accepted || out.Results[1].Reason != ReasonOK {
+		t.Fatalf("valid request after field error rejected: %+v", out.Results[1])
+	}
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 3 {
+		t.Fatalf("unexpected final state: term=%d ci=%d", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	want := []LogEntry{
+		entry(1, 1, "set balance=100"), entry(2, 2, "set balance=200"), entry(3, 2, "set receipt=ok"),
+	}
+	if !reflect.DeepEqual(out.FinalLog, want) {
+		t.Fatalf("log = %+v, want %+v", out.FinalLog, want)
+	}
+}
+
+// 首条任期等于前置任期是合法衔接；空条目请求没有首条日志，不做衔接检查；请求
+// 任期低于当前任期时仍沿用现有的低任期拒绝顺序（先于衔接检查）。
+func TestFirstEntryTermJoinBoundaryAndOrdering(t *testing.T) {
+	initial := InitialState{CurrentTerm: 2, CommittedIndex: 1, Log: []LogEntry{
+		entry(1, 1, "a"), entry(2, 2, "b"),
+	}}
+	// 首条任期 == 前置任期：合法，正常追加并提交。
+	out := run(t, initial,
+		AppendRequest{Term: 2, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 3,
+			Entries: []LogEntry{entry(3, 2, "c")}},
+	)
+	if !out.Results[0].Accepted || out.Results[0].Reason != ReasonOK {
+		t.Fatalf("equal-term join should be accepted: %+v", out.Results[0])
+	}
+	if out.FinalCommittedIndex != 3 || len(out.FinalLog) != 3 {
+		t.Fatalf("equal-term join not applied: ci=%d log=%+v", out.FinalCommittedIndex, out.FinalLog)
+	}
+	// 空条目请求没有首条日志：不能因此报任期下降，按原有前置日志规则处理
+	// （此处前置匹配，心跳成功并把提交推进到确认位置 2）。
+	out = run(t, initial,
+		AppendRequest{Term: 2, PrevLogIndex: 2, PrevLogTerm: 2, LeaderCommit: 2},
+	)
+	if !out.Results[0].Accepted {
+		t.Fatalf("empty-entries heartbeat rejected: %+v", out.Results[0])
+	}
+	if out.Results[0].CommittedIndex != 2 {
+		t.Fatalf("heartbeat commit = %d, want 2", out.Results[0].CommittedIndex)
+	}
+	// 低任期请求即使首条任期低于前置任期，也先按低任期拒绝，状态完全不变。
+	out = run(t, initial,
+		AppendRequest{Term: 1, PrevLogIndex: 2, PrevLogTerm: 2,
+			Entries: []LogEntry{entry(3, 1, "c")}},
+	)
+	result := out.Results[0]
+	if result.Accepted || result.Reason != ReasonStaleTerm {
+		t.Fatalf("expected stale-term rejection, got %+v", result)
+	}
+	if result.Term != 2 || result.CommittedIndex != 1 {
+		t.Fatalf("stale rejection changed state: %+v", result)
+	}
+	if !reflect.DeepEqual(out.FinalLog, initial.Log) {
+		t.Fatalf("log changed: %+v", out.FinalLog)
+	}
+}
+
 // 前置索引越过本地日志末尾：建议从末尾加一处重发，任期记 0；空日志因此是索引 1。
 func TestConflictHintIndexBeyondLog(t *testing.T) {
 	out := run(t, InitialState{CurrentTerm: 2},
