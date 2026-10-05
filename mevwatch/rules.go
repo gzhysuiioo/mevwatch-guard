@@ -361,8 +361,21 @@ func entryDeclaresID(entry json.RawMessage, id string) bool {
 // RegisterVersion validates raw as a rule version spec and stores it in the
 // archive at dir. Re-registering the same ID with identical parameters
 // succeeds without adding a version (created is false); the same ID with
-// different parameters is rejected. The built-in version ID is reserved.
-// Any failure leaves the archive untouched.
+// different parameters is rejected. When the submitted ID already exists,
+// its stored declaration must still satisfy every current registration
+// rule: a decayed document fails with ErrCorruptVersion (naming the
+// version and the offending rule or field) — never created:false, never a
+// parameter conflict, and the submitted parameters never replace the
+// stored ones. The built-in version ID is reserved.
+//
+// A genuinely new ID is only appended: every other registered version is
+// written back as its exact stored document (fields, values and order
+// preserved, corrupt and intact siblings alike), so registration never
+// completes a missing field, fills a null, drops an unknown or repeated
+// field, reorders or repairs an existing declaration. The enabled marker,
+// historical reports, suppressions, alert records and reviews are
+// untouched. Any failure — a corrupt existing declaration, an unreadable
+// or busy archive, a failed write — leaves the archive unchanged.
 func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err error) {
 	v, err = ParseRuleVersion(raw)
 	if err != nil {
@@ -380,19 +393,44 @@ func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err e
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Keep each registered version as its raw stored document the way a
+	// replay and an enable do: appending a new version must re-emit every
+	// other declaration byte for byte, never round-trip it through the
+	// decoded struct (which would silently turn a missing or null field
+	// into a zero value and drop unknown or repeated fields).
+	archiveRaw, err := readArchiveBytes(dir)
 	if err != nil {
 		return RuleVersion{}, false, err
 	}
-	for _, existing := range data.Versions {
-		if existing.ID == v.ID {
-			if existing.Rules == v.Rules {
-				return existing, false, nil
-			}
-			return RuleVersion{}, false, fmt.Errorf("%w: %s", ErrVersionConflict, v.ID)
+	data := replayArchiveDoc{Records: []record{}}
+	if archiveRaw != nil {
+		if err := json.Unmarshal(archiveRaw, &data); err != nil {
+			return RuleVersion{}, false, fmt.Errorf("archive is corrupted: %w", err)
 		}
 	}
-	data.Versions = append(data.Versions, v)
+	for _, entry := range data.Versions {
+		if !entryDeclaresID(entry, v.ID) {
+			continue
+		}
+		// The existing declaration must still be a complete, valid spec on
+		// its own. Only then may the submission be judged an identical
+		// retry (created:false) or a parameter conflict; a decayed
+		// declaration is reported as corruption and is never overwritten,
+		// completed or matched against the submitted parameters.
+		existing, perr := ParseRuleVersion(entry)
+		if perr != nil {
+			return RuleVersion{}, false, fmt.Errorf("%w: %s: %w", ErrCorruptVersion, v.ID, perr)
+		}
+		if existing.Rules == v.Rules {
+			return existing, false, nil
+		}
+		return RuleVersion{}, false, fmt.Errorf("%w: %s", ErrVersionConflict, v.ID)
+	}
+	entry, err := json.Marshal(v)
+	if err != nil {
+		return RuleVersion{}, false, err
+	}
+	data.Versions = append(data.Versions, json.RawMessage(entry))
 	if err := writeArchiveAtomic(dir, data); err != nil {
 		return RuleVersion{}, false, err
 	}
