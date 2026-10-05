@@ -342,9 +342,24 @@ func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err e
 	return v, true, nil
 }
 
-// EnableVersion makes id the archive's active version for later replays.
-// Enabling an unknown version fails and leaves the current enabled version
-// unchanged.
+// EnableVersion makes id the archive's active version for later replays
+// without an explicit --version. Success means the selected version's
+// stored archive document still satisfies every registration rule: it is
+// re-validated from its raw bytes with the same parser registrations pass,
+// the way a replay, comparison and review evaluation prove their versions.
+// A registered-but-corrupt version — a missing or null rule object or
+// required field, a wrong type, an out-of-range number, an unknown field or
+// rule, or a repeated field — fails with ErrCorruptVersion naming the
+// version and the offending rule or field, even when it is already the
+// enabled version; the corrupt content is never replaced by the current
+// version, the built-in rules or defaults. A version that was never
+// registered stays an ErrUnknownVersion failure; builtin needs no
+// registration and is always intact. A corrupt sibling version neither
+// blocks an intact choice nor is repaired, reordered or dropped: versions
+// are kept as raw documents and written back untouched, and every other
+// part of the archive (reports, suppressions, alert records and reviews)
+// is preserved. Any failure leaves the enabled marker and the whole
+// archive unchanged.
 func EnableVersion(dir, id string) (RuleVersion, error) {
 	if id == "" {
 		return RuleVersion{}, errors.New("version id must not be empty")
@@ -358,15 +373,35 @@ func EnableVersion(dir, id string) (RuleVersion, error) {
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Read the archive the same way a replay does, with every registered
+	// version kept as its raw stored document: a damaged sibling must
+	// neither break this read nor be completed, normalized, reordered or
+	// dropped when the marker is committed, and the selected version can be
+	// re-validated from its bytes exactly as at registration.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return RuleVersion{}, err
 	}
-	v, err := findVersion(data, id)
+	var data replayArchiveDoc
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return RuleVersion{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	// Prove the selected version intact before reporting success, including
+	// when it is already the enabled marker: re-enabling the current version
+	// must surface its corruption rather than accepting it on reputation.
+	// The built-in version is constructed in code and always intact; an
+	// archive written before rule versions existed has no marker and runs
+	// the built-in rules.
+	v, err := intactVersion(data.Versions, id)
 	if err != nil {
 		return RuleVersion{}, err
 	}
-	if data.EnabledVersion == id {
+	// An absent marker already means builtin, so enabling builtin there is a
+	// pure no-op and writes nothing. Any other marker change is the only
+	// thing committed; the validation above still ran even on a no-op.
+	if data.EnabledVersion == id || (data.EnabledVersion == "" && id == BuiltinVersionID) {
 		return v, nil
 	}
 	data.EnabledVersion = id
