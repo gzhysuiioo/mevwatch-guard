@@ -286,10 +286,7 @@ func intactVersion(versions []json.RawMessage, id string) (RuleVersion, error) {
 		return BuiltinVersion(), nil
 	}
 	for _, entry := range versions {
-		var meta struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(entry, &meta); err != nil || meta.ID != id {
+		if !entryDeclaresID(entry, id) {
 			continue
 		}
 		v, err := ParseRuleVersion(entry)
@@ -299,6 +296,66 @@ func intactVersion(versions []json.RawMessage, id string) (RuleVersion, error) {
 		return v, nil
 	}
 	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
+}
+
+// entryDeclaresID reports whether the raw version entry carries the given
+// id, recognising it the way the decoder folds field names — so "id", "ID"
+// and "ıd"-style compatibility spellings all count — and inspecting every
+// occurrence rather than decoding the object. A decayed document that
+// repeats the id key ("id":"x","id":<target>, which a plain unmarshal folds
+// onto the last value) is therefore still attributed to the registered
+// version and judged as corruption by ParseRuleVersion, never dismissed as
+// unknown. Entries that are not JSON objects, or whose id has no string
+// occurrence equal to target, do not match.
+func entryDeclaresID(entry json.RawMessage, id string) bool {
+	dec := json.NewDecoder(bytes.NewReader(entry))
+	first, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	if d, ok := first.(json.Delim); !ok || d != '{' {
+		return false
+	}
+	// foldName folds to the smallest rune in each case-folding orbit, so the
+	// folded spelling of "id" is "ID"; fold the key the same way rather than
+	// comparing against the lowercase literal.
+	idField := foldName("id")
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		key, _ := keyTok.(string)
+		valTok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		if _, isDelim := valTok.(json.Delim); isDelim {
+			// Consume the container the id (or another key) points at; an
+			// object/array id is a wrong type, not a matching identity.
+			depth := 1
+			for depth > 0 {
+				tok, err := dec.Token()
+				if err != nil {
+					return false
+				}
+				if dd, ok := tok.(json.Delim); ok {
+					if dd == '{' || dd == '[' {
+						depth++
+					} else {
+						depth--
+					}
+				}
+			}
+			continue
+		}
+		if foldName(key) == idField {
+			if s, ok := valTok.(string); ok && s == id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RegisterVersion validates raw as a rule version spec and stores it in the
@@ -342,9 +399,22 @@ func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err e
 	return v, true, nil
 }
 
-// EnableVersion makes id the archive's active version for later replays.
-// Enabling an unknown version fails and leaves the current enabled version
-// unchanged.
+// EnableVersion makes id the archive's active version for later replays
+// that name no explicit version. Before the marker changes, the selected
+// version's stored archive document must still satisfy every registration
+// rule in full — re-validated from its raw bytes with the same parser
+// registrations pass — even when it is already the enabled version: the
+// decoded struct cannot tell a decayed or wrong-typed field from an
+// explicit value, so enabling a corrupt registered version fails with
+// ErrCorruptVersion rather than succeeding under zeroed parameters and
+// delaying the failure to the next replay. A version that was never
+// registered stays an ErrUnknownVersion failure; the built-in version is
+// constructed in code, needs no registration and is always intact. On
+// success only the enabled marker changes: every other stored version is
+// written back byte for byte (fields, values and order preserved, corrupt
+// siblings included), and reports, suppressions, alert records and reviews
+// are untouched. Any failure — corruption, an unreadable or busy archive,
+// a failed write — leaves the archive unchanged.
 func EnableVersion(dir, id string) (RuleVersion, error) {
 	if id == "" {
 		return RuleVersion{}, errors.New("version id must not be empty")
@@ -358,11 +428,30 @@ func EnableVersion(dir, id string) (RuleVersion, error) {
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with each registered version kept as its raw stored document,
+	// the same shape a replay uses: a wrong-typed field in one version is
+	// that version's corruption rather than whole-archive corruption, a
+	// corrupt sibling cannot block an intact candidate or builtin, and the
+	// versions not selected are written back verbatim — enabling a version
+	// never completes a missing field, fixes a value, reorders or drops an
+	// entry.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return RuleVersion{}, err
 	}
-	v, err := findVersion(data, id)
+	data := replayArchiveDoc{Records: []record{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return RuleVersion{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	// Validate the stored declaration before changing anything. An explicit
+	// enabled:false is a legal off state, but a disabled rule still has to
+	// carry complete, in-range parameters; a missing or null rule object or
+	// field, a wrong type, an out-of-range number, an unknown or duplicate
+	// field all fail here. intactVersion returns the built-in version for
+	// the built-in id and an unknown-version error for an id it cannot find.
+	v, err := intactVersion(data.Versions, id)
 	if err != nil {
 		return RuleVersion{}, err
 	}
