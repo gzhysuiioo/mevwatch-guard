@@ -127,13 +127,26 @@ Key/value application (only when applyKV is true):
                           may be empty or contain spaces, CJK text and '='
       delete <key>        delete a key; deleting a missing key still succeeds
                           and the position counts as applied
+      incr <key>=<delta>  add delta to the key's current integer value; a
+                          missing key counts as 0 and is created. Both the
+                          current value and delta must be signed 64-bit
+                          decimal integers: an optional '-' sign and ASCII
+                          digits only (leading zeros allowed; no '+' sign,
+                          whitespace, decimals, exponents or non-ASCII digits;
+                          empty is not an integer). On success the key holds
+                          the canonical decimal form (no leading zeros, zero
+                          is "0"); a zero delta still writes the canonical
+                          form and counts as applied
   - Keys must be non-empty and contain no whitespace or '='. Every other
     command shape is a format error.
   - Uncommitted entries are never applied: their format errors stay invisible
     and a replaced uncommitted suffix leaves no trace in the table.
   - On the first format error in a committed command, previously applied
     results are kept, the applied index stops before the failing entry, and
-    no later entry is applied for the rest of the invocation. Replication
+    no later entry is applied for the rest of the invocation. An incr whose
+    current value is not an integer, whose delta is not an integer, or whose
+    sum overflows the signed 64-bit range fails the same way: the table is
+    left unchanged and the reason tells the three cases apart. Replication
     itself is unaffected: later requests still change log, term and commit
     position, and apply failure never turns an accepted replication into a
     rejection nor alters a rejection reason.
@@ -164,9 +177,12 @@ Extra output fields when applyKV is true:
   results[].appliedIndex  highest applied log index after the request
                           (0 = nothing applied)
   results[].applyError    null, or {"index", "reason"} for the first
-                          malformed committed command
+                          committed command that failed to apply (malformed
+                          command, or an incr with a non-integer current
+                          value, a non-integer delta, or an overflowing sum)
   finalAppliedIndex       highest applied log index at the end
-  finalKV                 final key/value table ({} when empty)
+  finalKV                 final key/value table ({} when empty); incr results
+                          are stored as canonical decimal strings
   finalApplyError         null, or {"index", "reason"}
 
 A request violating a field rule is recorded as one rejection without changing

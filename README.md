@@ -336,6 +336,70 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
   }
 ```
 
+### incr 增量命令
+
+`incr <key>=<delta>` 把累加动作直接写进日志：应用时把键的当前值加上
+`delta`，结果仍以**字符串**形式保存在键值表里。键不存在时当前值按 0
+计算并创建该键；同一日志中先前已经生效的写入或删除决定此次增量使用的
+当前值。例如 `set count=7` 之后应用 `incr count=-2`，最终 `count` 为
+`"5"`。
+
+- 当前值与 `delta` 都按**有符号 64 位十进制整数**解释：允许负号与前导零
+  （`incr k=-007` 合法），不接受正号、空白、小数、指数形式或非 ASCII
+  数字，空字符串也不是整数。
+- 成功后的值使用不带前导零的规范十进制形式，零统一为 `"0"`；`delta` 为 0
+  时同样写回规范形式并照常推进应用位置。
+- 命令名区分大小写，命令名后必须恰好有一个普通空格，键的规则与
+  set/delete 相同，命令与数值两端都不裁剪。
+- 当前值不是整数、`delta` 不是整数、或两者相加超出有符号 64 位范围时，
+  此条命令**不改变键值表**，应用位置停在该条目之前，三种原因分别报告：
+  - `invalid command: current value is not a signed 64-bit decimal integer`
+  - `invalid command: incr delta is not a signed 64-bit decimal integer`
+  - `invalid command: incr result exceeds signed 64-bit integer range`
+
+下例一次提交五条命令：创建计数、基于先前写入累加、删除后重新计数、
+`delta` 为 0 写回规范形式，最后一条当前值不是整数而失败：
+
+```json
+{
+  "currentTerm": 1,
+  "committedIndex": 0,
+  "log": [],
+  "applyKV": true,
+  "requests": [
+    {"term": 1, "prevLogIndex": 0, "prevLogTerm": 0, "leaderCommit": 5,
+     "entries": [
+       {"index": 1, "term": 1, "command": "incr hits=1"},
+       {"index": 2, "term": 1, "command": "set count=7"},
+       {"index": 3, "term": 1, "command": "incr count=-2"},
+       {"index": 4, "term": 1, "command": "incr pad=000"},
+       {"index": 5, "term": 1, "command": "incr hits=1x"}
+     ]}
+  ]
+}
+```
+
+输出末尾为（索引 5 的增量 `1x` 不是整数，应用停在 4；此前已生效的
+结果保留，`hits` 为 `"1"`、`count` 为 `"5"`、`pad` 为 `"0"`）：
+
+```json
+  "finalAppliedIndex": 4,
+  "finalKV": {
+    "count": "5",
+    "hits": "1",
+    "pad": "0"
+  },
+  "finalApplyError": {
+    "index": 5,
+    "reason": "invalid command: incr delta is not a signed 64-bit decimal integer"
+  }
+```
+
+与 set/delete 一样，incr 也遵守提交与应用顺序：只有已提交且轮到它应用
+时才改值；未提交的 incr 不会提前改值或暴露数值错误；重复复制同一条日志
+或提交位置未前进的心跳不会重复累加。`applyKV` 省略或为 `false` 时，
+`incr` 仍只是普通日志字符串，输出中没有任何应用字段。
+
 ### 应用错误不等于调用失败
 
 - `applyError` / `finalApplyError` 出现在**正常的输出 JSON** 中，进程退出码
