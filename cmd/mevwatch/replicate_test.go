@@ -713,6 +713,140 @@ func TestCLIApplyKVIncrTermConflictDisabledShape(t *testing.T) {
 	}
 }
 
+// TestCLIApplyKVIncrOverflowStuckThenSuffixReplacement 端到端锁定“应用因 incr
+// 溢出停住 × 任期冲突替换未提交后缀”相遇时的公开 JSON：
+//   - 初始任期 1、三条任期 1 的日志、提交位置 2：idx1 set count=最大整数已生效，
+//     idx2 incr count=1 因 MaxInt64+1 溢出让应用停在 1（错误指向 idx2），idx3
+//     incr count=-1 尚未提交，不能提前减一消除错误；
+//   - 请求一（任期 2，前置 idx2/任期 1）用任期 2 的 set count=0 与 incr count=1
+//     替换旧 idx3 并追加 idx4，leaderCommit=4：合法后缀替换照常接受，任期升到 2、
+//     提交到 4，最终日志保留两条已提交记录、旧减一命令消失、新后缀完整出现；
+//     但新命令即使格式正确且已复制、已提交也不生效，计数仍是最大整数，应用位置
+//     仍为 1，逐条结果与最终结果都保留 idx2 的同一溢出原因；
+//   - 请求二（任期 3，匹配 idx1）试图以不同任期改写已提交的 idx2：按覆盖已提交
+//     条目拒绝（无 conflict 键），较高任期 3 保留，日志、提交位置、键值表与首次
+//     应用错误均不变。两条请求各自保留当时的接受/拒绝结果。
+func TestCLIApplyKVIncrOverflowStuckThenSuffixReplacement(t *testing.T) {
+	input := `{
+  "currentTerm": 1,
+  "committedIndex": 2,
+  "log": [
+    {"index": 1, "term": 1, "command": "set count=9223372036854775807"},
+    {"index": 2, "term": 1, "command": "incr count=1"},
+    {"index": 3, "term": 1, "command": "incr count=-1"}
+  ],
+  "applyKV": true,
+  "requests": [
+    {"term": 2, "prevLogIndex": 2, "prevLogTerm": 1, "leaderCommit": 4,
+     "entries": [
+       {"index": 3, "term": 2, "command": "set count=0"},
+       {"index": 4, "term": 2, "command": "incr count=1"}
+     ]},
+    {"term": 3, "prevLogIndex": 1, "prevLogTerm": 1, "leaderCommit": 4,
+     "entries": [
+       {"index": 2, "term": 3, "command": "set count=0"},
+       {"index": 3, "term": 3, "command": "set count=1"},
+       {"index": 4, "term": 3, "command": "incr count=1"}
+     ]}
+  ]
+}`
+	var stdout, stderr bytes.Buffer
+	code := runReplicateIO(strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("replication verdict (including rejection) is normal output, stderr must be empty, got %q", stderr.String())
+	}
+	var out mevwatch.ReplicateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	if len(out.Results) != 2 {
+		t.Fatalf("expected 2 results in request order, got %+v", out.Results)
+	}
+
+	// 请求一：合法后缀替换接受；复制推进，但应用停在 idx2 的溢出错误上。
+	first := out.Results[0]
+	if !first.Accepted || first.Reason != mevwatch.ReasonOK {
+		t.Fatalf("legal suffix replacement must be accepted: %+v", first)
+	}
+	if first.Conflict != nil {
+		t.Fatalf("accepted replacement must not carry a conflict hint: %+v", first.Conflict)
+	}
+	if first.Term != 2 || first.CommittedIndex != 4 {
+		t.Fatalf("first result state = term %d ci %d, want term 2 ci 4",
+			first.Term, first.CommittedIndex)
+	}
+	if first.AppliedIndex == nil || *first.AppliedIndex != 1 {
+		t.Fatalf("first result appliedIndex = %+v, want 1 (stuck before the overflow entry)",
+			first.AppliedIndex)
+	}
+	if first.ApplyError == nil || first.ApplyError.Index != 2 ||
+		first.ApplyError.Reason != mevwatch.ApplyReasonIncrOverflow {
+		t.Fatalf("first result applyError = %+v, want index 2 overflow", first.ApplyError)
+	}
+
+	// 请求二：覆盖已提交的 idx2 被拒；高任期保留，其余（含首次应用错误）不变。
+	second := out.Results[1]
+	if second.Accepted || second.Reason != mevwatch.ReasonWouldOverwriteCommitted {
+		t.Fatalf("overwriting committed idx2 must be rejected, got %+v", second)
+	}
+	if second.Conflict != nil {
+		t.Fatalf("committed-overwrite rejection must not carry a conflict hint: %+v", second.Conflict)
+	}
+	if second.Term != 3 || second.CommittedIndex != 4 {
+		t.Fatalf("second result state = term %d ci %d, want term 3 ci 4",
+			second.Term, second.CommittedIndex)
+	}
+	if second.AppliedIndex == nil || *second.AppliedIndex != 1 {
+		t.Fatalf("second result appliedIndex = %+v, want 1", second.AppliedIndex)
+	}
+	if second.ApplyError == nil || second.ApplyError.Index != 2 ||
+		second.ApplyError.Reason != mevwatch.ApplyReasonIncrOverflow {
+		t.Fatalf("second result applyError = %+v, want the original index 2 overflow error",
+			second.ApplyError)
+	}
+
+	// 最终状态：任期升到 3；提交位置 4；日志为原两条已提交记录加任期 2 的新后缀，
+	// 旧的 incr count=-1 消失。
+	if out.FinalTerm != 3 || out.FinalCommittedIndex != 4 {
+		t.Fatalf("unexpected final state: term=%d ci=%d", out.FinalTerm, out.FinalCommittedIndex)
+	}
+	wantLog := []mevwatch.LogEntry{
+		{Index: 1, Term: 1, Command: "set count=9223372036854775807"},
+		{Index: 2, Term: 1, Command: "incr count=1"},
+		{Index: 3, Term: 2, Command: "set count=0"},
+		{Index: 4, Term: 2, Command: "incr count=1"},
+	}
+	if len(out.FinalLog) != len(wantLog) {
+		t.Fatalf("final log has %d entries, want %d: %+v", len(out.FinalLog), len(wantLog), out.FinalLog)
+	}
+	for i, want := range wantLog {
+		if out.FinalLog[i] != want {
+			t.Fatalf("final log[%d] = %+v, want %+v (old decrement gone, new suffix intact)",
+				i, out.FinalLog[i], want)
+		}
+	}
+	// 已复制、已提交不等于已生效：计数保留最大整数，set count=0 未写入，应用停住。
+	if out.FinalAppliedIndex == nil || *out.FinalAppliedIndex != 1 {
+		t.Fatalf("finalAppliedIndex = %+v, want 1", out.FinalAppliedIndex)
+	}
+	if len(out.FinalKV) != 1 || out.FinalKV["count"] != "9223372036854775807" {
+		t.Fatalf("finalKV = %v, want only the max int64 string (newly committed suffix not applied)",
+			out.FinalKV)
+	}
+	if out.FinalApplyError == nil || out.FinalApplyError.Index != 2 ||
+		out.FinalApplyError.Reason != mevwatch.ApplyReasonIncrOverflow {
+		t.Fatalf("finalApplyError = %+v, want the original index 2 overflow error",
+			out.FinalApplyError)
+	}
+	// 覆盖已提交条目属于冲突/提交类拒绝，不是前置日志不匹配：输出不含 conflict 键。
+	if strings.Contains(stdout.String(), `"conflict"`) {
+		t.Fatalf("output must not contain a conflict hint:\n%s", stdout.String())
+	}
+}
+
 func TestCLIErrors(t *testing.T) {
 	cases := []string{
 		`not json`,
