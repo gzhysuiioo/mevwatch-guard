@@ -29,10 +29,10 @@ var ErrVersionConflict = errors.New("version already registered with different p
 // field is missing or null, a value has the wrong type, or a severity or
 // multiplier is out of range. The decoded struct cannot tell a missing
 // field from an explicit zero value, so such an archive would otherwise
-// compare under silently zeroed parameters (a zero displacement
-// multiplier even crashes detection). A comparison naming a corrupt
-// version is refused; the corrupt content is never replaced by the
-// enabled version, the built-in rules or defaults.
+// run under silently zeroed parameters (a zero displacement multiplier
+// even crashes detection). A comparison, review-range evaluation or replay
+// naming a corrupt version is refused; the corrupt content is never
+// replaced by the enabled version, the built-in rules or defaults.
 var ErrCorruptVersion = errors.New("archived rule version is corrupted")
 
 // SandwichRule configures the sandwich rule: whether it runs and the
@@ -299,16 +299,6 @@ func intactVersion(versions []json.RawMessage, id string) (RuleVersion, error) {
 		return v, nil
 	}
 	return RuleVersion{}, fmt.Errorf("%w: %s", ErrUnknownVersion, id)
-}
-
-// enabledVersion resolves the archive's currently enabled version. Archives
-// written before rule versions existed have no marker and run the built-in
-// rules.
-func (d archiveData) enabledVersion() (RuleVersion, error) {
-	if d.EnabledVersion == "" {
-		return BuiltinVersion(), nil
-	}
-	return findVersion(d, d.EnabledVersion)
 }
 
 // RegisterVersion validates raw as a rule version spec and stores it in the
