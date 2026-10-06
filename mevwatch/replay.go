@@ -399,9 +399,47 @@ func readArchive(dir string) (archiveData, error) {
 	return data, nil
 }
 
-// replayArchiveDoc mirrors the archive file the way a replay reads and
-// writes it: records, suppressions, alert records and reviews are fully
-// decoded, but each registered version is kept as its raw stored document.
+// replayRecord mirrors one archived record the way a replay reads and
+// writes it, keeping the embedded rule-version declaration as its raw
+// stored document — the same shape a report query and alert generation
+// use. The decoded struct cannot tell a missing field, an explicit null
+// or a wrong-typed value from a real one: decoding the embedded version
+// into the struct would show a decayed report under silently zeroed
+// parameters, and a null declaration would come back as a nil pointer and
+// be misread as the legacy built-in shape. A zero-length Version means
+// the "version" key is absent entirely, which alone is the legacy,
+// pre-version format interpreted under the built-in rules; any present
+// value is kept byte for byte and re-validated before the report is
+// returned. The key is omitted again on write only when it was absent, so
+// a legacy record is never given a "version": null it did not have.
+type replayRecord struct {
+	ChainID     string          `json:"chainId"`
+	BlockHash   string          `json:"blockHash"`
+	BlockNumber int64           `json:"blockNumber"`
+	Swaps       []Swap          `json:"swaps"`
+	Findings    []ReportFinding `json:"findings"`
+	Version     json.RawMessage `json:"version,omitempty"`
+}
+
+func (r replayRecord) id() blockID { return blockID{r.ChainID, r.BlockHash} }
+
+// replayDoc mirrors the archive file the way a replay reads and writes
+// it: records keep their embedded version declarations as raw stored
+// documents (see replayRecord), each registered version is likewise kept
+// raw, and suppressions, alert records and reviews are fully decoded.
+type replayDoc struct {
+	Records        []replayRecord     `json:"records"`
+	Versions       []json.RawMessage  `json:"versions,omitempty"`
+	EnabledVersion string             `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression      `json:"suppressions,omitempty"`
+	AlertRecords   []ProcessingRecord `json:"alerts,omitempty"`
+	Reviews        []ReviewObject     `json:"reviews,omitempty"`
+}
+
+// replayArchiveDoc mirrors the archive file the way version registration,
+// enabling and listing read and write it: records, suppressions, alert
+// records and reviews are fully decoded, but each registered version is
+// kept as its raw stored document.
 // A corrupt version entry — a wrong-typed field, say — then cannot break
 // the read or masquerade as whole-archive corruption; the version this run
 // selects is judged on its own by intactVersion, and entries the run does
@@ -506,7 +544,12 @@ func parseBlocks(r io.Reader) ([]parsedBlock, error) {
 // first appearance. New blocks are judged under the archive's currently
 // enabled rule version; that version's stored document must still satisfy
 // the registration rules in full, or the whole replay fails with
-// ErrCorruptVersion before any report is produced.
+// ErrCorruptVersion before any report is produced. A block already
+// archived with identical content returns its original report, but only
+// after the report's own saved version declaration passes the same proof
+// a report query demands; a corrupt saved declaration fails the whole
+// replay with ErrCorruptVersion — no reports, no new blocks archived, the
+// archive untouched — wherever the block sits in the input.
 func ReplayFile(inputPath, dir string) ([]Report, error) {
 	return replayFile(inputPath, dir, "")
 }
@@ -540,6 +583,24 @@ func replayFile(inputPath, dir, versionID string) ([]Report, error) {
 // version fails the whole replay with ErrCorruptVersion — never a
 // substituted or zeroed parameter set — even when no input block would
 // have triggered the damaged rule.
+//
+// A block already archived with identical content is not re-detected: its
+// original report is returned with the conclusions, evidence, swap count
+// and full version parameters it archived. That report's saved version
+// declaration is first re-validated from its raw stored bytes with the
+// same proof a report query demands — a non-empty id, both rules each
+// with a boolean enabled and an integer severity 1-5, the displacement
+// multiplier an integer 2-100, no unknown or duplicated fields — and this
+// check is never skipped because the version selected for this run is
+// intact. Only a record with no "version" key at all keeps the legacy
+// built-in interpretation; a saved null, empty object or incomplete
+// declaration is corruption, and an id of "builtin" is validated like any
+// other. One corrupt saved declaration anywhere in the batch fails the
+// whole replay with ErrCorruptVersion naming the input line, the chain
+// and block, the readable saved id and the offending rule or field: no
+// report is returned, no new block is archived and the archive's existing
+// content is untouched, whether the decayed block precedes or follows the
+// new ones.
 func Replay(input io.Reader, dir string) ([]Report, error) {
 	return doReplay(input, dir, "")
 }
@@ -591,16 +652,20 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 	}
 	defer lock.Close()
 
-	// Decode with each registered version kept as its raw stored document,
-	// so a wrong-typed field in one version is that version's corruption,
-	// not whole-archive corruption, and the selected version's document can
-	// be re-validated from its bytes the same way a single-block comparison
-	// proves its version intact.
+	// Decode with each record's embedded version declaration and each
+	// registered version kept as its raw stored document: a decayed
+	// declaration is that report's or that version's corruption, judged on
+	// its own below, never whole-archive corruption, never silently zeroed
+	// parameters and never a nil pointer misread as the legacy built-in
+	// shape. The version this run selects is judged on its own by
+	// intactVersion, and entries the run does not select are written back
+	// byte for byte: a replay never repairs, completes or drops a stored
+	// version, not even a corrupt one.
 	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, err
 	}
-	data := replayArchiveDoc{Records: []record{}}
+	data := replayDoc{Records: []replayRecord{}}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return nil, fmt.Errorf("archive is corrupted: %w", err)
@@ -627,6 +692,12 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 
 	reports := make([]Report, 0, len(order))
 	changed := false
+	// The selected version is marshaled once; every new block archived this
+	// run embeds the same validated declaration.
+	versionRaw, err := json.Marshal(version)
+	if err != nil {
+		return nil, err
+	}
 	for _, occ := range order {
 		id := blockID{occ.block.ChainID, occ.block.BlockHash}
 		if idx, ok := archived[id]; ok {
@@ -636,20 +707,46 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 					"block %s/%s conflicts with the archived record", id.chainID, id.blockHash)}
 			}
 			// Identical re-import: return the original report, add nothing.
-			reports = append(reports, rec.report())
+			// The report is returned only after its saved version
+			// declaration passes the same proof a report query demands —
+			// re-validated from the raw stored bytes, never excused by the
+			// version this run selected. A corrupt declaration fails the
+			// whole replay before any report is returned or anything is
+			// written, naming the input line, the chain and block, the
+			// readable saved version id and the offending rule or field.
+			saved, err := archivedReportVersion(rec.Version)
+			if err != nil {
+				return nil, &LineError{Line: occ.line, Err: corruptReportError(
+					id.chainID, id.blockHash, rec.Version, err)}
+			}
+			reports = append(reports, Report{
+				ChainID:     rec.ChainID,
+				BlockHash:   rec.BlockHash,
+				BlockNumber: rec.BlockNumber,
+				SwapCount:   len(rec.Swaps),
+				Version:     saved,
+				Findings:    rec.Findings,
+			})
 			continue
 		}
-		rec := record{
+		rec := replayRecord{
 			ChainID:     occ.block.ChainID,
 			BlockHash:   occ.block.BlockHash,
 			BlockNumber: occ.block.BlockNumber,
 			Swaps:       occ.block.Swaps,
 			Findings:    DetectBlockWithRules(occ.block.Swaps, version.Rules),
-			Version:     &version,
+			Version:     versionRaw,
 		}
 		archived[id] = len(data.Records)
 		data.Records = append(data.Records, rec)
-		reports = append(reports, rec.report())
+		reports = append(reports, Report{
+			ChainID:     rec.ChainID,
+			BlockHash:   rec.BlockHash,
+			BlockNumber: rec.BlockNumber,
+			SwapCount:   len(rec.Swaps),
+			Version:     version,
+			Findings:    rec.Findings,
+		})
 		changed = true
 	}
 	if changed {
@@ -674,7 +771,7 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 // written before rule versions existed have no enabled marker and run the
 // built-in rules; the built-in version is constructed in code and always
 // intact.
-func resolveReplayVersion(data replayArchiveDoc, versionID string) (RuleVersion, error) {
+func resolveReplayVersion(data replayDoc, versionID string) (RuleVersion, error) {
 	id := versionID
 	if id == "" {
 		id = data.EnabledVersion
