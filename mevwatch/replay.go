@@ -305,7 +305,10 @@ type queryRecord struct {
 	BlockNumber int64           `json:"blockNumber"`
 	Swaps       []Swap          `json:"swaps"`
 	Findings    []ReportFinding `json:"findings"`
-	Version     json.RawMessage `json:"version"`
+	// omitempty keeps a legacy record that lacked the key keyless when an
+	// alert-generation run writes the archive back; a nil RawMessage would
+	// otherwise serialize as "version": null and itself become corruption.
+	Version json.RawMessage `json:"version,omitempty"`
 }
 
 // archivedReportVersion proves the version declaration embedded in an
@@ -693,6 +696,31 @@ func resolveReplayVersion(data replayArchiveDoc, versionID string) (RuleVersion,
 // zeroed parameters.
 type queryArchiveDoc struct {
 	Records []queryRecord `json:"records"`
+}
+
+// generateArchiveDoc mirrors the archive file the way one alert-generation
+// run reads and writes it: suppressions, the records already processed and
+// every section generation does not judge are written back unchanged
+// (registered versions stay raw documents, the same shape a replay keeps),
+// but each archived report keeps its embedded version declaration as its
+// raw stored document (queryRecord — the same shape a report query reads).
+// Generation decodes each declaration on its own and re-validates it from
+// those bytes before it can touch any conclusion, so a null, empty,
+// incomplete or wrong-typed declaration fails the whole run as report
+// corruption instead of decoding into silently zeroed parameters (enabled
+// false, severity 0, a zero displacement multiplier) or, for an explicit
+// null, masquerading as the built-in rules. A record with no version key at
+// all comes back as an empty RawMessage, the only legacy shape interpreted
+// under the built-in rules; on the write side omitempty keeps such a record
+// keyless rather than turning the absence into "version": null, while every
+// declaration actually present is preserved byte for byte.
+type generateArchiveDoc struct {
+	Records        []queryRecord      `json:"records"`
+	Versions       []json.RawMessage  `json:"versions,omitempty"`
+	EnabledVersion string             `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression      `json:"suppressions,omitempty"`
+	AlertRecords   []ProcessingRecord `json:"alerts,omitempty"`
+	Reviews        []ReviewObject     `json:"reviews,omitempty"`
 }
 
 // Query returns the archived report for one block identity. It only reads

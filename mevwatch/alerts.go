@@ -361,10 +361,39 @@ func sortRecords(records []ProcessingRecord) {
 // version switches and restarts idempotent. Channels are independent, and
 // blocks at the same height with different hashes are handled separately.
 //
-// All new records of one call are committed together or not at all. The
-// returned slice contains only records created by this call (alerts and
-// suppressions distinguished), sorted by height, block hash, tx hash and
-// kind; an empty result serializes as [].
+// Every report in the range is proven before this run can succeed: the
+// complete version declaration it archived is re-validated from its raw
+// bytes with the same proof registration, report queries, comparison,
+// evaluation and replay demand — a non-empty version identifier, both the
+// sandwich and displacement rules each with a boolean enabled and an
+// integer severity in 1-5, and the displacement multiplier an integer in
+// 2-100. A missing or null field or rule object, a wrong type, an
+// out-of-range number, an unknown field or rule, or a field declared twice
+// in one object (an exact repeat, an escaped spelling or a case-only
+// spelling that names the same field — even when both values agree) makes
+// the saved declaration corrupt; an explicit enabled:false is a legal off
+// state but the disabled rule still has to carry complete, in-range
+// parameters. Only an old-format record with no version key at all keeps
+// the built-in interpretation; null, an empty object and a partial object
+// do not. An id of "builtin" names the same saved declaration and is
+// validated in full rather than bypassing the check. A valid declaration
+// is used with the complete parameters it archived: nothing is completed
+// from the currently enabled version, a same-id registered version or
+// defaults, and the id need not still be registered.
+//
+// Any corrupt declaration in range fails the whole generation with
+// ErrCorruptVersion naming the chain, the block, the readable saved
+// version id and the offending rule or field — including when that report
+// has no findings, when every finding is below the threshold or when every
+// one of its findings was already processed: such a run is still a failure,
+// never a partial success. No processing record is created or saved for any
+// block in the call, and the archived reports, existing processing records
+// and suppression conditions are left untouched.
+//
+// Otherwise all new records of one call are committed together or not at
+// all. The returned slice contains only records created by this call
+// (alerts and suppressions distinguished), sorted by height, block hash, tx
+// hash and kind; an empty result serializes as [].
 func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64, minSeverity int) ([]ProcessingRecord, error) {
 	if strings.TrimSpace(chainID) == "" {
 		return nil, errors.New("chainId must be a non-empty string")
@@ -387,9 +416,21 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Read with each report's embedded version declaration kept as its raw
+	// stored document: the decoded struct cannot tell a missing enabled,
+	// severity or multiplier from an explicit zero value, and decoding an
+	// explicit null here is exactly the misread that used to explain a
+	// damaged report as the built-in rules. Every declaration is judged on
+	// its own from those bytes before a finding can become a record.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, err
+	}
+	data := generateArchiveDoc{Records: []queryRecord{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, fmt.Errorf("archive is corrupted: %w", err)
+		}
 	}
 	processed := make(map[alertKey]struct{}, len(data.AlertRecords))
 	for _, r := range data.AlertRecords {
@@ -397,7 +438,8 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 	}
 
 	created := []ProcessingRecord{}
-	for _, rec := range data.Records {
+	for i := range data.Records {
+		rec := &data.Records[i]
 		if rec.ChainID != chainID {
 			continue
 		}
@@ -405,7 +447,17 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 		if height < startHeight || height > endHeight {
 			continue
 		}
-		version := rec.ruleVersion()
+		// Prove the saved declaration before anything the report carries is
+		// used. The proof runs for every in-range report regardless of its
+		// findings, so a report with no conclusions, one whose conclusions
+		// are all below this run's threshold, or one whose conclusions were
+		// all processed before still fails the whole run when its version
+		// document decayed. A wholly absent version key is the one legacy
+		// shape and means builtin; null, {} and partial objects do not.
+		version, verr := archivedReportVersion(rec.Version)
+		if verr != nil {
+			return nil, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
+		}
 		for _, f := range rec.Findings {
 			if f.Severity < minSeverity {
 				// Below the threshold: no record is written, so the event
