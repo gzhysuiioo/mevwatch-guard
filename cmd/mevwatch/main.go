@@ -194,8 +194,14 @@ committedIndex, log entry index/term, request term/prevLogIndex/prevLogTerm/
 leaderCommit, entry index/term, matched case-insensitively): the whole input
 is rejected as a field type error naming the field location (e.g.
 requests[1].leaderCommit), instead of silently treating the null as zero.
-Omitting a field still applies its default, 0 keeps its ordinary meaning, and
-nulls in array fields or unknown keys are handled as before.
+When a recognized field name appears more than once in the same object
+including repeated log, requests or entries arrays, every occurrence is
+checked: a numeric null in any one of them rejects the input whether it
+appears before or after a number (array indexes count from 0 within that
+occurrence); duplicates without a numeric null are not additionally forbidden
+and the usual last-wins reading applies. Omitting a field still applies its
+default, 0 keeps its ordinary meaning, and nulls in array fields or unknown
+keys are handled as before.
 `)
 }
 
