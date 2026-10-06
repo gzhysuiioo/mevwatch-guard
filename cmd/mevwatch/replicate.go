@@ -71,13 +71,67 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// objectSchema 描述某一层次对象里已识别的字段：numerics 是显式写成 null 时
+// 必须拒绝整份输入的数值字段（标准拼写），arrays 是元素为对象的数组字段及其
+// 元素层次。字段名识别与 encoding/json 一致，只改变字母大小写的写法同样命中；
+// 错误位置始终使用这里的标准拼写而不是输入里的大小写变体。根状态、复制请求
+// 与日志条目共用同一套扫描逻辑，区别只在下面三份 schema。
+type objectSchema struct {
+	numerics []string
+	arrays   []arrayField
+}
+
+// arrayField 是一个已识别的对象数组字段：name 为标准字段名，elem 为数组元素
+// 所在层次的 schema。
+type arrayField struct {
+	name string
+	elem *objectSchema
+}
+
+var (
+	// 日志条目层次：log[i] 与 requests[r].entries[i] 是同一种对象。
+	entryObjectSchema = &objectSchema{numerics: []string{"index", "term"}}
+	// 复制请求层次：数值字段外还嵌套 entries 条目数组。
+	requestObjectSchema = &objectSchema{
+		numerics: []string{"term", "prevLogIndex", "prevLogTerm", "leaderCommit"},
+		arrays:   []arrayField{{name: "entries", elem: entryObjectSchema}},
+	}
+	// 根输入层次：初始状态的数值字段外还嵌套 log 与 requests 两个数组。
+	rootObjectSchema = &objectSchema{
+		numerics: []string{"currentTerm", "committedIndex"},
+		arrays: []arrayField{
+			{name: "log", elem: entryObjectSchema},
+			{name: "requests", elem: requestObjectSchema},
+		},
+	}
+)
+
+// numericName 在 key 命中本层次某个已识别数值字段时返回它的标准拼写。
+func (s *objectSchema) numericName(key string) (string, bool) {
+	for _, name := range s.numerics {
+		if strings.EqualFold(key, name) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// arrayField 在 key 命中本层次某个已识别数组字段时返回它的定义（含标准拼写）。
+func (s *objectSchema) arrayField(key string) (arrayField, bool) {
+	for _, field := range s.arrays {
+		if strings.EqualFold(key, field.name) {
+			return field, true
+		}
+	}
+	return arrayField{}, false
+}
+
 // nullNumericFieldPath 扫描整份输入 JSON 的 token 流，查找第一个被显式写成
 // null 的已识别数值字段，返回它的完整位置；没有时返回空串。检查范围是初始
 // 状态（currentTerm、committedIndex、log[i].index、log[i].term）与每条复制
 // 请求（term、prevLogIndex、prevLogTerm、leaderCommit 及 entries[j].index、
 // entries[j].term）；请求与条目下标从 0 开始，例如第二条请求的提交位置记为
-// requests[1].leaderCommit。字段名识别与 encoding/json 一致，只改变字母大小
-// 写的写法同样命中。
+// requests[1].leaderCommit。
 //
 // 必须扫描 token 而不能先解进 map[string]interface{}：map 解码遇到重复键只
 // 保留最后一次出现的值。{"currentTerm":null,"currentTerm":1} 里先出现的
@@ -95,107 +149,50 @@ func nullNumericFieldPath(data []byte) string {
 	if err != nil || tok != json.Delim('{') {
 		return ""
 	}
+	return scanObjectFields(dec, rootObjectSchema, "")
+}
+
+// scanObjectFields 扫描一个已读入起始 '{' 的对象的字段流，prefix 是该对象
+// 的位置前缀（根对象为空，其余层次以 "." 结尾，如 "requests[1]."）。每个键
+// 按所在层次的 schema 分派：已识别数值字段检查是否写成 null，已识别数组字段
+// 递归扫描元素，其余键的值整体跳过。返回第一个数值 null 的完整位置。
+func scanObjectFields(dec *json.Decoder, schema *objectSchema, prefix string) string {
 	for dec.More() {
 		key, ok := decodeKey(dec)
 		if !ok {
 			return ""
 		}
-		switch {
-		case strings.EqualFold(key, "currentTerm"), strings.EqualFold(key, "committedIndex"):
+		if name, ok := schema.numericName(key); ok {
 			if nullScalarPath(dec) {
-				return canonicalScalarPath(key)
-			}
-		case strings.EqualFold(key, "log"):
-			if path := scanEntryArray(dec, "log", ""); path != "" {
-				return path
-			}
-		case strings.EqualFold(key, "requests"):
-			if path := scanRequests(dec); path != "" {
-				return path
-			}
-		default:
-			skipValue(dec)
-		}
-	}
-	return ""
-}
-
-// scanRequests 扫描 requests 数组的完整 token 流，包括重复出现时的每一份
-// 数组，返回其中第一个数值 null 的完整位置。
-func scanRequests(dec *json.Decoder) string {
-	tok, err := dec.Token()
-	if err != nil {
-		return ""
-	}
-	if tok != json.Delim('[') {
-		// requests 不是数组（如 null 或被写成对象）：数组字段本身沿用既有
-		// 处理，类型错误由随后的类型化解码按既有格式报告。这里必须把整个值
-		// 消费完——起始分隔符已经读出，若就此返回，调用方的循环会落到对象
-		// 内部，把其中的字段当成外层字段，或提前结束扫描漏掉后面真正的
-		// 数值 null。
-		if d, ok := tok.(json.Delim); ok {
-			skipRest(dec, d)
-		}
-		return ""
-	}
-	for i := 0; dec.More(); i++ {
-		tok, err := dec.Token()
-		if err != nil {
-			return ""
-		}
-		if tok != json.Delim('{') {
-			// 非对象请求元素不可能含已识别字段；若它本身是容器仍要消费完整。
-			if d, ok := tok.(json.Delim); ok {
-				skipRest(dec, d)
+				return prefix + name
 			}
 			continue
 		}
-		prefix := fmt.Sprintf("requests[%d]", i)
-		for dec.More() {
-			key, ok := decodeKey(dec)
-			if !ok {
-				return ""
+		if field, ok := schema.arrayField(key); ok {
+			if path := scanObjectArray(dec, field.elem, prefix+field.name); path != "" {
+				return path
 			}
-			switch {
-			case strings.EqualFold(key, "term"),
-				strings.EqualFold(key, "prevLogIndex"),
-				strings.EqualFold(key, "prevLogTerm"),
-				strings.EqualFold(key, "leaderCommit"):
-				if nullScalarPath(dec) {
-					return prefix + "." + canonicalScalarPath(key)
-				}
-			case strings.EqualFold(key, "entries"):
-				if path := scanEntryArray(dec, "entries", prefix+"."); path != "" {
-					return path
-				}
-			default:
-				skipValue(dec)
-			}
+			continue
 		}
-		if _, err := dec.Token(); err != nil { // 请求对象的 '}'
-			return ""
-		}
-	}
-	if _, err := dec.Token(); err != nil {
-		return ""
+		skipValue(dec)
 	}
 	return ""
 }
 
-// scanEntryArray 扫描 log 或 entries 数组的完整 token 流（数组字段重复出现
-// 时由调用方对每一份数组分别调用），返回第一个 index/term 为 null 的条目
-// 字段完整位置。arrayName 只用于选择下标前缀的写法：根日志为 log[i]，请求
-// 条目为 requests[r].entries[i]（parentPrefix 已含 "requests[r]."）。
-func scanEntryArray(dec *json.Decoder, arrayName, parentPrefix string) string {
+// scanObjectArray 扫描一个对象数组字段的完整 token 流（数组字段重复出现时由
+// 调用方对每一份数组分别调用），arrayPath 是数组自身的位置（如 "log" 或
+// "requests[r].entries"），返回第一个数值 null 的完整位置。
+func scanObjectArray(dec *json.Decoder, elem *objectSchema, arrayPath string) string {
 	tok, err := dec.Token()
 	if err != nil {
 		return ""
 	}
 	if tok != json.Delim('[') {
 		// 数组字段本身为 null 或其他类型（如被写成对象）：沿用既有处理，
-		// 类型错误由类型化解码报告。与 scanRequests 相同，必须把整个值
-		// 消费完，否则对象内部的 term/index 等字段会冒充请求自身或合法
-		// 条目的字段，其后的真实字段也会被漏检。
+		// 类型错误由随后的类型化解码按既有格式报告。这里必须把整个值消费
+		// 完——起始分隔符已经读出，若就此返回，调用方的循环会落到对象内部，
+		// 把其中的 term/index 等字段当成外层已识别字段，其后的真实数值
+		// null 也会被漏检。
 		if d, ok := tok.(json.Delim); ok {
 			skipRest(dec, d)
 		}
@@ -207,31 +204,21 @@ func scanEntryArray(dec *json.Decoder, arrayName, parentPrefix string) string {
 			return ""
 		}
 		if tok != json.Delim('{') {
-			// 非对象条目不可能含已识别字段；若它本身是容器仍要消费完整。
+			// 非对象元素不可能含已识别字段；若它本身是容器仍要消费完整。
 			if d, ok := tok.(json.Delim); ok {
 				skipRest(dec, d)
 			}
 			continue
 		}
-		prefix := parentPrefix + arrayName + fmt.Sprintf("[%d]", i)
-		for dec.More() {
-			key, ok := decodeKey(dec)
-			if !ok {
-				return ""
-			}
-			if strings.EqualFold(key, "index") || strings.EqualFold(key, "term") {
-				if nullScalarPath(dec) {
-					return prefix + "." + canonicalEntryFieldPath(key)
-				}
-			} else {
-				skipValue(dec)
-			}
+		prefix := fmt.Sprintf("%s[%d].", arrayPath, i)
+		if path := scanObjectFields(dec, elem, prefix); path != "" {
+			return path
 		}
-		if _, err := dec.Token(); err != nil { // 条目对象的 '}'
+		if _, err := dec.Token(); err != nil { // 元素对象的 '}'
 			return ""
 		}
 	}
-	if _, err := dec.Token(); err != nil {
+	if _, err := dec.Token(); err != nil { // 数组的 ']'
 		return ""
 	}
 	return ""
@@ -295,28 +282,5 @@ func skipRest(dec *json.Decoder, open json.Delim) {
 				depth--
 			}
 		}
-	}
-}
-
-// canonicalScalarPath 把命中的根状态或请求数值字段名归一为标准字段名，错误
-// 位置始终使用标准拼写而不是输入里的大小写变体。
-func canonicalScalarPath(key string) string {
-	for _, name := range []string{"currentTerm", "committedIndex", "term", "prevLogIndex", "prevLogTerm", "leaderCommit"} {
-		if strings.EqualFold(key, name) {
-			return name
-		}
-	}
-	return key
-}
-
-// canonicalEntryFieldPath 把条目数值字段名归一为 index/term 的标准拼写。
-func canonicalEntryFieldPath(key string) string {
-	switch {
-	case strings.EqualFold(key, "index"):
-		return "index"
-	case strings.EqualFold(key, "term"):
-		return "term"
-	default:
-		return key
 	}
 }
