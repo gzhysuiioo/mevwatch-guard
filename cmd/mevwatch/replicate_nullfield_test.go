@@ -187,3 +187,94 @@ func TestCLINullValidationKeepsExistingSemantics(t *testing.T) {
 		}
 	}
 }
+
+// 本应是数组的 log/requests/entries 被写成对象时，对象内部的字段不能冒充
+// 外层已识别字段：扫描必须把整个错误对象消费掉，让类型化解码按既有 JSON
+// 类型错误格式指出这个数组字段本身，而不是声称某个数值字段被写成 null。
+func TestCLINonObjectArrayFieldKeepsInnerFieldsOutOfScan(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		path  string
+	}{
+		{
+			// requests 内的 currentTerm 不是顶层字段；错误必须指出 requests 本身。
+			name:  "requests object inner field is not top-level",
+			input: `{"requests":{"currentTerm":null}}`,
+			path:  "requests",
+		},
+		{
+			name:  "log object inner field is not an entry field",
+			input: `{"log":{"index":null,"term":null}}`,
+			path:  "log",
+		},
+		{
+			// entries 内的 term/index 既不是请求自身的字段，也不是合法条目的字段。
+			name: "entries object inner fields are not request or entry fields",
+			input: `{"currentTerm":1,"requests":[
+			  {"term":1,"prevLogIndex":0,"prevLogTerm":0,"leaderCommit":0,
+			   "entries":{"term":null,"index":null}}
+			]}`,
+			path: "entries",
+		},
+		{
+			// 错误对象里的嵌套内容同样不算已识别字段。
+			name:  "nested content inside error object is not recognized",
+			input: `{"requests":{"nested":{"log":[{"index":null}]}}}`,
+			path:  "requests",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			message := runReplicateExpectInputError(t, tc.input, tc.path)
+			if strings.Contains(message, "got null") {
+				t.Fatalf("error object inner fields must not be reported as numeric nulls, got: %q", message)
+			}
+		})
+	}
+}
+
+// 错误对象不能遮住其后的真实字段：log 被写成对象时，后面 committedIndex 的
+// 数值 null 仍要在读取阶段被报告，而不是只报告 log 的类型错误。多个真实
+// 字段都为 null 时按输入顺序报告第一个，错误对象内部的同名字段不参与次序。
+func TestCLIErrorObjectDoesNotHideLaterRealNull(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		path  string
+	}{
+		{
+			name:  "real null after log object",
+			input: `{"log":{},"committedIndex":null}`,
+			path:  "committedIndex",
+		},
+		{
+			name:  "real null after requests object",
+			input: `{"requests":{"term":null},"currentTerm":null}`,
+			path:  "currentTerm",
+		},
+		{
+			name: "real null after entries object",
+			input: `{"requests":[
+			  {"term":1,"prevLogIndex":0,"prevLogTerm":0,"leaderCommit":0,"entries":{"term":null}}
+			],"committedIndex":null}`,
+			path: "committedIndex",
+		},
+		{
+			// 数组字段重复出现时，前一份错误对象不影响后一份数组里的真实 null。
+			name:  "duplicate array field: object then array with real null",
+			input: `{"log":{},"log":[{"index":null,"term":1,"command":"a"}]}`,
+			path:  "log[0].index",
+		},
+		{
+			name:  "first real null in input order wins",
+			input: `{"committedIndex":null,"currentTerm":null}`,
+			path:  "committedIndex",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runReplicateExpectInputError(t, tc.input, tc.path)
+		})
+	}
+}

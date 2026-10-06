@@ -128,8 +128,14 @@ func scanRequests(dec *json.Decoder) string {
 		return ""
 	}
 	if tok != json.Delim('[') {
-		// requests 不是数组（如 null）：数组字段本身沿用既有处理，其值仍需
-		// 从 token 流中消费掉。
+		// requests 不是数组（如 null 或被写成对象）：数组字段本身沿用既有
+		// 处理，类型错误由随后的类型化解码按既有格式报告。这里必须把整个值
+		// 消费完——起始分隔符已经读出，若就此返回，调用方的循环会落到对象
+		// 内部，把其中的字段当成外层字段，或提前结束扫描漏掉后面真正的
+		// 数值 null。
+		if d, ok := tok.(json.Delim); ok {
+			skipRest(dec, d)
+		}
 		return ""
 	}
 	for i := 0; dec.More(); i++ {
@@ -186,7 +192,14 @@ func scanEntryArray(dec *json.Decoder, arrayName, parentPrefix string) string {
 		return ""
 	}
 	if tok != json.Delim('[') {
-		return "" // 数组字段本身为 null 或其他类型：沿用既有处理
+		// 数组字段本身为 null 或其他类型（如被写成对象）：沿用既有处理，
+		// 类型错误由类型化解码报告。与 scanRequests 相同，必须把整个值
+		// 消费完，否则对象内部的 term/index 等字段会冒充请求自身或合法
+		// 条目的字段，其后的真实字段也会被漏检。
+		if d, ok := tok.(json.Delim); ok {
+			skipRest(dec, d)
+		}
+		return ""
 	}
 	for i := 0; dec.More(); i++ {
 		tok, err := dec.Token()
