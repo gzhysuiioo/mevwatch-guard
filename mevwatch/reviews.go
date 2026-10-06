@@ -531,6 +531,22 @@ func currentReviewStatus(obj ReviewObject) string {
 	return obj.Revisions[len(obj.Revisions)-1].Status
 }
 
+// reviewHistoryArchiveDoc mirrors the archive file the way a review-history
+// query reads it: every record keeps its embedded rule-version declaration
+// as its raw stored document — the same shape a report query keeps it in —
+// while the review streams are fully decoded. The decoded struct cannot
+// tell a missing field, an explicit null or a wrong-typed value from a real
+// one, so decoding the version into the struct would explain a decayed
+// report under silently zeroed parameters (enabled false, severity 0, a
+// zero displacement multiplier) or read a written null as the built-in
+// rules. A corrupt declaration on a record the query does not target, or on
+// a registered version, is that entry's damage and never blocks the target
+// conclusion's intact history.
+type reviewHistoryArchiveDoc struct {
+	Records []queryRecord  `json:"records"`
+	Reviews []ReviewObject `json:"reviews"`
+}
+
 // ReviewHistoryQuery returns the current status and version of one
 // conclusion object plus every revision in ascending version order. Each
 // revision keeps its full submission content, and the response carries the
@@ -538,6 +554,30 @@ func currentReviewStatus(obj ReviewObject) string {
 // raw swap evidence. An identity without review data reports status
 // unreviewed, version 0 and an empty list; when no archived conclusion
 // matches the identity, original is null.
+//
+// When an archived conclusion does match, the version declaration its
+// report saved is first held to exactly the integrity proof a report query
+// enforces, re-validated from the raw stored bytes: a non-empty version
+// identifier, both the sandwich and displacement rules each declaring a
+// boolean enabled and an integer severity 1-5, and the displacement
+// multiplier an integer 2-100. A missing or null field or rule object, a
+// wrong type, an out-of-range number, an unknown field or rule, or a field
+// declared twice in one object (an exact repeat, an escaped spelling or a
+// case-only spelling naming the same field, even when both values agree)
+// makes the saved declaration corrupt, and the whole query fails with
+// ErrCorruptVersion naming the target chain and block, the readable saved
+// version id and the offending rule or field — no partial history is
+// returned. An explicit enabled:false is a legal off state, but the
+// disabled rule still has to carry complete, in-range parameters. Only an
+// old-format record with no "version" key at all keeps the built-in
+// interpretation: a written null, an empty object or an incomplete
+// declaration is corruption, and an id of "builtin" is validated like any
+// other rather than bypassing the check. A legal declaration is used
+// exactly as saved — parameters are never completed from the currently
+// enabled or a same-id registered version, and the saved id need not still
+// be registered — while a corrupt declaration on another block or on a
+// registered version never blocks the target's intact history. The query
+// never re-detects conclusions and never modifies the archive.
 func ReviewHistoryQuery(dir, chainID, blockHash, txHash, kind string) (ReviewHistory, error) {
 	if strings.TrimSpace(chainID) == "" || strings.TrimSpace(blockHash) == "" ||
 		strings.TrimSpace(txHash) == "" {
@@ -569,19 +609,42 @@ func ReviewHistoryQuery(dir, chainID, blockHash, txHash, kind string) (ReviewHis
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with every record's embedded version declaration kept as its
+	// raw stored document, the same shape a report query reads: a
+	// wrong-typed or decayed field in one report's declaration is that
+	// report's corruption, not whole-archive corruption, and can neither
+	// decode into silently zeroed parameters nor be explained as the
+	// built-in rules from a written null. Only the target record's
+	// declaration is judged; corrupt siblings and corrupt registered
+	// versions stay unread.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return ReviewHistory{}, err
 	}
-	if rec, f, ok := findArchivedConclusion(data, key); ok {
+	var doc reviewHistoryArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return ReviewHistory{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	if rec, f, ok := findArchivedQueryConclusion(doc.Records, key); ok {
+		// Prove the saved declaration before the original conclusion is
+		// explained by it — exactly the standard a standalone report query
+		// enforces. A corrupt declaration fails the whole query rather than
+		// presenting the conclusion under zeroed, defaulted or built-in
+		// parameters the report never archived.
+		version, verr := archivedReportVersion(rec.Version)
+		if verr != nil {
+			return ReviewHistory{}, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
+		}
 		out.Original = &ReviewOriginal{
 			BlockNumber: rec.BlockNumber,
 			Finding:     f,
-			Version:     rec.ruleVersion(),
+			Version:     version,
 		}
 	}
-	for i := range data.Reviews {
-		obj := data.Reviews[i]
+	for i := range doc.Reviews {
+		obj := doc.Reviews[i]
 		if obj.key() != key {
 			continue
 		}
@@ -594,6 +657,23 @@ func ReviewHistoryQuery(dir, chainID, blockHash, txHash, kind string) (ReviewHis
 		out.Revisions = []ReviewRevision{}
 	}
 	return out, nil
+}
+
+// findArchivedQueryConclusion locates the raw-version record and the
+// finding for an identity, mirroring findArchivedConclusion over records
+// whose version declarations are still the stored bytes.
+func findArchivedQueryConclusion(records []queryRecord, key conclusionKey) (queryRecord, ReportFinding, bool) {
+	for _, rec := range records {
+		if rec.ChainID != key.chainID || rec.BlockHash != key.blockHash {
+			continue
+		}
+		for _, f := range rec.Findings {
+			if f.TxHash == key.txHash && f.Kind == key.kind {
+				return rec, f, true
+			}
+		}
+	}
+	return queryRecord{}, ReportFinding{}, false
 }
 
 // findArchivedConclusion locates the record and the finding for an identity.
