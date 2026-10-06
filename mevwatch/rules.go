@@ -699,26 +699,56 @@ type CompareResult struct {
 	Changed          []FindingChange `json:"changed"`
 }
 
-// rawVersionArchiveDoc mirrors the archive file the way a comparison and a
-// review-range evaluation read it: records and reviews are fully decoded,
-// but each registered version is kept as its raw stored document. A corrupt
-// version entry — a wrong-typed field, say — then cannot break the read or
-// masquerade as whole-archive corruption; it is judged on its own by
-// intactVersion, so a corrupt sibling never contaminates an intact
-// candidate or the built-in version.
-type rawVersionArchiveDoc struct {
-	Records  []record          `json:"records"`
+// compareArchiveDoc mirrors the archive file the way a comparison reads
+// it: the embedded version declaration of every record is kept as its raw
+// stored document (queryRecord), the same shape a report query, a replay
+// and alert generation use, and each registered version is kept raw too.
+// A wrong-typed or decayed field in one saved declaration then cannot
+// break the read or masquerade as whole-archive corruption, and — crucially
+// — cannot decode into silently zeroed parameters or be explained as the
+// built-in rules from a written null: the target record's declaration is
+// judged on its own from those bytes before any comparison is returned.
+type compareArchiveDoc struct {
+	Records  []queryRecord     `json:"records"`
 	Versions []json.RawMessage `json:"versions"`
-	Reviews  []ReviewObject    `json:"reviews"`
 }
 
 // Compare re-runs detection for one archived block under the given
 // registered version and diffs the conclusions against the archived
 // report. It only reads the archive: the original input file is not
 // needed, and neither the archived report nor the enabled version is
-// modified. The named version's stored document must still satisfy the
-// registration rules in full; a corrupt one fails with ErrCorruptVersion
-// rather than comparing under zeroed or substituted parameters.
+// modified.
+//
+// The historical side is the target block's own saved report and is held
+// to exactly the integrity proof a report query enforces before any
+// result is returned: its declaration is re-validated from the raw stored
+// bytes — a non-empty id, sandwich and displacement each declaring a
+// boolean enabled and an integer severity 1-5, and a displacement
+// multiplier 2-100; a missing or null field or rule object, a wrong type,
+// an out-of-range number, an unknown field or rule, or a field declared
+// twice in one object (an exact repeat, an escaped spelling or a
+// case-only spelling naming the same field, even with identical values;
+// the two rules declaring their own parameters side by side is not a
+// repeat) makes the saved declaration corrupt. An explicit enabled:false
+// is a legal off state, but the disabled rule still has to carry
+// complete, in-range parameters. Only an old-format record with no
+// version key at all keeps the built-in interpretation: a written null,
+// an empty object or an incomplete declaration is corruption, and an id
+// of "builtin" names the same saved declaration and cannot bypass the
+// check. A legal candidate version never rescues a damaged historical
+// declaration: the whole comparison fails with ErrCorruptVersion naming
+// the target chain and block, the readable saved version id and the
+// offending rule or field — even when the block has no swaps or its
+// archived findings are empty, so no empty comparison can skip the
+// proof. The historical parameters come from that report alone, never
+// from the currently enabled or a same-id registered version, and the
+// saved id need not still be registered.
+//
+// The named candidate version's stored document must likewise still
+// satisfy the registration rules in full; a corrupt one fails with
+// ErrCorruptVersion rather than comparing under zeroed or substituted
+// parameters. An unknown block stays ErrUnknownBlock and an unknown or
+// corrupt candidate version keeps its existing error behavior.
 func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if _, err := os.Stat(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -736,13 +766,13 @@ func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if err != nil {
 		return CompareResult{}, err
 	}
-	var doc rawVersionArchiveDoc
+	var doc compareArchiveDoc
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return CompareResult{}, fmt.Errorf("archive is corrupted: %w", err)
 		}
 	}
-	var rec *record
+	var rec *queryRecord
 	for i := range doc.Records {
 		if doc.Records[i].ChainID == chainID && doc.Records[i].BlockHash == blockHash {
 			rec = &doc.Records[i]
@@ -752,10 +782,27 @@ func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if rec == nil {
 		return CompareResult{}, ErrUnknownBlock
 	}
-	// The requested version must be intact in the archive: re-validate its
-	// stored document before judging anything, so a corrupt version fails
-	// the same way even when the block has no swaps and detection would
-	// produce no conclusions at all.
+	// The historical side is this block's own saved report and has to pass
+	// exactly the integrity proof a report query demands before any result
+	// is returned — re-validated from the declaration's raw stored bytes,
+	// not the decoded struct. A written null would otherwise leave the
+	// version pointer nil and be explained as the built-in rules, and a
+	// missing enabled/severity/multiplier would decode as an explicit zero
+	// value and compare under silently zeroed parameters; an empty object,
+	// a wrong type, an out-of-range number, an unknown rule or field and a
+	// repeated field are damage of the same kind. A legal candidate can
+	// never rescue this declaration, and the check runs unconditionally —
+	// even for a block with no swaps or an empty findings array — so no
+	// empty comparison can skip it. Only a wholly absent version key (a
+	// zero-length RawMessage) is the legacy shape explained by builtin.
+	originalVersion, err := archivedReportVersion(rec.Version)
+	if err != nil {
+		return CompareResult{}, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, err)
+	}
+	// The requested candidate version must also be intact in the archive:
+	// re-validate its stored document before judging anything, so a corrupt
+	// version fails the same way even when the block has no swaps and
+	// detection would produce no conclusions at all.
 	compared, err := intactVersion(doc.Versions, versionID)
 	if err != nil {
 		return CompareResult{}, err
@@ -808,7 +855,7 @@ func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 		ChainID:          rec.ChainID,
 		BlockHash:        rec.BlockHash,
 		BlockNumber:      rec.BlockNumber,
-		OriginalVersion:  rec.ruleVersion(),
+		OriginalVersion:  originalVersion,
 		ComparedVersion:  compared,
 		OriginalFindings: original,
 		ComparedFindings: rejudged,

@@ -667,6 +667,19 @@ func sortReviewDetails(details []ReviewDetail) {
 	})
 }
 
+// rawVersionArchiveDoc mirrors the archive file the way a review-range
+// evaluation reads it: records and reviews are fully decoded, but each
+// registered version is kept as its raw stored document. A corrupt version
+// entry — a wrong-typed field, say — then cannot break the read or
+// masquerade as whole-archive corruption; it is judged on its own by
+// intactVersion, so a corrupt sibling never contaminates an intact
+// candidate or the built-in version.
+type rawVersionArchiveDoc struct {
+	Records  []record          `json:"records"`
+	Versions []json.RawMessage `json:"versions"`
+	Reviews  []ReviewObject    `json:"reviews"`
+}
+
 // EvaluateReviews re-judges every archived block on chainID in the inclusive
 // range [startHeight, endHeight] under the given registered rule version and
 // compares the candidate conclusions against archived originals, using only
