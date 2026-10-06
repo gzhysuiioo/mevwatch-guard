@@ -531,6 +531,20 @@ func currentReviewStatus(obj ReviewObject) string {
 	return obj.Revisions[len(obj.Revisions)-1].Status
 }
 
+// historyArchiveDoc mirrors the archive file the way a review-history
+// query reads it: the target record's embedded version declaration is kept
+// as its raw stored document — the same shape a report query, a comparison
+// and a review-range evaluation keep it in — while reviews are fully
+// decoded. A wrong-typed field in the target's declaration can then be
+// re-validated from its raw bytes instead of decoding into silently zeroed
+// parameters, and a written null cannot be mistaken for an absent legacy
+// key. Damage confined to a registered version or another record the query
+// never opens is not part of this document's judgment.
+type historyArchiveDoc struct {
+	Records []queryRecord  `json:"records"`
+	Reviews []ReviewObject `json:"reviews"`
+}
+
 // ReviewHistoryQuery returns the current status and version of one
 // conclusion object plus every revision in ascending version order. Each
 // revision keeps its full submission content, and the response carries the
@@ -538,6 +552,32 @@ func currentReviewStatus(obj ReviewObject) string {
 // raw swap evidence. An identity without review data reports status
 // unreviewed, version 0 and an empty list; when no archived conclusion
 // matches the identity, original is null.
+//
+// When an archived conclusion matches, its report's saved version
+// declaration is re-validated from its raw bytes with the exact integrity
+// proof a report query enforces before the history is returned: a non-empty
+// version identifier, both the sandwich and displacement rules each with a
+// boolean enabled and an integer severity 1-5, and a displacement
+// multiplier 2-100. A missing or null field or rule object, a wrong type,
+// an out-of-range number, an unknown field or rule, or a field declared
+// twice in one object (an exact repeat, an escaped spelling or a
+// case-only spelling naming the same field, even with identical values)
+// makes the saved declaration corrupt; an explicit enabled:false is a
+// legal off state but the disabled rule still has to carry complete,
+// in-range parameters. Only an old-format record with no "version" key at
+// all keeps the built-in interpretation: a written null, an empty object
+// or a partial declaration is corruption, and an id of "builtin" is
+// validated like every other id rather than bypassing the check.
+//
+// On corruption the whole query fails with ErrCorruptVersion naming the
+// target chain and block, the readable saved version id and the offending
+// rule or field — no history JSON and no partial original are returned.
+// The legal declaration is used exactly as saved, with parameters never
+// zero-filled, completed from the currently enabled or a same-id
+// registered version, or re-detected, and its id need not still be
+// registered. Damage confined to other records or to the registered
+// versions section never blocks the target's history. The query is
+// read-only: success or failure rewrites nothing.
 func ReviewHistoryQuery(dir, chainID, blockHash, txHash, kind string) (ReviewHistory, error) {
 	if strings.TrimSpace(chainID) == "" || strings.TrimSpace(blockHash) == "" ||
 		strings.TrimSpace(txHash) == "" {
@@ -569,19 +609,42 @@ func ReviewHistoryQuery(dir, chainID, blockHash, txHash, kind string) (ReviewHis
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with the target record's embedded version declaration kept as
+	// its raw stored document, the same shape a report query uses, so its
+	// declaration is re-validated from those bytes rather than decoded into
+	// silently zeroed parameters or explained as the built-in rules from a
+	// written null.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return ReviewHistory{}, err
 	}
-	if rec, f, ok := findArchivedConclusion(data, key); ok {
+	var doc historyArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return ReviewHistory{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	if rec, f, ok := findHistoryConclusion(doc.Records, key); ok {
+		// Prove the saved declaration before the original conclusion and its
+		// detection parameters are returned. A wholly absent version key is
+		// the only legacy shape and means builtin; every declaration that was
+		// actually written must stand on its own, and a corrupt one fails the
+		// whole query rather than presenting a zero-filled or built-in
+		// explanation. A legal declaration is used exactly as saved: nothing is
+		// borrowed from the enabled or a registered version, the saved id need
+		// not still be registered, and the conclusion is never re-detected.
+		version, verr := archivedReportVersion(rec.Version)
+		if verr != nil {
+			return ReviewHistory{}, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
+		}
 		out.Original = &ReviewOriginal{
 			BlockNumber: rec.BlockNumber,
 			Finding:     f,
-			Version:     rec.ruleVersion(),
+			Version:     version,
 		}
 	}
-	for i := range data.Reviews {
-		obj := data.Reviews[i]
+	for i := range doc.Reviews {
+		obj := doc.Reviews[i]
 		if obj.key() != key {
 			continue
 		}
@@ -594,6 +657,23 @@ func ReviewHistoryQuery(dir, chainID, blockHash, txHash, kind string) (ReviewHis
 		out.Revisions = []ReviewRevision{}
 	}
 	return out, nil
+}
+
+// findHistoryConclusion locates the record and the finding for an identity
+// among records whose embedded version declaration is still raw.
+func findHistoryConclusion(records []queryRecord, key conclusionKey) (*queryRecord, ReportFinding, bool) {
+	for i := range records {
+		rec := &records[i]
+		if rec.ChainID != key.chainID || rec.BlockHash != key.blockHash {
+			continue
+		}
+		for _, f := range rec.Findings {
+			if f.TxHash == key.txHash && f.Kind == key.kind {
+				return rec, f, true
+			}
+		}
+	}
+	return nil, ReportFinding{}, false
 }
 
 // findArchivedConclusion locates the record and the finding for an identity.
