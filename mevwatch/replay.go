@@ -285,6 +285,60 @@ func (r record) ruleVersion() RuleVersion {
 	return BuiltinVersion()
 }
 
+// queryRecord mirrors one archived record the way a report query reads it.
+// Every business field is decoded normally, but the archived rule-version
+// declaration is kept as its raw stored document. The decoded struct cannot
+// tell a missing field, an explicit null or a wrong-typed value from a real
+// one: decoding the embedded version into the struct would show a decayed
+// report under silently zeroed parameters (enabled false, severity 0, a
+// zero displacement multiplier), and — because a null or incomplete
+// declaration carries no usable id — risk explaining it as the built-in
+// rules. A zero-length Version means the "version" key is absent entirely
+// (a value-type RawMessage is left untouched for a missing key), which
+// alone is the legacy, pre-version format interpreted under the built-in
+// rules; any present value — the bytes "null", {} or an object — is kept
+// byte for byte and must be re-validated from those bytes before the
+// report is shown.
+type queryRecord struct {
+	ChainID     string          `json:"chainId"`
+	BlockHash   string          `json:"blockHash"`
+	BlockNumber int64           `json:"blockNumber"`
+	Swaps       []Swap          `json:"swaps"`
+	Findings    []ReportFinding `json:"findings"`
+	Version     json.RawMessage `json:"version"`
+}
+
+// archivedReportVersion proves the version declaration embedded in an
+// archived record still satisfies every registration rule, re-validating
+// the raw document with the same parser registrations pass. A wholly
+// absent "version" key is the only legacy shape and means the built-in
+// rules; anything actually saved — null, an empty object, an incomplete
+// declaration, a wrong type, an out-of-range number, an unknown or
+// duplicated field — is corruption rather than a zero-filled or built-in
+// parameter set. An id of "builtin" names the same saved declaration and
+// is validated just like any other id; it never bypasses the check.
+func archivedReportVersion(raw json.RawMessage) (RuleVersion, error) {
+	if len(raw) == 0 {
+		return BuiltinVersion(), nil
+	}
+	return ParseRuleVersion(raw)
+}
+
+// corruptReportError names the chain and block a failed report query
+// targets, the saved version identifier when the document still carries a
+// readable one (so corruption is not mistaken for an unregistered
+// version), and the offending rule or field from the validation failure.
+// It wraps both ErrCorruptVersion and the underlying cause (for example
+// ErrDuplicateField).
+func corruptReportError(chainID, blockHash string, raw json.RawMessage, cause error) error {
+	if id := identifiableVersionID(raw); id != "unidentifiable version" {
+		return fmt.Errorf("%w: archived report for chain %s block %s uses version %q: %w",
+			ErrCorruptVersion, chainID, blockHash, id, cause)
+	}
+	return fmt.Errorf("%w: archived report for chain %s block %s: %w",
+		ErrCorruptVersion, chainID, blockHash, cause)
+}
+
 func (r record) report() Report {
 	return Report{
 		ChainID:     r.ChainID,
@@ -631,8 +685,44 @@ func resolveReplayVersion(data replayArchiveDoc, versionID string) (RuleVersion,
 	return intactVersion(data.Versions, id)
 }
 
+// queryArchiveDoc mirrors just the records a report query reads, keeping
+// each record's embedded version declaration as its raw stored document —
+// the same shape registered versions are kept in everywhere else — so a
+// wrong-typed field in one report's declaration fails that report's query
+// rather than breaking the whole-archive decode or decoding into silently
+// zeroed parameters.
+type queryArchiveDoc struct {
+	Records []queryRecord `json:"records"`
+}
+
 // Query returns the archived report for one block identity. It only reads
-// the archive; the original input file is not needed.
+// the archive; the original input file is not needed, and neither a
+// successful nor a failed query rewrites anything.
+//
+// Before the report is returned, the complete version declaration the
+// report archived is re-validated from its raw bytes with the same proof
+// registration, enable, comparison, evaluation and replay demand: a
+// non-empty version identifier, both the sandwich and displacement rules
+// each with a boolean enabled and an integer severity in 1-5, and the
+// displacement multiplier an integer in 2-100. A missing or null field or
+// rule object, a wrong type, an out-of-range number, an unknown field or
+// rule, or a field declared twice in one object (an exact repeat, an
+// escaped spelling or a case-only spelling that names the same field —
+// even when both values agree) makes the saved declaration corrupt. An
+// explicit enabled:false is a legal off state, not damage; the disabled
+// rule still has to carry complete, in-range parameters.
+//
+// Only an old-format record with no "version" key at all keeps the
+// original built-in interpretation. A declaration actually saved as null,
+// as an empty object or only in part is corruption, and an id of
+// "builtin" is validated like every other id rather than bypassing the
+// check. On corruption Query fails with ErrCorruptVersion naming the
+// target chain and block, the readable saved version id and the offending
+// rule or field; it never zero-fills the parameters, explains them as
+// built-in, or substitutes parameters from the currently enabled or a
+// registered version. The report uses the parameters it archived and is
+// never re-detected. A block that was never archived stays
+// ErrUnknownBlock.
 func Query(dir, chainID, blockHash string) (Report, error) {
 	if _, err := os.Stat(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -646,14 +736,43 @@ func Query(dir, chainID, blockHash string) (Report, error) {
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return Report{}, err
 	}
-	for _, rec := range data.Records {
-		if rec.ChainID == chainID && rec.BlockHash == blockHash {
-			return rec.report(), nil
+	var doc queryArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return Report{}, fmt.Errorf("archive is corrupted: %w", err)
 		}
 	}
-	return Report{}, ErrUnknownBlock
+	idx := -1
+	for i := range doc.Records {
+		if doc.Records[i].ChainID == chainID && doc.Records[i].BlockHash == blockHash {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return Report{}, ErrUnknownBlock
+	}
+	rec := &doc.Records[idx]
+
+	// Prove the saved declaration before presenting the report. A wholly
+	// absent version key is the only legacy shape and means builtin; every
+	// declaration that was actually written must stand on its own.
+	version, err := archivedReportVersion(rec.Version)
+	if err != nil {
+		return Report{}, corruptReportError(chainID, blockHash, rec.Version, err)
+	}
+
+	findings := rec.Findings
+	return Report{
+		ChainID:     rec.ChainID,
+		BlockHash:   rec.BlockHash,
+		BlockNumber: rec.BlockNumber,
+		SwapCount:   len(rec.Swaps),
+		Version:     version,
+		Findings:    findings,
+	}, nil
 }
