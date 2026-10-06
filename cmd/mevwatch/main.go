@@ -188,7 +188,14 @@ Extra output fields when applyKV is true:
 A request violating a field rule is recorded as one rejection without changing
 any state (including its higher term), and processing continues with the next
 request. Invalid initial state or unparseable input JSON ends the command with
-a non-zero exit code and an error message on standard error.
+a non-zero exit code and an error message on standard error. So does an
+explicit null written for any recognized numeric field (currentTerm,
+committedIndex, log entry index/term, request term/prevLogIndex/prevLogTerm/
+leaderCommit, entry index/term, matched case-insensitively): the whole input
+is rejected as a field type error naming the field location (e.g.
+requests[1].leaderCommit), instead of silently treating the null as zero.
+Omitting a field still applies its default, 0 keeps its ordinary meaning, and
+nulls in array fields or unknown keys are handled as before.
 `)
 }
 

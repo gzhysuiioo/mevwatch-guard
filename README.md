@@ -411,6 +411,14 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
 - **无法解析的输入 JSON** 或**非法初始状态**（如 `committedIndex` 超过日志
   长度、日志索引不连续、条目任期超过当前任期）不会产生输出 JSON，而是以
   **非零退出码**结束并在标准错误给出消息，例如：
+- **已识别的数值字段被显式写成 `null`** 同样在读取输入阶段拒绝整份输入：
+  范围包括初始状态的 `currentTerm`、`committedIndex`、初始日志条目的
+  `index`/`term`，以及每条请求的 `term`、`prevLogIndex`、`prevLogTerm`、
+  `leaderCommit` 和请求条目的 `index`/`term`（字段名只改变大小写同样命中）。
+  此时不产生结果 JSON，退出码为 1，标准错误以 `replicate:` 前缀指出字段的
+  完整位置（请求与条目从 0 计数，如 `requests[1].leaderCommit`）。省略字段
+  仍采用默认值（`{}` 仍是合法空初始状态），合法数字 `0` 保持原有含义，数组
+  字段与未知键里的 `null` 沿用已有处理。
 
 ```text
 $ echo '{not json' | go run ./cmd/mevwatch replicate
@@ -419,6 +427,10 @@ replicate: parse input JSON: invalid character 'n' looking for beginning of obje
 
 $ echo '{"currentTerm":1,"committedIndex":5,"log":[],"requests":[]}' | go run ./cmd/mevwatch replicate
 replicate: invalid initial state: committedIndex 5 exceeds log length 0
+# 退出码 1
+
+$ echo '{"currentTerm":2,"committedIndex":null,"log":[{"index":1,"term":1,"command":"a"}]}' | go run ./cmd/mevwatch replicate
+replicate: invalid field type: committedIndex must be a number, got null
 # 退出码 1
 ```
 
