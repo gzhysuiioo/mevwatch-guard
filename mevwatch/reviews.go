@@ -237,6 +237,17 @@ func (v *reviewViolation) submitError() error {
 	}
 }
 
+// ErrReviewDuplicateField reports a review submission document that names
+// the same field twice. Field names are compared after JSON unescaping and
+// with the decoder's own field-name folding, so two spellings that resolve
+// to the same field — differing only in case, or one spelling a letter as
+// a \u escape — are duplicates even when both carry the same value, and a
+// null next to a legal value is no exception. The typed decoder alone
+// cannot catch this: it silently keeps the last value, so a spec could
+// otherwise submit one status while carrying another, or hide a stale
+// expectedVersion behind a later number.
+var ErrReviewDuplicateField = errors.New("duplicate field in review spec")
+
 // ErrReviewTrailingData reports non-whitespace content after the single JSON
 // object that makes up a review submission: a second object, an unmatched
 // } or ], another JSON value or any other character.
@@ -252,9 +263,11 @@ var reviewFields = []string{
 }
 
 // reviewScanPolicy validates the shape of a review document with the shared
-// scanner, the same machine rule-version and suppression registrations use.
-// Duplicate-field detection stays with the typed decoder below: the scanner
-// proves exactly one balanced object surrounded by nothing but whitespace.
+// scanner, the same machine rule-version and suppression registrations use:
+// it proves exactly one balanced object surrounded by nothing but
+// whitespace, and that every supported field is declared at most once. An
+// exact re-spelling of an unknown key is left for the typed decoder below,
+// which rejects unknown fields outright.
 var reviewScanPolicy = specPolicy{
 	topObject:          "review spec",
 	known:              fieldTable(reviewFields...),
@@ -277,6 +290,10 @@ var reviewScanPolicy = specPolicy{
 	wrap: func(err error) error {
 		return fmt.Errorf("invalid review spec: %w", err)
 	},
+	duplicate: func(_ string, canonical, first, spelling string) error {
+		return fmt.Errorf("%w: field %q (declared as %q and %q)",
+			ErrReviewDuplicateField, canonical, first, spelling)
+	},
 	trailing: reviewTrailingData,
 }
 
@@ -296,7 +313,11 @@ func reviewTrailingData(raw []byte, offset int) error {
 // only, arrays, null, scalars and unclosed objects are not — and that no
 // byte other than whitespace follows the closing brace. Brackets inside
 // string values are field content, not structure: the tokenizer only treats
-// delimiters outside strings as object boundaries.
+// delimiters outside strings as object boundaries. Every supported field
+// may be declared at most once, compared after JSON unescaping with the
+// decoder's own field-name folding: a field spelled twice — equal values,
+// case-only variants or null beside a legal value included — rejects the
+// whole document before any value is read.
 func validateReviewDocument(raw []byte) error {
 	return scanJSONObject(raw, reviewScanPolicy)
 }
@@ -307,10 +328,14 @@ func validateReviewDocument(raw []byte) error {
 // array, null, any other standalone value or an unclosed object fail, and
 // a second object or value, an unmatched } or ] or any other non-whitespace
 // byte after the closing brace fails as trailing data — the valid prefix is
-// never accepted on its own. Identity fields and operator/reason/
-// submissionId must be non-empty, the status must be one of real,
-// false_positive or unreviewed, expectedVersion must be a non-negative
-// integer, and the kind must be a known conclusion kind.
+// never accepted on its own. Every supported field may be declared at most
+// once: two declarations of the same field — identical values included, a
+// null beside a legal value included, case-only or \u-escaped key spellings
+// included — fail the whole document naming the field, so the decoder can
+// never silently keep a later status or expectedVersion. Identity fields
+// and operator/reason/submissionId must be non-empty, the status must be
+// one of real, false_positive or unreviewed, expectedVersion must be a
+// non-negative integer, and the kind must be a known conclusion kind.
 func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
 	if err := validateReviewDocument(raw); err != nil {
 		return ReviewSubmission{}, err

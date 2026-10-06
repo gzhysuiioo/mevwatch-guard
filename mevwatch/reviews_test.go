@@ -337,6 +337,204 @@ func TestSubmitReviewCorruptSpecChangesNothing(t *testing.T) {
 	}
 }
 
+// TestParseReviewSubmissionDuplicateFieldsRejected pins that a document
+// declaring any supported field twice is refused as a whole: encoding/json
+// would otherwise keep the last value, so a later status could silently
+// override an earlier one or a later expectedVersion mask a stale base.
+// Identity fields, the submission id, operator, reason, status and the
+// expected version are all covered; equal values, a null beside a legal
+// value, case-only and \u-escaped key spellings are duplicates too.
+func TestParseReviewSubmissionDuplicateFieldsRejected(t *testing.T) {
+	good := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"alice","reason":"r","status":"real","expectedVersion":0}`
+	dup := func(field, declaration string) string {
+		switch field {
+		case "chainId":
+			return `{"chainId":"1","chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`
+		case "blockHash":
+			return `{"chainId":"1","blockHash":"0xa","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`
+		case "txHash":
+			return `{"chainId":"1","blockHash":"0xa","txHash":"0xv","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`
+		case "kind":
+			return `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`
+		case "submissionId":
+			return `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`
+		case "operator":
+			return `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","operator":"a","reason":"r","status":"real","expectedVersion":0}`
+		case "reason":
+			return `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","reason":"r","status":"real","expectedVersion":0}`
+		case "status":
+			return `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","status":"real","expectedVersion":0}`
+		case "expectedVersion":
+			return `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0,"expectedVersion":0}`
+		}
+		t.Fatalf("unhandled field %s declaration %s", field, declaration)
+		return ""
+	}
+	for _, field := range reviewFields {
+		t.Run(field, func(t *testing.T) {
+			_, err := ParseReviewSubmission([]byte(dup(field, "")))
+			if !errors.Is(err, ErrReviewDuplicateField) {
+				t.Fatalf("duplicate %s: got %v, want ErrReviewDuplicateField", field, err)
+			}
+			if !strings.Contains(err.Error(), field) {
+				t.Fatalf("error %q must name field %q", err.Error(), field)
+			}
+		})
+	}
+
+	conflicting := []struct {
+		name  string
+		spec  string
+		field string
+	}{
+		{
+			"two different statuses",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","status":"false_positive","expectedVersion":0}`,
+			"status",
+		},
+		{
+			"stale expected version hidden behind a later zero",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":5,"expectedVersion":0}`,
+			"expectedVersion",
+		},
+		{
+			"zero then stale expected version",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0,"expectedVersion":9}`,
+			"expectedVersion",
+		},
+		{
+			"status in upper case first",
+			strings.Replace(good, `"status":"real"`, `"STATUS":"real","status":"real"`, 1),
+			"status",
+		},
+		{
+			"status with letter escaped",
+			strings.Replace(good, `"status":"real"`, `"status":"real","sta\u0074us":"real"`, 1),
+			"status",
+		},
+		{
+			"null then a legal status",
+			strings.Replace(good, `"status":"real"`, `"status":null,"status":"real"`, 1),
+			"status",
+		},
+		{
+			"legal status then null",
+			strings.Replace(good, `"status":"real"`, `"status":"real","status":null`, 1),
+			"status",
+		},
+		{
+			"duplicate status wins over the invalid second value",
+			strings.Replace(good, `"status":"real"`, `"status":"real","status":"bogus"`, 1),
+			"status",
+		},
+	}
+	for _, tc := range conflicting {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseReviewSubmission([]byte(tc.spec))
+			if !errors.Is(err, ErrReviewDuplicateField) {
+				t.Fatalf("got %v, want ErrReviewDuplicateField", err)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("error %q must name field %q", err.Error(), tc.field)
+			}
+		})
+	}
+
+	// Field names and brackets appearing inside a string value are content,
+	// never a second declaration.
+	valueMentionsField := strings.Replace(good, `"reason":"r"`, `"reason":"status STATUS expectedVersion } ] {"`, 1)
+	sub, err := ParseReviewSubmission([]byte(valueMentionsField))
+	if err != nil {
+		t.Fatalf("field name inside a string value rejected: %v", err)
+	}
+	if sub.Reason != `status STATUS expectedVersion } ] {` {
+		t.Fatalf("reason not preserved verbatim: %q", sub.Reason)
+	}
+}
+
+// TestSubmitReviewDuplicateFieldSpecChangesNothing proves the duplicate
+// rejection happens entirely in parsing, before any archive state is
+// touched: no revision is appended, no version moves, the submission id
+// stays free, and reusing an already-stored id still fails as an input
+// error rather than coming back as the idempotent created:false retry or a
+// submission-id conflict.
+func TestSubmitReviewDuplicateFieldSpecChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	good := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":"real","expectedVersion":0}`
+	dupStatus := strings.Replace(good, `"status":"real"`, `"status":"real","status":"false_positive"`, 1)
+	dupVersion := strings.Replace(good, `"expectedVersion":0`, `"expectedVersion":9,"expectedVersion":0`, 1)
+	dupEscaped := strings.Replace(good, `"status":"real"`, `"status":"real","sta\u0074us":"real"`, 1)
+
+	for _, spec := range []string{dupStatus, dupVersion, dupEscaped} {
+		if _, err := ParseReviewSubmission([]byte(spec)); !errors.Is(err, ErrReviewDuplicateField) {
+			t.Fatalf("spec %q: got %v, want ErrReviewDuplicateField", spec, err)
+		}
+	}
+	hist, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 0 || hist.Status != ReviewStatusUnreviewed || len(hist.Revisions) != 0 {
+		t.Fatalf("rejected duplicate specs changed state: %+v", hist)
+	}
+
+	// The rejected id was never consumed: the legal document creates v1.
+	legal, err := ParseReviewSubmission([]byte(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := SubmitReview(dir, legal)
+	if err != nil || !res.Created || res.Version != 1 {
+		t.Fatalf("legal submit after duplicate rejections = %+v, %v", res, err)
+	}
+
+	// A duplicate-field document reusing the stored id — whether or not the
+	// collapsed values would match the stored revision — is the parsing
+	// failure. It must never become an idempotent created:false retry, and a
+	// collapsed value that differs from history must not degrade into a
+	// submission-id conflict; the CLI stops at parsing, and the object stays
+	// at version 1.
+	archiveBefore, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range []string{
+		// Same collapsed content as the stored revision.
+		strings.Replace(good, `"status":"real"`, `"status":"real","status":"real"`, 1),
+		// Collapsed status differs from the stored revision.
+		dupStatus,
+		// Collapsed expected version would itself be a version conflict.
+		dupVersion,
+		// Case-folded duplicate spelling.
+		strings.Replace(good, `"status":"real"`, `"STATUS":"real","status":"real"`, 1),
+		// A letter in the key is \u-escaped.
+		dupEscaped,
+	} {
+		if _, perr := ParseReviewSubmission([]byte(spec)); !errors.Is(perr, ErrReviewDuplicateField) {
+			t.Fatalf("spec %q: parse error = %v, want ErrReviewDuplicateField", spec, perr)
+		}
+	}
+	archiveAfter, err := os.ReadFile(filepath.Join(dir, archiveFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(archiveBefore, archiveAfter) {
+		t.Fatal("parsing duplicate-field specs must not touch the archive")
+	}
+	hist, err = ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 1 || hist.Status != ReviewStatusReal || len(hist.Revisions) != 1 {
+		t.Fatalf("duplicate reuse changed state: %+v", hist)
+	}
+	if hist.Revisions[0].SubmissionID != "r-1" || hist.Revisions[0].Status != ReviewStatusReal ||
+		hist.Revisions[0].ExpectedVersion != 0 {
+		t.Fatalf("stored revision altered: %+v", hist.Revisions[0])
+	}
+}
+
 func TestReviewHistoryQuery(t *testing.T) {
 	dir := t.TempDir()
 	mustReplay(t, dir, twoFindingsInput)

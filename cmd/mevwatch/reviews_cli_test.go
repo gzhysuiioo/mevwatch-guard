@@ -139,6 +139,125 @@ func TestReviewsSubmitTrailingBracketsRejectedFromFileAndStdin(t *testing.T) {
 	}
 }
 
+// TestReviewsSubmitDuplicateFieldsRejectedFromFileAndStdin drives the real
+// command both ways a user supplies a spec and proves a document declaring
+// a supported field twice is refused as an input error: exit 1, no success
+// JSON on stdout, the error names the duplicated field, no revision is
+// created and the submission id stays free — both before the id was ever
+// used and after it already belongs to a legal submission (in which case
+// the answer must be neither created:false nor a submission-id conflict).
+func TestReviewsSubmitDuplicateFieldsRejectedFromFileAndStdin(t *testing.T) {
+	dir := setupReviewCLIArchive(t)
+
+	// Duplicate statuses (different values), duplicate expectedVersion (a
+	// stale base masked by a later zero) and a case-folded/escaped key
+	// spelling.
+	dups := []struct {
+		name  string
+		spec  string
+		field string
+	}{
+		{
+			"two statuses",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":"real","status":"false_positive","expectedVersion":0}`,
+			"status",
+		},
+		{
+			"two expected versions",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":"real","expectedVersion":7,"expectedVersion":0}`,
+			"expectedVersion",
+		},
+		{
+			"status folded case",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","STATUS":"real","status":"real","expectedVersion":0}`,
+			"status",
+		},
+		{
+			"status key escaped",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":"real","sta\u0074us":"real","expectedVersion":0}`,
+			"status",
+		},
+		{
+			"null beside a legal status",
+			`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":null,"status":"real","expectedVersion":0}`,
+			"status",
+		},
+	}
+	for _, tc := range dups {
+		// From a spec file.
+		specPath := filepath.Join(t.TempDir(), "review.json")
+		if err := os.WriteFile(specPath, []byte(tc.spec), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res := runCLI(t, "reviews", "submit", dir, specPath)
+		if res.exitCode != 1 {
+			t.Fatalf("%s: file submit exited %d", tc.name, res.exitCode)
+		}
+		if strings.TrimSpace(res.stdout) != "" {
+			t.Fatalf("%s: file submit wrote success output: %q", tc.name, res.stdout)
+		}
+		if !strings.Contains(res.stderr, "duplicate") || !strings.Contains(res.stderr, tc.field) {
+			t.Fatalf("%s: file submit stderr = %q, want duplicate-field error naming %q", tc.name, res.stderr, tc.field)
+		}
+
+		// From standard input.
+		res = runCLIStdin(t, tc.spec, "reviews", "submit", dir, "-")
+		if res.exitCode != 1 {
+			t.Fatalf("%s: stdin submit exited %d", tc.name, res.exitCode)
+		}
+		if strings.TrimSpace(res.stdout) != "" {
+			t.Fatalf("%s: stdin submit wrote success output: %q", tc.name, res.stdout)
+		}
+		if !strings.Contains(res.stderr, "duplicate") || !strings.Contains(res.stderr, tc.field) {
+			t.Fatalf("%s: stdin submit stderr = %q, want duplicate-field error naming %q", tc.name, res.stderr, tc.field)
+		}
+	}
+
+	// Nothing was committed: state stays unreviewed at version 0 and the id
+	// was never consumed.
+	status, version, revisions := reviewHistoryState(t, dir)
+	if status != "unreviewed" || version != 0 || revisions != 0 {
+		t.Fatalf("duplicate specs changed state: %s/%d with %d revisions", status, version, revisions)
+	}
+
+	// The legal document now creates version 1.
+	specPath := filepath.Join(t.TempDir(), "review.json")
+	if err := os.WriteFile(specPath, []byte(cliReviewSpec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := runCLI(t, "reviews", "submit", dir, specPath)
+	if res.exitCode != 0 || !strings.Contains(res.stdout, `"created":true`) {
+		t.Fatalf("legal submit failed: %d %s %s", res.exitCode, res.stdout, res.stderr)
+	}
+
+	// Reusing the stored id in a duplicate-field document is still the input
+	// error — identical collapsed content included, differing collapsed
+	// content included — never created:false and never an id conflict.
+	reuses := []string{
+		`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"confirmed bot war","status":"real","status":"real","expectedVersion":0}`,
+		`{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"confirmed bot war","status":"real","status":"false_positive","expectedVersion":0}`,
+	}
+	for _, spec := range reuses {
+		res := runCLIStdin(t, spec, "reviews", "submit", dir, "-")
+		if res.exitCode != 1 {
+			t.Fatalf("duplicate reuse exited %d", res.exitCode)
+		}
+		if strings.Contains(res.stdout, `"created"`) {
+			t.Fatalf("duplicate reuse wrote a result: %q", res.stdout)
+		}
+		if !strings.Contains(res.stderr, "duplicate") {
+			t.Fatalf("duplicate reuse stderr = %q, want duplicate-field error", res.stderr)
+		}
+		if strings.Contains(res.stderr, "already used") {
+			t.Fatalf("duplicate reuse must not degrade into an id conflict: %q", res.stderr)
+		}
+	}
+	status, version, revisions = reviewHistoryState(t, dir)
+	if status != "real" || version != 1 || revisions != 1 {
+		t.Fatalf("duplicate reuse changed state: %s/%d with %d revisions", status, version, revisions)
+	}
+}
+
 // TestReviewsSubmitNonObjectAndUnclosedSpecs pins that the other
 // non-single-object shapes fail through the command as spec errors rather
 // than as version conflicts or unknown conclusions.
