@@ -481,6 +481,10 @@ func EnableVersion(dir, id string) (RuleVersion, error) {
 	return v, nil
 }
 
+// unidentifiableVersion is the label identifiableVersionID returns when a
+// stored document carries no readable id string.
+const unidentifiableVersion = "unidentifiable version"
+
 // identifiableVersionID recovers the best human-recognizable identifier a
 // stored version document still carries for an error message: the last
 // string occurrence of its id key, recognising it the way the decoder folds
@@ -492,7 +496,7 @@ func EnableVersion(dir, id string) (RuleVersion, error) {
 // id at all, has no identifiable version; its corruption is still reported
 // (ParseRuleVersion judges the document), just without a made-up name.
 func identifiableVersionID(entry json.RawMessage) string {
-	const unidentifiable = "unidentifiable version"
+	const unidentifiable = unidentifiableVersion
 	dec := json.NewDecoder(bytes.NewReader(entry))
 	first, err := dec.Token()
 	if err != nil {
