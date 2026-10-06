@@ -243,9 +243,9 @@ func (v *reviewViolation) submitError() error {
 var ErrReviewTrailingData = errors.New("unexpected trailing data after review spec")
 
 // reviewFields lists every field name a review submission document may
-// declare, in the struct's JSON spelling. The scanner only needs the table
-// to know which values are ordinary scalars; a review document is flat, so
-// no nested table exists.
+// declare, in the struct's JSON spelling. The scanner uses the table both
+// to know which values are ordinary scalars and to catch a known field
+// declared twice; a review document is flat, so no nested table exists.
 var reviewFields = []string{
 	"chainId", "blockHash", "txHash", "kind",
 	"submissionId", "operator", "reason", "status", "expectedVersion",
@@ -253,8 +253,9 @@ var reviewFields = []string{
 
 // reviewScanPolicy validates the shape of a review document with the shared
 // scanner, the same machine rule-version and suppression registrations use.
-// Duplicate-field detection stays with the typed decoder below: the scanner
-// proves exactly one balanced object surrounded by nothing but whitespace.
+// A review document is flat, so no nested table exists, and only known
+// fields take part in duplicate detection (an unknown key is left for the
+// typed decoder to reject).
 var reviewScanPolicy = specPolicy{
 	topObject:          "review spec",
 	known:              fieldTable(reviewFields...),
@@ -277,6 +278,9 @@ var reviewScanPolicy = specPolicy{
 	wrap: func(err error) error {
 		return fmt.Errorf("invalid review spec: %w", err)
 	},
+	duplicate: func(_ string, canonical, first, spelling string) error {
+		return fmt.Errorf("invalid review spec: duplicate field %q (declared as %q and %q)", canonical, first, spelling)
+	},
 	trailing: reviewTrailingData,
 }
 
@@ -294,9 +298,16 @@ func reviewTrailingData(raw []byte, offset int) error {
 // validateReviewDocument proves raw holds exactly one complete JSON object
 // — leading and trailing whitespace is fine, but empty input, whitespace
 // only, arrays, null, scalars and unclosed objects are not — and that no
-// byte other than whitespace follows the closing brace. Brackets inside
-// string values are field content, not structure: the tokenizer only treats
-// delimiters outside strings as object boundaries.
+// byte other than whitespace follows the closing brace. Inside the object
+// every known field may be declared at most once: field names are compared
+// after JSON unescaping with the decoder's own field-name folding, so two
+// spellings that resolve to the same field — differing only in case, like
+// status and STATUS, or in a compatibility character, like U+017F for s —
+// count as one duplicate declaration even when both carry the same value,
+// and the whole document is rejected rather than one value silently
+// winning. Brackets inside string values are field content, not structure:
+// the tokenizer only treats delimiters outside strings as object
+// boundaries.
 func validateReviewDocument(raw []byte) error {
 	return scanJSONObject(raw, reviewScanPolicy)
 }
@@ -307,10 +318,14 @@ func validateReviewDocument(raw []byte) error {
 // array, null, any other standalone value or an unclosed object fail, and
 // a second object or value, an unmatched } or ] or any other non-whitespace
 // byte after the closing brace fails as trailing data — the valid prefix is
-// never accepted on its own. Identity fields and operator/reason/
-// submissionId must be non-empty, the status must be one of real,
-// false_positive or unreviewed, expectedVersion must be a non-negative
-// integer, and the kind must be a known conclusion kind.
+// never accepted on its own. Every supported field may be declared at most
+// once: two declarations of the same field — under any spellings the
+// decoder folds together, and even when both carry the same value or one
+// carries null — are a duplicate and reject the whole document rather than
+// letting a later value override an earlier one. Identity fields and
+// operator/reason/submissionId must be non-empty, the status must be one of
+// real, false_positive or unreviewed, expectedVersion must be a
+// non-negative integer, and the kind must be a known conclusion kind.
 func ParseReviewSubmission(raw []byte) (ReviewSubmission, error) {
 	if err := validateReviewDocument(raw); err != nil {
 		return ReviewSubmission{}, err

@@ -285,6 +285,126 @@ func TestParseReviewSubmissionTrailingBracketsNameToken(t *testing.T) {
 	}
 }
 
+// TestParseReviewSubmissionDuplicateField pins that declaring any supported
+// field twice rejects the whole document — under any spellings the decoder
+// folds together, with identical values, and with one side null — instead
+// of letting the later value silently override the earlier one.
+func TestParseReviewSubmissionDuplicateField(t *testing.T) {
+	good := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"alice","reason":"r","status":"real","expectedVersion":0}`
+	dup := []struct {
+		name  string
+		spec  string
+		field string // canonical field name the error must carry
+	}{
+		{"status twice", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","status":"false_positive","expectedVersion":0}`, "status"},
+		{"status identical values", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","status":"real","expectedVersion":0}`, "status"},
+		{"status null then value", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":null,"status":"real","expectedVersion":0}`, "status"},
+		{"status value then null", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","status":null,"expectedVersion":0}`, "status"},
+		{"status case folded", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","STATUS":"real","expectedVersion":0}`, "status"},
+		{"status escaped spelling", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","sta\u0074us":"real","expectedVersion":0}`, "status"},
+		{"expectedVersion twice", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0,"expectedVersion":7}`, "expectedVersion"},
+		{"expectedVersion identical", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0,"expectedVersion":0}`, "expectedVersion"},
+		{"expectedVersion null then value", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":null,"expectedVersion":0}`, "expectedVersion"},
+		{"chainId twice", `{"chainId":"1","chainId":"2","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`, "chainId"},
+		{"blockHash twice", `{"chainId":"1","blockHash":"0xa","blockHash":"0xb","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`, "blockHash"},
+		{"txHash twice", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","txHash":"0xw","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`, "txHash"},
+		{"kind twice", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","kind":"displacement","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`, "kind"},
+		{"submissionId twice", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","submissionId":"t","operator":"a","reason":"r","status":"real","expectedVersion":0}`, "submissionId"},
+		{"operator twice", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","operator":"b","reason":"r","status":"real","expectedVersion":0}`, "operator"},
+		{"reason twice", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"s","operator":"a","reason":"r","reason":"q","status":"real","expectedVersion":0}`, "reason"},
+		{"kind case folded", `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","Kind":"sandwich","submissionId":"s","operator":"a","reason":"r","status":"real","expectedVersion":0}`, "kind"},
+	}
+	for _, tc := range dup {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseReviewSubmission([]byte(tc.spec))
+			if err == nil {
+				t.Fatal("duplicate field parsed")
+			}
+			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), `"`+tc.field+`"`) {
+				t.Fatalf("error %q does not name the duplicate field %q", err, tc.field)
+			}
+			if strings.Contains(err.Error(), "trailing") {
+				t.Fatalf("duplicate reported as trailing data: %q", err)
+			}
+		})
+	}
+
+	// A field name or brackets inside a string value is content, never a
+	// second declaration.
+	reasonMentionsField := strings.Replace(good, `"reason":"r"`, `"reason":"status says {\"status\":\"real\"} ]"`, 1)
+	sub, err := ParseReviewSubmission([]byte(reasonMentionsField))
+	if err != nil {
+		t.Fatalf("field name inside reason rejected: %v", err)
+	}
+	if sub.Reason != `status says {"status":"real"} ]` {
+		t.Fatalf("reason not preserved verbatim: %q", sub.Reason)
+	}
+
+	// A single declaration under a folded or escaped supported spelling is
+	// still a legal document.
+	folded := strings.Replace(good, `"status":"real"`, `"STATUS":"real"`, 1)
+	if sub, err := ParseReviewSubmission([]byte(folded)); err != nil || sub.Status != ReviewStatusReal {
+		t.Fatalf("single folded spelling: sub=%+v err=%v", sub, err)
+	}
+}
+
+// TestSubmitReviewDuplicateFieldChangesNothing proves the duplicate-field
+// failure happens entirely in parsing, before any archive state is touched:
+// no revision is appended, no version moves, and the submission id stays
+// free — even when that id already names a stored legal submission, the
+// ambiguous document is an input error, never the idempotent created:false
+// retry and never a submission-id conflict.
+func TestSubmitReviewDuplicateFieldChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+	mustReplay(t, dir, twoFindingsInput)
+	good := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":"real","expectedVersion":0}`
+	dupStatus := `{"chainId":"1","blockHash":"0xa","txHash":"0xv","kind":"sandwich","submissionId":"r-1","operator":"alice","reason":"r","status":"real","status":"false_positive","expectedVersion":0}`
+
+	if _, err := ParseReviewSubmission([]byte(dupStatus)); err == nil {
+		t.Fatal("duplicate-field spec parsed")
+	}
+	hist, err := ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 0 || hist.Status != ReviewStatusUnreviewed || len(hist.Revisions) != 0 {
+		t.Fatalf("rejected duplicate changed review state: %+v", hist)
+	}
+
+	// The rejected id is not consumed: the complete legal document with the
+	// same id creates version 1 normally.
+	sub, err := ParseReviewSubmission([]byte(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := SubmitReview(dir, sub)
+	if err != nil {
+		t.Fatalf("legal resubmit after rejection: %v", err)
+	}
+	if !res.Created || res.Version != 1 {
+		t.Fatalf("legal resubmit = %+v, want created at version 1", res)
+	}
+
+	// With the id stored, a duplicate-field resubmission — even one whose
+	// surviving value would match or differ from the stored revision — is
+	// still the parsing failure, not created:false and not a submission-id
+	// conflict.
+	for _, spec := range []string{dupStatus, strings.Replace(dupStatus, `"status":"false_positive"`, `"STATUS":"real"`, 1)} {
+		if _, err := ParseReviewSubmission([]byte(spec)); err == nil {
+			t.Fatalf("duplicate-field reuse of stored id parsed: %s", spec)
+		} else if errors.Is(err, ErrSubmissionConflict) {
+			t.Fatalf("duplicate-field reuse reported as submission conflict: %v", err)
+		}
+	}
+	hist, err = ReviewHistoryQuery(dir, "1", "0xa", "0xv", "sandwich")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Version != 1 || len(hist.Revisions) != 1 {
+		t.Fatalf("duplicate-field reuse mutated history: %+v", hist)
+	}
+}
+
 // TestSubmitReviewCorruptSpecChangesNothing proves the trailing-data
 // failure happens entirely in parsing, before any archive state is touched:
 // no revision is appended, no version moves, and the submission id stays
