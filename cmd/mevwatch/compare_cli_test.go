@@ -526,6 +526,159 @@ func TestCLICompareCorruptVersion(t *testing.T) {
 	}
 }
 
+// corruptStoredReportVersion rewrites the version declaration embedded in
+// one archived record (not the same-id entry in the versions registry).
+func corruptStoredReportVersion(t *testing.T, dir, chain, hash string, mutate func(ver map[string]any)) {
+	t.Helper()
+	archivePath := filepath.Join(dir, "archive.json")
+	raw, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range doc["records"].([]any) {
+		rec := r.(map[string]any)
+		if rec["chainId"] != chain || rec["blockHash"] != hash {
+			continue
+		}
+		ver, ok := rec["version"].(map[string]any)
+		if !ok {
+			t.Fatalf("record %s/%s has no object version to rewrite", chain, hash)
+		}
+		mutate(ver)
+		found = true
+	}
+	if !found {
+		t.Fatalf("record %s/%s not found in archive", chain, hash)
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archivePath, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// replaceStoredReportVersion replaces the embedded version declaration of
+// one record wholesale — used here for a written null.
+func replaceStoredReportVersion(t *testing.T, dir, chain, hash string, value any) {
+	t.Helper()
+	archivePath := filepath.Join(dir, "archive.json")
+	raw, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range doc["records"].([]any) {
+		rec := r.(map[string]any)
+		if rec["chainId"] == chain && rec["blockHash"] == hash {
+			rec["version"] = value
+			out, err := json.MarshalIndent(doc, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(archivePath, out, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+	}
+	t.Fatalf("record %s/%s not found in archive", chain, hash)
+}
+
+// TestCLICompareCorruptHistoricalVersion pins the user-facing failure when
+// the archived block's own version declaration has decayed: the candidate
+// (builtin) is intact, but a legal candidate must not carry a damaged
+// historical declaration into the comparison. The command exits 1, prints
+// no comparison JSON on stdout, and names the target chain, the block, the
+// readable historical version id and the offending field. The archive is
+// not rewritten.
+func TestCLICompareCorruptHistoricalVersion(t *testing.T) {
+	dir := setupCLIArchive(t)
+	// Damage only the report's embedded copy: the registered archA entry
+	// stays intact, so nothing can be borrowed back from the registry.
+	corruptStoredReportVersion(t, dir, "1", "0xblk", func(ver map[string]any) {
+		delete(ver["rules"].(map[string]any)["displacement"].(map[string]any), "multiplier")
+	})
+
+	res := runCLI(t, "compare", dir, "1", "0xblk", "builtin")
+	if res.exitCode != 1 {
+		t.Fatalf("exit = %d, want 1; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if res.stdout != "" {
+		t.Fatalf("corrupt historical declaration must print no comparison JSON, got %q", res.stdout)
+	}
+	for _, want := range []string{"corrupt", "1", "0xblk", "archA", "multiplier"} {
+		if !strings.Contains(res.stderr, want) {
+			t.Fatalf("stderr = %q, want substring %q", res.stderr, want)
+		}
+	}
+
+	// A written null used to be misread as the built-in rules; it must now
+	// fail the same way with no JSON.
+	replaceStoredReportVersion(t, dir, "1", "0xblk", nil)
+	res = runCLI(t, "compare", dir, "1", "0xblk", "candC")
+	if res.exitCode != 1 || res.stdout != "" || !strings.Contains(res.stderr, "corrupt") {
+		t.Fatalf("written null version must fail as corruption: exit=%d stdout=%q stderr=%q",
+			res.exitCode, res.stdout, res.stderr)
+	}
+
+	// The archive is untouched: the report stays under its stored archA
+	// conclusions and the enabled version stays liveB. A different block
+	// still compares normally.
+	other := runCLI(t, "compare", dir, "1", "0xother", "candC")
+	if other.exitCode != 0 {
+		t.Fatalf("an intact block must still compare: %d %q", other.exitCode, other.stderr)
+	}
+}
+
+// TestCLICompareCorruptHistoricalVersionEmptyBlock proves an empty
+// comparison can never skip the check: a block with swaps but no
+// conclusion under either version still fails when its saved declaration
+// is damaged.
+func TestCLICompareCorruptHistoricalVersionEmptyBlock(t *testing.T) {
+	dir := t.TempDir()
+	const (
+		archA = `{"id":"archA","rules":{"sandwich":{"enabled":true,"severity":4},"displacement":{"enabled":true,"severity":1,"multiplier":3}}}`
+		candC = `{"id":"candC","rules":{"sandwich":{"enabled":false,"severity":3},"displacement":{"enabled":true,"severity":4,"multiplier":2}}}`
+	)
+	for _, spec := range []string{archA, candC} {
+		if _, _, err := mevwatch.RegisterVersion(dir, []byte(spec)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inputPath := filepath.Join(t.TempDir(), "empty.jsonl")
+	// 15 vs 10 hits neither multiplier 3 nor 2: no conclusion either side.
+	if err := os.WriteFile(inputPath, []byte(cliBlockLine("1", "0none", 1,
+		cliSwapRecord("0g0", "p", "w", 15, 0),
+		cliSwapRecord("0g1", "p", "u", 10, 1),
+	)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mevwatch.ReplayFileWithVersion(inputPath, dir, "archA"); err != nil {
+		t.Fatal(err)
+	}
+	corruptStoredReportVersion(t, dir, "1", "0none", func(ver map[string]any) {
+		ver["rules"].(map[string]any)["displacement"].(map[string]any)["multiplier"] = 0
+	})
+	res := runCLI(t, "compare", dir, "1", "0none", "candC")
+	if res.exitCode != 1 {
+		t.Fatalf("exit = %d, want 1; stdout=%q stderr=%q", res.exitCode, res.stdout, res.stderr)
+	}
+	if res.stdout != "" || !strings.Contains(res.stderr, "corrupt") ||
+		!strings.Contains(res.stderr, "archA") || !strings.Contains(res.stderr, "multiplier") {
+		t.Fatalf("empty block failure shape wrong: stdout=%q stderr=%q", res.stdout, res.stderr)
+	}
+}
+
 // setupReviewCLIArchive builds an archive with one block carrying a
 // sandwich and a displacement, registers a mult3 candidate (multiplier 3
 // still flags the displacement at 50 > 30), and stores one false-positive

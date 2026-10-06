@@ -699,10 +699,10 @@ type CompareResult struct {
 	Changed          []FindingChange `json:"changed"`
 }
 
-// rawVersionArchiveDoc mirrors the archive file the way a comparison and a
-// review-range evaluation read it: records and reviews are fully decoded,
-// but each registered version is kept as its raw stored document. A corrupt
-// version entry — a wrong-typed field, say — then cannot break the read or
+// rawVersionArchiveDoc mirrors the archive file the way a review-range
+// evaluation reads it: records and reviews are fully decoded, but each
+// registered version is kept as its raw stored document. A corrupt version
+// entry — a wrong-typed field, say — then cannot break the read or
 // masquerade as whole-archive corruption; it is judged on its own by
 // intactVersion, so a corrupt sibling never contaminates an intact
 // candidate or the built-in version.
@@ -712,13 +712,53 @@ type rawVersionArchiveDoc struct {
 	Reviews  []ReviewObject    `json:"reviews"`
 }
 
+// compareArchiveDoc mirrors the archive file the way a single-block
+// comparison reads it: every record's embedded version declaration is kept
+// as its raw stored document — exactly the shape a report query reads with
+// queryRecord — and every registered version is kept raw too. A
+// wrong-typed field in one declaration then cannot break the read or
+// masquerade as whole-archive corruption: the compared block's saved
+// declaration is re-validated from those bytes by the same proof a report
+// query runs, while the named candidate is judged on its own by
+// intactVersion.
+type compareArchiveDoc struct {
+	Records  []queryRecord     `json:"records"`
+	Versions []json.RawMessage `json:"versions"`
+}
+
 // Compare re-runs detection for one archived block under the given
 // registered version and diffs the conclusions against the archived
 // report. It only reads the archive: the original input file is not
 // needed, and neither the archived report nor the enabled version is
-// modified. The named version's stored document must still satisfy the
-// registration rules in full; a corrupt one fails with ErrCorruptVersion
-// rather than comparing under zeroed or substituted parameters.
+// modified.
+//
+// Before any result is returned, the complete version declaration the
+// selected block archived is proved from its raw bytes with the exact
+// integrity check a report query runs: a non-empty version identifier,
+// both the sandwich and displacement rules each with a boolean enabled and
+// an integer severity in 1-5, and the displacement multiplier an integer
+// in 2-100. A missing or null field or rule object, a wrong type, an
+// out-of-range number, an unknown field or rule, or a field declared twice
+// in one object (an escaped spelling or a case-only spelling that names the
+// same field, even when both values agree) makes the saved declaration
+// corrupt; an explicitly disabled rule (enabled:false) is a legal off
+// state but still has to be declared completely. A legal candidate cannot
+// carry a damaged historical declaration into the comparison: the whole
+// compare fails with ErrCorruptVersion naming the target chain and block,
+// the readable saved version id and the offending rule or field — no
+// partial or empty result is returned, and this holds even when the block
+// has no swaps or carried no original conclusion. Only an old-format
+// record with no "version" key at all keeps the built-in interpretation;
+// a written null, an empty object or an incomplete declaration is
+// corruption, and an id of "builtin" is validated like every other id
+// rather than bypassing the check. The historical parameters come only
+// from the report itself, never from the enabled or a same-id registered
+// version, and the saved id need not still be registered.
+//
+// Independently, the named candidate's stored document must still satisfy
+// the registration rules in full; a corrupt one fails the same way rather
+// than comparing under zeroed or substituted parameters. A block that was
+// never archived stays ErrUnknownBlock.
 func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if _, err := os.Stat(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -736,21 +776,35 @@ func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 	if err != nil {
 		return CompareResult{}, err
 	}
-	var doc rawVersionArchiveDoc
+	var doc compareArchiveDoc
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return CompareResult{}, fmt.Errorf("archive is corrupted: %w", err)
 		}
 	}
-	var rec *record
+	idx := -1
 	for i := range doc.Records {
 		if doc.Records[i].ChainID == chainID && doc.Records[i].BlockHash == blockHash {
-			rec = &doc.Records[i]
+			idx = i
 			break
 		}
 	}
-	if rec == nil {
+	if idx < 0 {
 		return CompareResult{}, ErrUnknownBlock
+	}
+	rec := &doc.Records[idx]
+	// Prove the historical declaration the selected block archived before
+	// any conclusion — historical or candidate — is produced. The proof and
+	// the failure wording are exactly what a report query uses, so a written
+	// null can never be explained as the built-in rules and a missing
+	// parameter can never come back as a zero value; a wholly absent version
+	// key alone is the legacy shape archivedReportVersion maps to builtin.
+	// The check cannot be skipped by an empty block or an empty original
+	// conclusion set: a corrupt declaration fails the whole compare either
+	// way, candidate legality notwithstanding.
+	historical, err := archivedReportVersion(rec.Version)
+	if err != nil {
+		return CompareResult{}, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, err)
 	}
 	// The requested version must be intact in the archive: re-validate its
 	// stored document before judging anything, so a corrupt version fails
@@ -808,7 +862,7 @@ func Compare(dir, chainID, blockHash, versionID string) (CompareResult, error) {
 		ChainID:          rec.ChainID,
 		BlockHash:        rec.BlockHash,
 		BlockNumber:      rec.BlockNumber,
-		OriginalVersion:  rec.ruleVersion(),
+		OriginalVersion:  historical,
 		ComparedVersion:  compared,
 		OriginalFindings: original,
 		ComparedFindings: rejudged,
