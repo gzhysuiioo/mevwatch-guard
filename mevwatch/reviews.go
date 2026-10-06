@@ -667,15 +667,20 @@ func sortReviewDetails(details []ReviewDetail) {
 	})
 }
 
-// rawVersionArchiveDoc mirrors the archive file the way a review-range
-// evaluation reads it: records and reviews are fully decoded, but each
-// registered version is kept as its raw stored document. A corrupt version
-// entry — a wrong-typed field, say — then cannot break the read or
-// masquerade as whole-archive corruption; it is judged on its own by
-// intactVersion, so a corrupt sibling never contaminates an intact
-// candidate or the built-in version.
-type rawVersionArchiveDoc struct {
-	Records  []record          `json:"records"`
+// reviewArchiveDoc mirrors the archive file the way a review-range
+// evaluation reads it: reviews are fully decoded, each registered version
+// is kept as its raw stored document, and every record is kept in the
+// queryRecord shape a report query uses, with its embedded version
+// declaration kept as its raw stored bytes. A corrupt document — a
+// wrong-typed field in a registered version, or a decayed historical
+// declaration — then cannot break the read or masquerade as whole-archive
+// corruption: it is judged on its own from those bytes, so a corrupt
+// sibling never contaminates an intact candidate or the built-in version,
+// and a damaged report inside the selected chain and range is refused
+// rather than decoded into silently zeroed parameters or explained as the
+// built-in rules from a written null.
+type reviewArchiveDoc struct {
+	Records  []queryRecord     `json:"records"`
 	Versions []json.RawMessage `json:"versions"`
 	Reviews  []ReviewObject    `json:"reviews"`
 }
@@ -691,8 +696,36 @@ type rawVersionArchiveDoc struct {
 // review counts as pending, as does the new kind when the candidate changes
 // a tx's conclusion type; withdrawn objects behave as unreviewed. The call
 // is read-only: reports, the enabled version, reviews and alert records are
-// never modified. An empty range yields zero counts and an empty list. The
-// named candidate's stored document must still satisfy the registration
+// never modified. An empty range yields zero counts and an empty list.
+//
+// Every historical report the judgment actually reads — each archived
+// record on chainID whose height lies in the inclusive range, including
+// blocks with no swaps, no conclusions and no valid review — is held to
+// exactly the integrity proof a report query enforces before any statistic
+// or detail is produced: its embedded declaration is re-validated from the
+// raw stored bytes as a non-empty id with sandwich and displacement each
+// declaring a boolean enabled and an integer severity 1-5, and a
+// displacement multiplier 2-100. A missing or null field or rule object, a
+// wrong type, an out-of-range number, an unknown field or rule, or a field
+// declared twice in one object (an exact repeat, an escaped spelling or a
+// case-only spelling that names the same field, even when both values
+// agree) makes that historical report corrupt; an explicit enabled:false is
+// a legal off state but the disabled rule still has to carry complete,
+// in-range parameters. Only an old-format record with no version key at
+// all keeps the built-in interpretation: a written null, an empty object
+// or an incomplete declaration is corruption, and an id of "builtin" names
+// the same saved declaration and cannot bypass the check. One damaged
+// report in the selected chain and range fails the whole evaluation with
+// ErrCorruptVersion naming the chain, the block, the readable saved version
+// id and the offending rule or field — there are no partial results for the
+// intact blocks, and a legal candidate never rescues the damaged history.
+// Reports on other chains or outside the range are never read, so a
+// damaged declaration there does not block the evaluation. The historical
+// parameters come from that report alone, never from the currently enabled
+// or a same-id registered version, and the saved id need not still be
+// registered.
+//
+// The named candidate's stored document must still satisfy the registration
 // rules in full — both rules declared with non-null, well-typed, in-range
 // parameters, including a rule explicitly disabled (enabled:false) — or the
 // whole evaluation fails with ErrCorruptVersion before any judgment, even
@@ -736,16 +769,20 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 	}
 	defer lock.Close()
 
-	// Decode with each registered version kept as its raw stored document,
-	// so a wrong-typed field in one version is that version's corruption,
-	// not whole-archive corruption, and the candidate's document can be
-	// re-validated from its bytes the same way a single-block comparison
-	// proves its version intact.
+	// Decode with each registered version kept as its raw stored document
+	// and every record in the queryRecord shape a report query uses, with
+	// its embedded version declaration kept as raw bytes, so a wrong-typed
+	// field in one version is that version's corruption, not whole-archive
+	// corruption, the candidate's document can be re-validated from its
+	// bytes the same way a single-block comparison proves its version
+	// intact, and an in-range historical report is proved from its own raw
+	// declaration rather than decoded into silently zeroed parameters or a
+	// null-explained built-in report.
 	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return ReviewEvaluation{}, err
 	}
-	var doc rawVersionArchiveDoc
+	var doc reviewArchiveDoc
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return ReviewEvaluation{}, fmt.Errorf("archive is corrupted: %w", err)
@@ -775,7 +812,27 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 		if height < startHeight || height > endHeight {
 			continue
 		}
-		originalVersion := rec.ruleVersion()
+		// The historical side is this report's own saved declaration and
+		// has to pass exactly the integrity proof a report query demands
+		// before any judgment is made — re-validated from the
+		// declaration's raw stored bytes, not the decoded struct. A
+		// written null would otherwise leave the version pointer nil and
+		// be explained as the built-in rules, and a missing
+		// enabled/severity/multiplier would decode as an explicit zero
+		// value and judge under silently zeroed parameters; an empty
+		// object, a wrong type, an out-of-range number, an unknown rule or
+		// field and a repeated field are damage of the same kind. A legal
+		// candidate can never rescue this declaration, and the proof runs
+		// for every report in the selected chain and range
+		// unconditionally — even one with no swaps, no conclusions or no
+		// valid review — so one damaged report fails the whole evaluation
+		// with no partial results for the intact blocks. Only a wholly
+		// absent version key (a zero-length RawMessage) is the legacy
+		// shape explained by the built-in rules.
+		originalVersion, verr := archivedReportVersion(rec.Version)
+		if verr != nil {
+			return ReviewEvaluation{}, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
+		}
 		candidateFindings := DetectBlockWithRules(rec.Swaps, candidate.Rules)
 		candByKey := make(map[conclusionKey]ReportFinding, len(candidateFindings))
 		candByTx := make(map[string]ReportFinding, len(candidateFindings))
@@ -833,7 +890,7 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 		// type" side of a type change; either way it is unreviewed and
 		// pending.
 		for _, cf := range candidateFindings {
-			if _, sameKind := findOriginalFinding(rec, cf.TxHash, cf.Kind); sameKind {
+			if _, sameKind := findOriginalFinding(rec.Findings, cf.TxHash, cf.Kind); sameKind {
 				continue
 			}
 			details = append(details, ReviewDetail{
@@ -863,8 +920,8 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 	return result, nil
 }
 
-func findOriginalFinding(rec record, txHash, kind string) (ReportFinding, bool) {
-	for _, f := range rec.Findings {
+func findOriginalFinding(findings []ReportFinding, txHash, kind string) (ReportFinding, bool) {
+	for _, f := range findings {
 		if f.TxHash == txHash && f.Kind == kind {
 			return f, true
 		}
