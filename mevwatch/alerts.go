@@ -351,6 +351,41 @@ func sortRecords(records []ProcessingRecord) {
 	})
 }
 
+// alertRecord mirrors one archived record the way alert generation reads
+// and writes it: every business field is decoded normally, but the embedded
+// rule-version declaration is kept as its raw stored document — the same
+// shape a report query keeps it in. The decoded struct cannot tell a
+// missing field, an explicit null or a wrong-typed value from a real one,
+// so decoding the version into the struct would process a decayed report
+// under silently zeroed parameters (enabled false, severity 0, a zero
+// displacement multiplier) or explain a null declaration as the built-in
+// rules. A wholly absent "version" key is the only legacy shape; anything
+// actually saved is kept byte for byte and re-validated before the report's
+// conclusions are processed, and written back unchanged.
+type alertRecord struct {
+	ChainID     string          `json:"chainId"`
+	BlockHash   string          `json:"blockHash"`
+	BlockNumber int64           `json:"blockNumber"`
+	Swaps       []Swap          `json:"swaps"`
+	Findings    []ReportFinding `json:"findings"`
+	Version     json.RawMessage `json:"version,omitempty"`
+}
+
+// alertArchiveDoc mirrors the archive file the way alert generation reads
+// and writes it: records keep their embedded version declarations as raw
+// stored documents, and registered versions are kept raw too — generation
+// never consults the registry, so a corrupt registered version is that
+// version's damage, not whole-archive corruption, and is written back byte
+// for byte. Suppressions, processing records and reviews are decoded fully.
+type alertArchiveDoc struct {
+	Records        []alertRecord      `json:"records"`
+	Versions       []json.RawMessage  `json:"versions,omitempty"`
+	EnabledVersion string             `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression      `json:"suppressions,omitempty"`
+	AlertRecords   []ProcessingRecord `json:"alerts,omitempty"`
+	Reviews        []ReviewObject     `json:"reviews,omitempty"`
+}
+
 // GenerateAlerts turns archived conclusions in the inclusive range
 // [startHeight, endHeight] on chainID for channel into new processing
 // records. Detection is not re-run: the archived finding, evidence and rule
@@ -365,6 +400,23 @@ func sortRecords(records []ProcessingRecord) {
 // returned slice contains only records created by this call (alerts and
 // suppressions distinguished), sorted by height, block hash, tx hash and
 // kind; an empty result serializes as [].
+//
+// Every archived report in the range must still carry an intact version
+// declaration — the same proof a report query demands, re-validated from
+// the raw stored document with the parser registrations pass. A missing or
+// null field or rule object, a wrong type, an out-of-range number, an
+// unknown field or rule, or a field declared twice in one object makes the
+// whole generation fail with ErrCorruptVersion naming the chain, the block,
+// the readable saved version id and the offending rule or field — even when
+// that report has no conclusions, every conclusion is below the threshold,
+// or every conclusion was already processed. Only an old-format record with
+// no "version" key at all keeps the built-in interpretation; an explicit
+// null, an empty object or a partial declaration is corruption, and an id
+// of "builtin" is validated like any other. A legal declaration is used
+// exactly as saved: parameters are never completed from the enabled or a
+// registered version, and the id need not still be registered. A failed
+// generation changes nothing: reports, existing processing records and
+// suppressions are all left untouched.
 func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64, minSeverity int) ([]ProcessingRecord, error) {
 	if strings.TrimSpace(chainID) == "" {
 		return nil, errors.New("chainId must be a non-empty string")
@@ -387,9 +439,19 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with each record's embedded version declaration kept as its
+	// raw stored document, the same shape a report query uses: a decayed
+	// declaration is that report's corruption, judged on its own below,
+	// rather than whole-archive corruption or silently zeroed parameters.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, err
+	}
+	data := alertArchiveDoc{Records: []alertRecord{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, fmt.Errorf("archive is corrupted: %w", err)
+		}
 	}
 	processed := make(map[alertKey]struct{}, len(data.AlertRecords))
 	for _, r := range data.AlertRecords {
@@ -405,7 +467,16 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 		if height < startHeight || height > endHeight {
 			continue
 		}
-		version := rec.ruleVersion()
+		// Prove the saved declaration before any of the report's
+		// conclusions is processed — and even when none would be. A wholly
+		// absent version key is the only legacy shape and means builtin;
+		// every declaration that was actually written must stand on its
+		// own, and a corrupt one fails the whole generation before
+		// anything is written.
+		version, err := archivedReportVersion(rec.Version)
+		if err != nil {
+			return nil, corruptReportError(chainID, rec.BlockHash, rec.Version, err)
+		}
 		for _, f := range rec.Findings {
 			if f.Severity < minSeverity {
 				// Below the threshold: no record is written, so the event
