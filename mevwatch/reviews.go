@@ -667,15 +667,37 @@ func sortReviewDetails(details []ReviewDetail) {
 	})
 }
 
+// evaluateRecord mirrors one archived record the way a review-range
+// evaluation reads it: every business field is decoded normally, but the
+// embedded rule-version declaration is kept as its raw stored document —
+// the same shape a report query and alert generation keep it in. The
+// decoded struct cannot tell a missing field, an explicit null or a
+// wrong-typed value from a real one, so decoding the version into the
+// struct would evaluate a decayed report under silently zeroed parameters
+// (enabled false, severity 0, a zero displacement multiplier) or explain a
+// null declaration as the built-in rules. A wholly absent "version" key is
+// the only legacy shape; anything actually saved is kept byte for byte and
+// re-validated before the report's conclusions are judged.
+type evaluateRecord struct {
+	ChainID     string          `json:"chainId"`
+	BlockHash   string          `json:"blockHash"`
+	BlockNumber int64           `json:"blockNumber"`
+	Swaps       []Swap          `json:"swaps"`
+	Findings    []ReportFinding `json:"findings"`
+	Version     json.RawMessage `json:"version"`
+}
+
 // rawVersionArchiveDoc mirrors the archive file the way a review-range
-// evaluation reads it: records and reviews are fully decoded, but each
-// registered version is kept as its raw stored document. A corrupt version
-// entry — a wrong-typed field, say — then cannot break the read or
-// masquerade as whole-archive corruption; it is judged on its own by
-// intactVersion, so a corrupt sibling never contaminates an intact
-// candidate or the built-in version.
+// evaluation reads it: records keep their embedded version declarations as
+// raw stored documents, reviews are fully decoded, and each registered
+// version is kept as its raw stored document. A corrupt version entry — a
+// wrong-typed field, say — then cannot break the read or masquerade as
+// whole-archive corruption; it is judged on its own by intactVersion, so a
+// corrupt sibling never contaminates an intact candidate or the built-in
+// version, and a corrupt report declaration is that report's corruption,
+// judged on its own below.
 type rawVersionArchiveDoc struct {
-	Records  []record          `json:"records"`
+	Records  []evaluateRecord  `json:"records"`
 	Versions []json.RawMessage `json:"versions"`
 	Reviews  []ReviewObject    `json:"reviews"`
 }
@@ -699,6 +721,23 @@ type rawVersionArchiveDoc struct {
 // when the range contains no blocks; the corrupt content is never replaced
 // by defaults, the currently enabled version or the built-in rules. A
 // corrupt version the call does not name never blocks an intact candidate.
+//
+// Every archived report in the range must likewise still carry an intact
+// version declaration — the same proof a report query demands, re-validated
+// from the raw stored document with the parser registrations pass. A
+// missing or null field or rule object, a wrong type, an out-of-range
+// number, an unknown field or rule, or a field declared twice in one object
+// makes the whole evaluation fail with ErrCorruptVersion naming the chain,
+// the block, the readable saved version id and the offending rule or field
+// — even when that report has no swaps, no conclusions or no valid review,
+// and no partial statistics or details are produced. Only an old-format
+// record with no "version" key at all keeps the built-in interpretation; an
+// explicit null, an empty object or a partial declaration is corruption,
+// and an id of "builtin" is validated like any other. A legal declaration
+// is used exactly as saved: parameters are never completed from the enabled
+// or a registered version, and the id need not still be registered. A
+// report outside the chain or range whose declaration alone is damaged
+// never blocks the evaluation. A failed evaluation changes nothing.
 func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, versionID string) (ReviewEvaluation, error) {
 	if strings.TrimSpace(chainID) == "" {
 		return ReviewEvaluation{}, errors.New("chainId must be a non-empty string")
@@ -736,11 +775,15 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 	}
 	defer lock.Close()
 
-	// Decode with each registered version kept as its raw stored document,
-	// so a wrong-typed field in one version is that version's corruption,
-	// not whole-archive corruption, and the candidate's document can be
+	// Decode with each record's embedded version declaration and each
+	// registered version kept as its raw stored document, so a wrong-typed
+	// field in one declaration is that report's or that version's
+	// corruption, not whole-archive corruption: the candidate's document is
 	// re-validated from its bytes the same way a single-block comparison
-	// proves its version intact.
+	// proves its version intact, and every in-range report's declaration is
+	// re-validated from its bytes exactly the way a report query proves it,
+	// rather than decoded into silently zeroed parameters or a
+	// null-explained built-in report.
 	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return ReviewEvaluation{}, err
@@ -775,7 +818,17 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 		if height < startHeight || height > endHeight {
 			continue
 		}
-		originalVersion := rec.ruleVersion()
+		// Prove the saved declaration before any of the report's conclusions
+		// is judged — and even when none would be. A wholly absent version
+		// key is the only legacy shape and means builtin; every declaration
+		// that was actually written must stand on its own, and a corrupt one
+		// fails the whole evaluation before any statistic or detail is
+		// produced. Reports on other chains or outside the range are never
+		// opened.
+		originalVersion, err := archivedReportVersion(rec.Version)
+		if err != nil {
+			return ReviewEvaluation{}, corruptReportError(chainID, rec.BlockHash, rec.Version, err)
+		}
 		candidateFindings := DetectBlockWithRules(rec.Swaps, candidate.Rules)
 		candByKey := make(map[conclusionKey]ReportFinding, len(candidateFindings))
 		candByTx := make(map[string]ReportFinding, len(candidateFindings))
@@ -863,7 +916,7 @@ func EvaluateReviews(dir, chainID string, startHeight, endHeight uint64, version
 	return result, nil
 }
 
-func findOriginalFinding(rec record, txHash, kind string) (ReportFinding, bool) {
+func findOriginalFinding(rec evaluateRecord, txHash, kind string) (ReportFinding, bool) {
 	for _, f := range rec.Findings {
 		if f.TxHash == txHash && f.Kind == kind {
 			return f, true
