@@ -194,8 +194,14 @@ committedIndex, log entry index/term, request term/prevLogIndex/prevLogTerm/
 leaderCommit, entry index/term, matched case-insensitively): the whole input
 is rejected as a field type error naming the field location (e.g.
 requests[1].leaderCommit), instead of silently treating the null as zero.
-Omitting a field still applies its default, 0 keeps its ordinary meaning, and
-nulls in array fields or unknown keys are handled as before.
+The check covers every occurrence of a duplicated field name, so a null written
+before or after the other value ({"currentTerm":null,"currentTerm":1}) is still
+rejected, and when log, requests or entries appears more than once (even with
+different casing) a numeric null inside any of those arrays cannot be masked by
+a later array. Duplicate keys themselves are not forbidden: when no occurrence
+carries a numeric null the usual last-wins JSON reading rules apply. Omitting a
+field still applies its default, 0 keeps its ordinary meaning, and nulls in
+array fields themselves or in unknown keys are handled as before.
 `)
 }
 

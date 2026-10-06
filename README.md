@@ -416,9 +416,14 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
   `index`/`term`，以及每条请求的 `term`、`prevLogIndex`、`prevLogTerm`、
   `leaderCommit` 和请求条目的 `index`/`term`（字段名只改变大小写同样命中）。
   此时不产生结果 JSON，退出码为 1，标准错误以 `replicate:` 前缀指出字段的
-  完整位置（请求与条目从 0 计数，如 `requests[1].leaderCommit`）。省略字段
-  仍采用默认值（`{}` 仍是合法空初始状态），合法数字 `0` 保持原有含义，数组
-  字段与未知键里的 `null` 沿用已有处理。
+  完整位置（请求与条目从 0 计数，如 `requests[1].leaderCommit`）。该检查覆盖
+  重复字段名的**每一次出现**：`{"currentTerm":null,"currentTerm":1}` 中无论
+  `null` 写在数字之前还是之后都会拒绝；`log`、`requests`、`entries` 自身重复
+  出现（含只改变大小写）时，任一份数组里的数值 `null` 都不会被后面的数组盖
+  掉。重复键本身不额外禁止：所有出现都不含数值 `null` 时，仍按既有 JSON
+  读取规则（后者生效）处理。省略字段仍采用默认值（`{}` 仍是合法空初始
+  状态），合法数字 `0` 保持原有含义，数组字段本身与未知键里的 `null` 沿用
+  已有处理。
 
 ```text
 $ echo '{not json' | go run ./cmd/mevwatch replicate
