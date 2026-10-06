@@ -422,6 +422,27 @@ replicate: invalid initial state: committedIndex 5 exceeds log length 0
 # 退出码 1
 ```
 
+- **已识别数值字段显式写成 `null`** 同样在读取输入阶段整份拒绝：顶层的
+  `currentTerm`、`committedIndex`，每条请求的 `term`、`prevLogIndex`、
+  `prevLogTerm`、`leaderCommit`，以及初始日志和每条请求里每个条目的
+  `index`、`term`，只要明确写成 `null` 就不产生结果 JSON，退出码 1，标准
+  错误指出字段完整位置（请求和条目从 0 开始计数）：
+
+```text
+$ echo '{"currentTerm":2,"committedIndex":null,"log":[{"index":1,"term":1,"command":"a"}]}' | go run ./cmd/mevwatch replicate
+replicate: invalid input: field committedIndex must be a number, got null
+# 退出码 1
+
+$ echo '{"currentTerm":1,"requests":[{"term":1,"prevLogIndex":0,"prevLogTerm":0,"leaderCommit":null}]}' | go run ./cmd/mevwatch replicate
+replicate: invalid input: field requests[0].leaderCommit must be a number, got null
+# 退出码 1
+```
+
+  这与“省略字段”不同：省略仍取既有默认值，`{}` 仍是合法的空初始状态；
+  合法数字 `0`（尤其是日志起点的索引 0 与任期 0）含义不变。只改字母大小
+  写的字段名按同样方式识别，不能绕过校验。数组字段（`log`、`requests`、
+  `entries`）及无关键里的 `null` 沿用既有处理。
+
 ## 技术方向
 
 mev, mev-detection, sandwich-attack, anomaly-detection, transaction-monitoring, risk-engine, onchain-analytics

@@ -189,6 +189,19 @@ A request violating a field rule is recorded as one rejection without changing
 any state (including its higher term), and processing continues with the next
 request. Invalid initial state or unparseable input JSON ends the command with
 a non-zero exit code and an error message on standard error.
+
+Explicit null on a recognized numeric field is a field-type error, not a zero
+value: currentTerm and committedIndex at the top level, term, prevLogIndex,
+prevLogTerm and leaderCommit of every request, and index and term of every
+entry (including the initial log) written as null reject the whole document
+while the input is read. The command exits with code 1, writes no JSON to
+standard output, and names the field's full location on standard error;
+requests and entries are counted from 0, e.g. requests[1].leaderCommit or
+requests[0].entries[2].term. Field names that differ only in letter case are
+recognized the same way and cannot bypass this check. Omitting a field keeps
+its default value ({} is still a valid empty initial state), the number 0
+keeps its ordinary meaning (including the index-0/term-0 log origin), and null
+in array fields or under unknown keys keeps its previous handling.
 `)
 }
 
