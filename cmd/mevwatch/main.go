@@ -199,9 +199,15 @@ before or after the other value ({"currentTerm":null,"currentTerm":1}) is still
 rejected, and when log, requests or entries appears more than once (even with
 different casing) a numeric null inside any of those arrays cannot be masked by
 a later array. Duplicate keys themselves are not forbidden: when no occurrence
-carries a numeric null the usual last-wins JSON reading rules apply. Omitting a
-field still applies its default, 0 keeps its ordinary meaning, and nulls in
-array fields themselves or in unknown keys are handled as before.
+carries a numeric null the usual last-wins JSON reading rules apply. For a
+repeated log, requests or entries array the last array replaces the previous one
+wholesale: each element is interpreted only from the last array — an omitted
+number defaults to 0, an omitted command to "", and an omitted entries array is
+empty; no element borrows the term, index, commit position, command or entries
+of the old element at the same position, and a shorter array keeps only the
+elements it actually gives. Omitting a field still applies its default, 0 keeps
+its ordinary meaning, and nulls in array fields themselves or in unknown keys
+are handled as before.
 `)
 }
 

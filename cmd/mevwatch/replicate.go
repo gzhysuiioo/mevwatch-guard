@@ -11,13 +11,82 @@ import (
 	"github.com/gzhysuiioo/mevwatch-guard/mevwatch"
 )
 
-// replicateInput 是 replicate 子命令从标准输入读取的 JSON。
+// replicateInput 是 replicate 子命令从标准输入读取的 JSON。log/requests 以及
+// 请求内的 entries 使用自定义切片类型（见 entryList/requestList）：重复出现的
+// 数组字段必须以后一份整体替换前一份，而不能复用前一份的底层数组。
 type replicateInput struct {
-	CurrentTerm    int                      `json:"currentTerm"`
-	CommittedIndex int                      `json:"committedIndex"`
-	Log            []mevwatch.LogEntry      `json:"log"`
-	ApplyKV        bool                     `json:"applyKV"`
-	Requests       []mevwatch.AppendRequest `json:"requests"`
+	CurrentTerm    int         `json:"currentTerm"`
+	CommittedIndex int         `json:"committedIndex"`
+	Log            entryList   `json:"log"`
+	ApplyKV        bool        `json:"applyKV"`
+	Requests       requestList `json:"requests"`
+}
+
+// entryList 是初始日志或请求 entries 字段解码后的条目数组。
+type entryList []mevwatch.LogEntry
+
+// appendRequestInput 是复制请求在读取阶段的形状：与 mevwatch.AppendRequest
+// 字段一致，但 entries 使用 entryList，使同一请求对象内重复出现的 entries
+// 同样整体替换（mevwatch.AppendRequest 的 entries 是普通切片，直接解码会
+// 复用旧底层数组）。
+type appendRequestInput struct {
+	Term         int       `json:"term"`
+	PrevLogIndex int       `json:"prevLogIndex"`
+	PrevLogTerm  int       `json:"prevLogTerm"`
+	Entries      entryList `json:"entries"`
+	LeaderCommit int       `json:"leaderCommit"`
+}
+
+// requestList 是 requests 字段解码后的复制请求数组。
+type requestList []mevwatch.AppendRequest
+
+// 标准库把重复键的第二个数组解进既有切片时，会直接复用其底层数组并把长度
+// 重置为新数组的长度：长度内逐元素只覆盖本次写出的字段，长度外的旧元素仍留在
+// 底层数组上。于是后一份元素省略 command/index/term 时会带上同位置旧元素的值，
+// 后一份更短时被截掉的旧条目也仍然存活。两类数组都在每一次出现时整体替换为
+// 全新分配的零值切片：后一份省略的数值按默认值 0、命令按空字符串、省略的条目
+// 数组按空切片解释，数组变短也只保留实际给出的元素。显式 null 沿用既有处理，
+// 不解出任何元素（保持 nil），不覆盖此前已有的值。
+func decodeReplacingList[T any](raw []byte) ([]T, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil
+	}
+	var values []T
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+// UnmarshalJSON 见 decodeReplacingList。
+func (l *entryList) UnmarshalJSON(raw []byte) error {
+	values, err := decodeReplacingList[mevwatch.LogEntry](raw)
+	if err != nil {
+		return err
+	}
+	*l = entryList(values)
+	return nil
+}
+
+// UnmarshalJSON 见 decodeReplacingList；请求元素先解进 appendRequestInput，
+// 使其内部重复出现的 entries 也走 entryList 的整体替换，再转成逻辑层类型。
+func (l *requestList) UnmarshalJSON(raw []byte) error {
+	decoded, err := decodeReplacingList[appendRequestInput](raw)
+	if err != nil {
+		return err
+	}
+	requests := make([]mevwatch.AppendRequest, len(decoded))
+	for i, r := range decoded {
+		requests[i] = mevwatch.AppendRequest{
+			Term:         r.Term,
+			PrevLogIndex: r.PrevLogIndex,
+			PrevLogTerm:  r.PrevLogTerm,
+			Entries:      []mevwatch.LogEntry(r.Entries),
+			LeaderCommit: r.LeaderCommit,
+		}
+	}
+	*l = requestList(requests)
+	return nil
 }
 
 // runReplicate 从标准输入读取一份 JSON（初始状态 + 顺序到达的复制请求），
@@ -56,8 +125,8 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 	output, err := mevwatch.ReplicateWithOptions(mevwatch.InitialState{
 		CurrentTerm:    input.CurrentTerm,
 		CommittedIndex: input.CommittedIndex,
-		Log:            input.Log,
-	}, input.Requests, mevwatch.ReplicateOptions{ApplyKV: input.ApplyKV})
+		Log:            []mevwatch.LogEntry(input.Log),
+	}, []mevwatch.AppendRequest(input.Requests), mevwatch.ReplicateOptions{ApplyKV: input.ApplyKV})
 	if err != nil {
 		fmt.Fprintf(stderr, "replicate: %v\n", err)
 		return 1
