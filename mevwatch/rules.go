@@ -381,7 +381,7 @@ func RegisterVersion(dir string, raw []byte) (v RuleVersion, created bool, err e
 	}
 	defer lock.Close()
 
-	data := replayArchiveDoc{Records: []record{}}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
 	archiveRaw, err := readArchiveBytes(dir)
 	if err != nil {
 		return RuleVersion{}, false, err
@@ -455,7 +455,7 @@ func EnableVersion(dir, id string) (RuleVersion, error) {
 	if err != nil {
 		return RuleVersion{}, err
 	}
-	data := replayArchiveDoc{Records: []record{}}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return RuleVersion{}, fmt.Errorf("archive is corrupted: %w", err)
@@ -600,7 +600,7 @@ func ListVersions(dir string) (versions []RuleVersion, enabled string, err error
 	if err != nil {
 		return nil, "", err
 	}
-	data := replayArchiveDoc{Records: []record{}}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return nil, "", fmt.Errorf("archive is corrupted: %w", err)
@@ -665,7 +665,7 @@ func GetVersion(dir, id string) (RuleVersion, error) {
 	if err != nil {
 		return RuleVersion{}, err
 	}
-	data := replayArchiveDoc{Records: []record{}}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return RuleVersion{}, fmt.Errorf("archive is corrupted: %w", err)

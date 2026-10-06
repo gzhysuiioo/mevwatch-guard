@@ -276,8 +276,6 @@ type record struct {
 	Version     *RuleVersion    `json:"version,omitempty"`
 }
 
-func (r record) id() blockID { return blockID{r.ChainID, r.BlockHash} }
-
 func (r record) ruleVersion() RuleVersion {
 	if r.Version != nil {
 		return *r.Version
@@ -337,6 +335,34 @@ func corruptReportError(chainID, blockHash string, raw json.RawMessage, cause er
 	}
 	return fmt.Errorf("%w: archived report for chain %s block %s: %w",
 		ErrCorruptVersion, chainID, blockHash, cause)
+}
+
+// reportFromQueryRecord builds the Report presented for one archived
+// record, proving the complete version declaration the record archived
+// before any conclusion is shown. A report query and an identical reimport
+// take this same path, so a re-imported block whose content matches the
+// archive is held to exactly the standard of a standalone report query:
+// a wholly absent version key is the one legacy shape and means the
+// built-in rules, while a declaration actually saved as null, as an empty
+// object, only in part, with a wrong type or an out-of-range number, an
+// unknown or repeated field — an id of "builtin" included — fails as
+// ErrCorruptVersion naming the chain, the block, the readable saved id
+// and the offending rule or field. The parameters are never zero-filled,
+// borrowed from the enabled or a registered version, or re-detected; the
+// archived findings, evidence and swap count are returned as stored.
+func reportFromQueryRecord(rec *queryRecord) (Report, error) {
+	version, err := archivedReportVersion(rec.Version)
+	if err != nil {
+		return Report{}, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, err)
+	}
+	return Report{
+		ChainID:     rec.ChainID,
+		BlockHash:   rec.BlockHash,
+		BlockNumber: rec.BlockNumber,
+		SwapCount:   len(rec.Swaps),
+		Version:     version,
+		Findings:    rec.Findings,
+	}, nil
 }
 
 func (r record) report() Report {
@@ -400,15 +426,19 @@ func readArchive(dir string) (archiveData, error) {
 }
 
 // replayArchiveDoc mirrors the archive file the way a replay reads and
-// writes it: records, suppressions, alert records and reviews are fully
-// decoded, but each registered version is kept as its raw stored document.
-// A corrupt version entry — a wrong-typed field, say — then cannot break
-// the read or masquerade as whole-archive corruption; the version this run
-// selects is judged on its own by intactVersion, and entries the run does
-// not select are written back byte for byte: a replay never repairs,
-// completes or drops a stored version, not even a corrupt one.
+// writes it: every record and every registered version is kept as its raw
+// stored document, while suppressions, alert records and reviews are fully
+// decoded. A corrupt document — a wrong-typed field, say — then cannot
+// break the read or masquerade as whole-archive corruption; the version
+// this run selects is judged on its own by intactVersion, and an already
+// archived block whose content matches the input is judged on its own from
+// its record's raw bytes exactly the way a report query proves it, rather
+// than decoded into silently zeroed parameters or a null-explained
+// built-in report. Entries the run does not touch are written back byte
+// for byte: a replay never repairs, completes or drops a stored record or
+// version, not even a corrupt one.
 type replayArchiveDoc struct {
-	Records        []record           `json:"records"`
+	Records        []json.RawMessage  `json:"records"`
 	Versions       []json.RawMessage  `json:"versions,omitempty"`
 	EnabledVersion string             `json:"enabledVersion,omitempty"`
 	Suppressions   []Suppression      `json:"suppressions,omitempty"`
@@ -540,6 +570,29 @@ func replayFile(inputPath, dir, versionID string) ([]Report, error) {
 // version fails the whole replay with ErrCorruptVersion — never a
 // substituted or zeroed parameter set — even when no input block would
 // have triggered the damaged rule.
+//
+// A block that is already archived and arrives with identical content is
+// not re-judged: its original report is returned. Before that report is
+// returned the declaration the record archived is proved from its raw
+// bytes by exactly the standard a standalone report query (Query)
+// enforces — a non-empty id, both rules each declaring a boolean enabled
+// and an integer severity 1-5, and a displacement multiplier 2-100 —
+// rather than trusted because this run's own version is legal. A
+// declaration saved as null, as an empty object, only in part, with a
+// wrong type or out-of-range number, an unknown rule or field, or a field
+// repeated in one object (the field-name folding and escapes included,
+// even when both values agree) fails the whole replay with
+// ErrCorruptVersion; an explicit enabled:false is a legal off state but a
+// disabled rule still has to be declared completely. Only a wholly absent
+// version key — the pre-version legacy shape — is explained by the
+// built-in rules; a written "builtin" id is validated like every other.
+// On failure no report is returned, no same-batch new block is saved and
+// no archived content changes, regardless of where the corrupt old block
+// sits relative to the new ones. An intact old report is returned with
+// its originally saved conclusions, evidence, swap count and full
+// parameters, never re-detected and never completed from the currently
+// enabled or a same-id registered version; its historical id need not
+// still be registered.
 func Replay(input io.Reader, dir string) ([]Report, error) {
 	return doReplay(input, dir, "")
 }
@@ -591,16 +644,20 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 	}
 	defer lock.Close()
 
-	// Decode with each registered version kept as its raw stored document,
-	// so a wrong-typed field in one version is that version's corruption,
-	// not whole-archive corruption, and the selected version's document can
-	// be re-validated from its bytes the same way a single-block comparison
-	// proves its version intact.
+	// Decode with every stored record and registered version kept as its
+	// raw stored document, so a wrong-typed field in one entry is that
+	// entry's corruption, not whole-archive corruption: the selected
+	// version's document is re-validated from its bytes the same way a
+	// single-block comparison proves its version intact, and each already
+	// archived block this run re-imports is proved from its record's raw
+	// bytes the same way a standalone report query proves it, rather than
+	// decoded into silently zeroed parameters or a null-explained
+	// built-in report.
 	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, err
 	}
-	data := replayArchiveDoc{Records: []record{}}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return nil, fmt.Errorf("archive is corrupted: %w", err)
@@ -620,23 +677,44 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Index the stored records by block identity with their decoded
+	// content; the embedded version stays raw until an identical reimport
+	// actually has to present that record's report, when its saved
+	// declaration is proved exactly as a report query would.
+	stored := make([]queryRecord, len(data.Records))
 	archived := make(map[blockID]int, len(data.Records))
-	for i, rec := range data.Records {
-		archived[rec.id()] = i
+	for i, rawRec := range data.Records {
+		var qr queryRecord
+		if err := json.Unmarshal(rawRec, &qr); err != nil {
+			return nil, fmt.Errorf("archive is corrupted: record %d: %w", i, err)
+		}
+		stored[i] = qr
+		archived[blockID{qr.ChainID, qr.BlockHash}] = i
 	}
 
 	reports := make([]Report, 0, len(order))
-	changed := false
+	newRecords := []json.RawMessage{}
 	for _, occ := range order {
 		id := blockID{occ.block.ChainID, occ.block.BlockHash}
 		if idx, ok := archived[id]; ok {
-			rec := data.Records[idx]
+			rec := stored[idx]
 			if !sameContent(rec.BlockNumber, rec.Swaps, occ.block) {
 				return nil, &LineError{Line: occ.line, Err: fmt.Errorf(
 					"block %s/%s conflicts with the archived record", id.chainID, id.blockHash)}
 			}
 			// Identical re-import: return the original report, add nothing.
-			reports = append(reports, rec.report())
+			// The saved declaration is held to the standard of a standalone
+			// report query before any conclusion is returned — never read as
+			// built-in from a null version or as zeroed parameters from an
+			// incomplete one, and never completed from the version this run
+			// selected. A corrupt declaration fails the whole batch here,
+			// before a single new block is committed, whether the old block
+			// appears before or after the new ones.
+			report, perr := reportFromQueryRecord(&rec)
+			if perr != nil {
+				return nil, &LineError{Line: occ.line, Err: perr}
+			}
+			reports = append(reports, report)
 			continue
 		}
 		rec := record{
@@ -647,12 +725,17 @@ func doReplay(input io.Reader, dir, versionID string) ([]Report, error) {
 			Findings:    DetectBlockWithRules(occ.block.Swaps, version.Rules),
 			Version:     &version,
 		}
-		archived[id] = len(data.Records)
-		data.Records = append(data.Records, rec)
+		rawRec, perr := json.Marshal(rec)
+		if perr != nil {
+			return nil, perr
+		}
+		newRecords = append(newRecords, rawRec)
 		reports = append(reports, rec.report())
-		changed = true
 	}
-	if changed {
+	// All blocks passed — new and identical alike — so commit the new
+	// records once, leaving every stored record's raw bytes untouched.
+	if len(newRecords) > 0 {
+		data.Records = append(data.Records, newRecords...)
 		if err := writeArchiveAtomic(dir, data); err != nil {
 			return nil, err
 		}
@@ -757,22 +840,5 @@ func Query(dir, chainID, blockHash string) (Report, error) {
 		return Report{}, ErrUnknownBlock
 	}
 	rec := &doc.Records[idx]
-
-	// Prove the saved declaration before presenting the report. A wholly
-	// absent version key is the only legacy shape and means builtin; every
-	// declaration that was actually written must stand on its own.
-	version, err := archivedReportVersion(rec.Version)
-	if err != nil {
-		return Report{}, corruptReportError(chainID, blockHash, rec.Version, err)
-	}
-
-	findings := rec.Findings
-	return Report{
-		ChainID:     rec.ChainID,
-		BlockHash:   rec.BlockHash,
-		BlockNumber: rec.BlockNumber,
-		SwapCount:   len(rec.Swaps),
-		Version:     version,
-		Findings:    findings,
-	}, nil
+	return reportFromQueryRecord(rec)
 }
