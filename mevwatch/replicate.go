@@ -234,61 +234,89 @@ func (s *replicateState) conflictFor(prevLogIndex int) *ConflictHint {
 	return &ConflictHint{Index: first, Term: term}
 }
 
-// apply 处理单条请求。整个操作是原子的：任何拒绝都不会在日志、已提交索引上
-// 留下部分变更；唯一例外是较高任期带来的 currentTerm 更新，按规则必须保留。
+// appendDecision 是单条复制请求的处理结论。判定过程（decide）不改动节点
+// 状态，请求允许留下的全部状态变化都先收集在这里，由 apply 统一落笔——
+// “每种拒绝允许留下哪些状态变化”只在本结构与 apply 的落笔规则中维护：
+//
+//   - 任何拒绝都可能留下 term（仅当请求字段合法且任期更高时才会被抬高，
+//     其余情况下 term 等于当前任期，落笔与不落笔效果相同）；
+//   - log 与 committedIndex 仅在接受时有效，拒绝时不会被落笔，因此任何
+//     拒绝都不可能在日志或提交位置上留下部分修改。
+type appendDecision struct {
+	accepted bool
+	reason   string
+	conflict *ConflictHint
+	// term 是处理后的节点任期：未触发任期更新规则时等于当前任期。
+	term int
+	// log 与 committedIndex 仅 accepted 为 true 时有效：合并后的完整日志
+	// 与推进后的提交位置。
+	log            []LogEntry
+	committedIndex int
+}
+
+// apply 处理单条请求：decide 给出结论后，状态落笔只在此一处。拒绝时唯一
+// 允许留下的变化是任期更新；日志与提交位置只在接受时前进。
 func (s *replicateState) apply(request AppendRequest) AppendResult {
-	snapshot := *s
-	accepted, reason, conflict := s.tryApply(request)
-	if !accepted {
-		// 回滚日志与提交位置；较高任期更新（若已发生）保留在 s.currentTerm 中。
-		s.log = snapshot.log
-		s.committedIndex = snapshot.committedIndex
+	decision := s.decide(request)
+	s.currentTerm = decision.term
+	if decision.accepted {
+		s.log = decision.log
+		s.committedIndex = decision.committedIndex
 	}
 	return AppendResult{
-		Accepted:       accepted,
-		Reason:         reason,
+		Accepted:       decision.accepted,
+		Reason:         decision.reason,
 		Term:           s.currentTerm,
 		CommittedIndex: s.committedIndex,
-		Conflict:       conflict,
+		Conflict:       decision.conflict,
 	}
 }
 
-func (s *replicateState) tryApply(request AppendRequest) (bool, string, *ConflictHint) {
+// decide 判定单条请求的处理结论，不改动节点状态：各拒绝分支只填写原因
+// （与必要时的重发建议），状态变化一律经由 appendDecision 表达。
+func (s *replicateState) decide(request AppendRequest) appendDecision {
+	decision := appendDecision{term: s.currentTerm}
+
 	// 规则 1：先做字段合法性校验。违反字段规则的请求只记录拒绝、不改变任何
-	// 状态——即使它携带更高任期，也不能更新节点。
+	// 状态——即使它携带更高任期，也不能更新节点（term 维持当前任期）。
 	if reason := validateRequest(request); reason != ReasonOK {
-		return false, reason, nil
+		decision.reason = reason
+		return decision
 	}
 
 	// 规则 2：较低任期直接拒绝，状态（含任期）完全不变。
 	if request.Term < s.currentTerm {
-		return false, ReasonStaleTerm, nil
+		decision.reason = ReasonStaleTerm
+		return decision
 	}
 
 	// 规则 3：首条目任期不得低于前一条日志任期（整段日志必须不下降）。
 	// 这仍属于字段规则，放在任期更新之前：非法请求不能借高任期改变节点。
 	if len(request.Entries) > 0 && request.Entries[0].Term < request.PrevLogTerm {
-		return false, ReasonEntryTermDecreases, nil
+		decision.reason = ReasonEntryTermDecreases
+		return decision
 	}
 
-	// 规则 4：较高任期先更新当前任期，再核对日志；之后即便因前缀不匹配被拒，
+	// 规则 4：较高任期先记入结论，再核对日志；之后即便因前缀不匹配被拒，
 	// 任期更新也保留。
 	if request.Term > s.currentTerm {
-		s.currentTerm = request.Term
+		decision.term = request.Term
 	}
 
 	// 规则 5：前一条日志必须存在且任期相同。索引 0 始终只与任期 0 匹配。
 	// 只有这种拒绝附带重发建议，且建议按此时（未因本请求改变）的本地日志生成。
 	prevTerm, ok := s.termAt(request.PrevLogIndex)
 	if !ok || prevTerm != request.PrevLogTerm {
-		return false, ReasonPrevLogMismatch, s.conflictFor(request.PrevLogIndex)
+		decision.reason = ReasonPrevLogMismatch
+		decision.conflict = s.conflictFor(request.PrevLogIndex)
+		return decision
 	}
 
-	// 规则 6：把待追加条目与现有位置逐一比对——全部检查通过后才落笔，
-	// 保证“即使前面已发现可追加内容，也不能留下部分变更”。第一个任期冲突
-	// 位置之后的旧日志都会被整段替换，因此只需在冲突位置之前检查命令冲突。
-	// matched 是请求条目中与现有位置完全相同（同任期同命令）的连续前缀长度；
-	// 超出本地日志长度的位置尚不存在，不属于已匹配，稍后追加。
+	// 规则 6：把待追加条目与现有位置逐一比对——全部检查通过后才生成合并
+	// 结果，保证“即使前面已发现可追加内容，也不能留下部分变更”。第一个任期
+	// 冲突位置之后的旧日志都会被整段替换，因此只需在冲突位置之前检查命令
+	// 冲突。matched 是请求条目中与现有位置完全相同（同任期同命令）的连续
+	// 前缀长度；超出本地日志长度的位置尚不存在，不属于已匹配，稍后追加。
 	start := request.PrevLogIndex // entries[k] 对应索引 start+1+k
 	cutAt := -1                   // 首个任期不同的现有位置（切片下标）
 	matched := 0
@@ -304,10 +332,12 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string, *Conflic
 			matched++
 		case existing.Term == incoming.Term:
 			// 同索引同任期却命令不同：拒绝，日志与提交位置保持原样。
-			return false, ReasonCommandConflictSameTerm, nil
+			decision.reason = ReasonCommandConflictSameTerm
+			return decision
 		case idx <= s.committedIndex:
 			// 不同任期意味着要覆盖该处及其后缀；已提交条目不可覆盖。
-			return false, ReasonWouldOverwriteCommitted, nil
+			decision.reason = ReasonWouldOverwriteCommitted
+			return decision
 		default:
 			// 未提交位置上的任期冲突：截断到此处再追加，其后旧日志整段丢弃。
 			cutAt = idx - 1
@@ -319,13 +349,15 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string, *Conflic
 
 	// 规则 7：合并日志。全部匹配的短请求（matched == len(entries)）不删除
 	// 本地多出的尾部；任期冲突时截断冲突位置及其后缀；其余缺失位置追加。
+	merged := s.log
 	if cutAt >= 0 {
 		matched = cutAt - start
-		s.log = append([]LogEntry(nil), s.log[:cutAt]...)
+		merged = append([]LogEntry(nil), s.log[:cutAt]...)
 	}
 	if matched < len(request.Entries) {
-		s.log = append(s.log, request.Entries[matched:]...)
+		merged = append(merged, request.Entries[matched:]...)
 	}
+	decision.log = merged
 
 	// 规则 8：提交位置推进至 leaderCommit 与本次确认的最后索引的较小值，
 	// 且不会后退。空条目请求的确认位置就是前一条索引。
@@ -334,10 +366,13 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string, *Conflic
 	if lastIndex < newCommit {
 		newCommit = lastIndex
 	}
-	if newCommit > s.committedIndex {
-		s.committedIndex = newCommit
+	decision.committedIndex = s.committedIndex
+	if newCommit > decision.committedIndex {
+		decision.committedIndex = newCommit
 	}
-	return true, ReasonOK, nil
+	decision.accepted = true
+	decision.reason = ReasonOK
+	return decision
 }
 
 func validateRequest(request AppendRequest) string {
@@ -355,7 +390,7 @@ func validateRequest(request AppendRequest) string {
 	}
 	// 条目必须从前一条索引加 1 开始连续排列；任期为正、沿请求条目自身
 	// 不下降，且不得超过请求（领导者）任期。与 prevLogTerm 的衔接在
-	// tryApply 中单独检查。
+	// decide 中单独检查。
 	switch rule, _ := checkEntryRules(request.Entries, request.PrevLogIndex, request.Term); rule {
 	case entryRuleIndexGap:
 		return ReasonEntryIndexGap
