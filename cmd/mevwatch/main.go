@@ -228,7 +228,22 @@ index, commit position, command or entries of the same-position earlier one, so
 a later initial-log element that omits index or term ends the run as an invalid
 initial state. Omitting a field that appears only once still applies its
 default, 0 keeps its ordinary meaning, and nulls in array fields themselves or
-in unknown keys are handled as before. Unrecognized fields are ignored
+in unknown keys are handled as before. command may appear more than once inside a
+single entry object (in the initial log or in request entries, even with
+different casing): the last textual occurrence decides it, case-insensitively.
+A last string is kept verbatim; a last null means the empty string, exactly like
+"command":null alone or an omitted command; null followed by a string takes the
+later string. So {"index":1,"term":1,"command":"set count=7","command":null}
+ends with the empty command: with applyKV on and the entry committed it stops at
+that index with the usual unknown-command apply error (a previously applied key,
+e.g. count "3", is kept and the displaced write never applies), while an
+uncommitted empty command raises no apply error; with applyKV off the empty
+command is still stored as an ordinary string and no apply fields are emitted.
+Writing command as a number, boolean, object or array is still an input type
+error: any such occurrence, before or after a legal string and regardless of
+casing, rejects the whole input with exit code 1 (stderr keeps the replicate:
+prefix, stdout has no result JSON); a later legal string cannot mask it.
+Unrecognized fields are ignored
 wherever they appear (root, request, log entry, or nested inside each other),
 including numbers of any magnitude such as 1e400; they never take part in
 follower state and never appear in the output. The same oversized numbers

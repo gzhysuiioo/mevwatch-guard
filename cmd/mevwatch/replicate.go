@@ -24,6 +24,10 @@ import (
 // replicateInputEntries）每一次出现都解进一份全新切片并整体替换；requests 元素
 // 直接复用库类型 mevwatch.AppendRequest（见 replicateInputRequests）。最后一份
 // 数组是什么就保留什么，元素省略的数值按默认 0、省略的命令按空字符串解释。
+//
+// 数组元素本身用 replicateInputEntry 解码（而不是直接解进 mevwatch.LogEntry）：
+// 同一条目对象里 command 允许重复，按输入顺序的最后一次出现决定命令，只改变
+// 字段名大小写的写法也参与这次判断（见 replicateInputEntry.UnmarshalJSON）。
 type replicateInput struct {
 	CurrentTerm    int                    `json:"currentTerm"`
 	CommittedIndex int                    `json:"committedIndex"`
@@ -33,10 +37,12 @@ type replicateInput struct {
 }
 
 // replicateInputLog 是根对象的 log 字段：重复出现时最后一份数组整体替换。
+// 元素经 replicateInputEntry 应用 command 重复字段的最后出现规则，再转换为
+// 库类型 mevwatch.LogEntry。
 type replicateInputLog []mevwatch.LogEntry
 
 func (l *replicateInputLog) UnmarshalJSON(data []byte) error {
-	return unmarshalLastWinsArray(data, (*[]mevwatch.LogEntry)(l))
+	return unmarshalLastWinsEntryArray(data, (*[]mevwatch.LogEntry)(l))
 }
 
 // replicateInputRequest 是读取阶段的复制请求：它以库类型
@@ -67,7 +73,11 @@ func (r *replicateInputRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &shape); err != nil {
 		return normalizeRequestJSONError(err)
 	}
-	shape.AppendRequest.Entries = []mevwatch.LogEntry(shape.Entries)
+	entries := make([]mevwatch.LogEntry, len(shape.Entries))
+	for i := range shape.Entries {
+		entries[i] = mevwatch.LogEntry(shape.Entries[i])
+	}
+	shape.AppendRequest.Entries = entries
 	*r = replicateInputRequest(shape.AppendRequest)
 	return nil
 }
@@ -80,9 +90,9 @@ func (r *replicateInputRequest) UnmarshalJSON(data []byte) error {
 type replicateInputRequests []mevwatch.AppendRequest
 
 func (r *replicateInputRequests) UnmarshalJSON(data []byte) error {
-	// 仍须先解进局部切片再整体替换：与 unmarshalLastWinsArray 同理，直接解到
-	// r 会让重复出现的 requests 只按下标覆盖，短数组尾部与省略字段都残留上一
-	// 份请求的内容。元素经整体值转换直接成为库类型（两边底层布局逐字段一致），
+	// 仍须先解进局部切片再整体替换：与条目数组的整体替换同理，直接解到 r 会
+	// 让重复出现的 requests 只按下标覆盖，短数组尾部与省略字段都残留上一份
+	// 请求的内容。元素经整体值转换直接成为库类型（两边底层布局逐字段一致），
 	// 转换不出现任何请求字段名：请求含义只在 mevwatch.AppendRequest 一处定义。
 	var next []replicateInputRequest
 	if err := json.Unmarshal(data, &next); err != nil {
@@ -97,11 +107,18 @@ func (r *replicateInputRequests) UnmarshalJSON(data []byte) error {
 }
 
 // replicateInputEntries 是单个请求内的 entries 字段：同一请求对象里重复
-// 出现时，最后一份条目数组整体替换。
-type replicateInputEntries []mevwatch.LogEntry
+// 出现时，最后一份条目数组整体替换。元素经 replicateInputEntry 应用 command
+// 重复字段的最后出现规则，其底层类型因此是 []replicateInputEntry 而不是
+// []mevwatch.LogEntry；整体替换语义由本类型的 UnmarshalJSON 负责。
+type replicateInputEntries []replicateInputEntry
 
 func (e *replicateInputEntries) UnmarshalJSON(data []byte) error {
-	return unmarshalLastWinsArray(data, (*[]mevwatch.LogEntry)(e))
+	var next []replicateInputEntry
+	if err := json.Unmarshal(data, &next); err != nil {
+		return normalizeEntryArrayTypeError(err)
+	}
+	*e = next
+	return nil
 }
 
 // normalizeRequestJSONError 把请求对象内嵌解码产出的 JSON 类型错误改写成整理
@@ -124,16 +141,143 @@ func normalizeRequestJSONError(err error) error {
 	return &fixed
 }
 
-// unmarshalLastWinsArray 把一次数组字段出现解进一份全新的切片，并用它整体
-// 替换 dst。它必须先解进局部切片而不能直接解到 dst：encoding/json 对“非 nil
-// 现有切片 + 重复数组键”只做下标覆盖，短数组的尾部与元素内省略的字段都会
-// 残留上一次出现的内容。null 与既有行为一致，把目标置为空切片（nil）。
-func unmarshalLastWinsArray[T any](data []byte, dst *[]T) error {
-	var next []T
-	if err := json.Unmarshal(data, &next); err != nil {
+// replicateInputEntry 是读取阶段的日志条目：以库类型 mevwatch.LogEntry 为底层
+// 类型另行定义，只为挂载输入特有的 command 解码规则。读完后整个值可直接转换回
+// mevwatch.LogEntry，无须逐字段搬运。
+//
+// entryUnmarshalShape 与库条目布局逐字段一致，command 解在普通字符串字段上。
+// 它只是 UnmarshalJSON 内的局部形状，不构成第二套条目字段；其类型名不会出现
+// 在整理后的错误信息里（见 normalizeEntryJSONError）。
+type replicateInputEntry mevwatch.LogEntry
+
+type entryUnmarshalShape struct {
+	Index   int    `json:"index"`
+	Term    int    `json:"term"`
+	Command string `json:"command"`
+}
+
+// UnmarshalJSON 解码一个日志条目，并对 command 施加“同一对象内可重复、最后
+// 一次出现决定内容”的规则：
+//
+//   - 任一次出现（含只改变字段名大小写的写法）为数字、布尔、对象或数组时，
+//     都是输入类型错误；后面的合法字符串不能掩盖这次错误。整份输入按既有
+//     JSON 类型错误拒绝（退出码 1、标准错误保留 replicate: 前缀）。
+//   - 最后一次出现是字符串时按原文保留；是 null 时为空字符串，与单独给出
+//     command:null 或省略 command 的结果一致；先 null 后字符串时采用后面的
+//     字符串。
+//
+// 先做一次与库条目同形的普通解码：command 解进字符串字段。encoding/json 对
+// 重复键按下标覆盖——字符串重复取最后一个，任一次数字/布尔/对象/数组都会
+// saveError 并保留输入顺序上的首个类型错误（后面的合法字符串盖不掉），null
+// 写入字符串被直接忽略，index/term 等其余字段的类型错误与优先级也都与既有
+// 行为完全一致。普通解码唯一处理不了的是“最后一次出现为 null、而前面还出现
+// 过字符串”：最后的 null 被忽略，字段里残留前面的字符串。因此仅当普通解码
+// 成功、且 token 扫描确认最后一次 command 为 null 时，把命令改回空字符串。
+// 能走到这一步说明没有任何非法类型出现（否则普通解码已经报错），也就不会用
+// 空串掩盖一次类型错误。
+func (e *replicateInputEntry) UnmarshalJSON(data []byte) error {
+	var shape entryUnmarshalShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return normalizeEntryJSONError(err)
+	}
+	if lastCommandIsNull(data) {
+		shape.Command = ""
+	}
+	*e = replicateInputEntry(shape)
+	return nil
+}
+
+// jsonNullLiteral 是 JSON 的 null 字面量。
+var jsonNullLiteral = []byte("null")
+
+// lastCommandIsNull 扫描一个日志条目对象的 token 流，报告按输入顺序最后一次
+// 出现的 command（键名大小写不敏感，与 encoding/json 的字段识别一致）是否为
+// null。没有 command 出现、条目不是对象或 JSON 无法解析时返回 false——这些
+// 情况已由先前的普通类型化解码产出结果或错误。token 流保留重复键的每一次出
+// 现，因此 {"command":"set ...","command":null} 与先 null 后字符串能被正确
+// 区分；只改变大小写的写法（Command、COMMAND 等）同样参与判断。
+func lastCommandIsNull(data []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return false
+	}
+	var lastRaw json.RawMessage
+	found := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return false
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return false
+		}
+		if strings.EqualFold(key, "command") {
+			// Decode 复用并可能覆盖传入切片，逐次拷贝保留本次字面量。
+			lastRaw = append(json.RawMessage(nil), raw...)
+			found = true
+		}
+	}
+	if !found {
+		return false
+	}
+	return bytes.Equal(bytes.TrimSpace(lastRaw), jsonNullLiteral)
+}
+
+// normalizeEntryJSONError 把条目形状解码产出的类型错误整理回库类型的稳定文本：
+// “整条条目不是对象”的错误来自局部 entryUnmarshalShape，encoding/json 会把这
+// 个实现细节写进 Type；这里改回 mevwatch.LogEntry。字段级（index/term/
+// command）错误的 Type 本就是 int/string，保持原样，由外层解码补上
+// requests.entries / log 的字段路径。非类型错误原样返回。
+func normalizeEntryJSONError(err error) error {
+	var te *json.UnmarshalTypeError
+	if !errors.As(err, &te) {
 		return err
 	}
-	*dst = next
+	fixed := *te
+	if fixed.Type == reflect.TypeOf(entryUnmarshalShape{}) {
+		fixed.Type = reflect.TypeOf(mevwatch.LogEntry{})
+	}
+	return &fixed
+}
+
+// normalizeEntryArrayTypeError 把条目数组解码产出的类型错误整理回库类型的稳定
+// 文本：数组字段本身被写成对象/标量时，encoding/json 写出的目标类型是内部的
+// []replicateInputEntry，改回对外的 []mevwatch.LogEntry。元素级错误（整条条目
+// 不是对象、index/term/command 类型错误）已在 replicateInputEntry 一侧整理为
+// mevwatch.LogEntry / int / string，这里不匹配、保持原样。非类型错误原样返回。
+func normalizeEntryArrayTypeError(err error) error {
+	var te *json.UnmarshalTypeError
+	if !errors.As(err, &te) {
+		return err
+	}
+	fixed := *te
+	if fixed.Type == reflect.TypeOf([]replicateInputEntry{}) {
+		fixed.Type = reflect.TypeOf([]mevwatch.LogEntry{})
+	}
+	return &fixed
+}
+
+// unmarshalLastWinsEntryArray 把一次数组字段出现解进一份全新的条目切片，并在
+// 转换为库类型后整体替换 dst。它必须先解进局部切片而不能直接解到 dst，原因与
+// 整体替换数组一致：encoding/json 对“非 nil 现有切片 + 重复数组键”只做下标
+// 覆盖，短数组的尾部与元素内省略的字段都会残留上一次出现的内容。null 与既有
+// 行为一致，把目标置为空切片（nil）。
+func unmarshalLastWinsEntryArray(data []byte, dst *[]mevwatch.LogEntry) error {
+	var next []replicateInputEntry
+	if err := json.Unmarshal(data, &next); err != nil {
+		return normalizeEntryArrayTypeError(err)
+	}
+	entries := make([]mevwatch.LogEntry, len(next))
+	for i := range next {
+		entries[i] = mevwatch.LogEntry(next[i])
+	}
+	*dst = entries
 	return nil
 }
 
