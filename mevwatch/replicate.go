@@ -234,82 +234,176 @@ func (s *replicateState) conflictFor(prevLogIndex int) *ConflictHint {
 	return &ConflictHint{Index: first, Term: term}
 }
 
-// apply 处理单条请求。整个操作是原子的：任何拒绝都不会在日志、已提交索引上
-// 留下部分变更；唯一例外是较高任期带来的 currentTerm 更新，按规则必须保留。
+// appendDecision 是单条请求的裁决结果。裁决只在只读副本上推导，不触碰
+// replicateState 本身，把“接受/拒绝与冲突判断”和“状态落笔”彻底分开：
+//
+//   - accepted 为 true 时，mergedLog 是合并后的完整新日志、commitTo 是本次
+//     允许提交位置推进到的目标；
+//   - accepted 为 false 时，reason 是既有拒绝原因、conflict 仅在前置日志不
+//     匹配时非空，mergedLog 为 nil；
+//   - termToKeep 是处理后必须保留的当前任期：字段非法与低任期拒绝保持请求
+//     前的任期，合法请求（含被拒绝的高任期请求）携带更高任期时为该新任期。
+//
+// 每种拒绝允许留下哪些状态变化，只由 apply 对这些字段的统一处理决定，裁决
+// 函数不再各自维护日志与提交位置的回滚。
+type appendDecision struct {
+	accepted   bool
+	reason     string
+	conflict   *ConflictHint
+	termToKeep int
+	mergedLog  []LogEntry // 仅 accepted 时非 nil
+	commitTo   int        // 仅 accepted 时有效
+}
+
+// apply 处理单条请求。裁决（decide）与落笔（commitDecision）分开后，各类
+// 拒绝能留下的状态变化只有一处统一边界：
+//
+//   - 字段非法、低任期：裁决不触碰状态，任期、日志、提交位置全部保持；
+//   - 前置不匹配、同任期命令冲突、覆盖已提交条目：仅保留更高任期（若有），
+//     日志与提交位置保持请求前的值；
+//   - 接受：整体替换为裁决出的合并日志，并只向前推进提交位置。
+//
+// 裁决在状态副本上进行，因此拒绝路径不需要回滚，接受路径一次性落笔，任何
+// 拒绝都不会在日志与已提交索引上留下部分变更。
 func (s *replicateState) apply(request AppendRequest) AppendResult {
-	snapshot := *s
-	accepted, reason, conflict := s.tryApply(request)
-	if !accepted {
-		// 回滚日志与提交位置；较高任期更新（若已发生）保留在 s.currentTerm 中。
-		s.log = snapshot.log
-		s.committedIndex = snapshot.committedIndex
-	}
+	decision := s.decide(request)
+	s.commitDecision(decision)
 	return AppendResult{
-		Accepted:       accepted,
-		Reason:         reason,
+		Accepted:       decision.accepted,
+		Reason:         decision.reason,
 		Term:           s.currentTerm,
 		CommittedIndex: s.committedIndex,
-		Conflict:       conflict,
+		Conflict:       decision.conflict,
 	}
 }
 
-func (s *replicateState) tryApply(request AppendRequest) (bool, string, *ConflictHint) {
+// commitDecision 按裁决落笔，是全部裁决共用的唯一状态变更点：接受时一次性
+// 替换日志并只在新目标更高时推进提交位置；拒绝时只保留任期。日志与提交位置
+// 除接受外不会被写入，因此无需快照回滚。
+func (s *replicateState) commitDecision(d appendDecision) {
+	s.currentTerm = d.termToKeep
+	if !d.accepted {
+		return
+	}
+	s.log = d.mergedLog
+	if d.commitTo > s.committedIndex {
+		s.committedIndex = d.commitTo
+	}
+}
+
+// decide 在状态副本上裁决单条请求，返回带明确状态边界的裁决。整个推导只读
+// s：所有可能改动日志的合并动作都发生在副本上，校验未全部通过时副本被直接
+// 丢弃，不产生任何部分修改。
+func (s *replicateState) decide(request AppendRequest) appendDecision {
 	// 规则 1：先做字段合法性校验。违反字段规则的请求只记录拒绝、不改变任何
 	// 状态——即使它携带更高任期，也不能更新节点。
 	if reason := validateRequest(request); reason != ReasonOK {
-		return false, reason, nil
+		return s.reject(reason, nil)
 	}
 
 	// 规则 2：较低任期直接拒绝，状态（含任期）完全不变。
 	if request.Term < s.currentTerm {
-		return false, ReasonStaleTerm, nil
+		return s.reject(ReasonStaleTerm, nil)
 	}
 
 	// 规则 3：首条目任期不得低于前一条日志任期（整段日志必须不下降）。
 	// 这仍属于字段规则，放在任期更新之前：非法请求不能借高任期改变节点。
 	if len(request.Entries) > 0 && request.Entries[0].Term < request.PrevLogTerm {
-		return false, ReasonEntryTermDecreases, nil
+		return s.reject(ReasonEntryTermDecreases, nil)
 	}
 
-	// 规则 4：较高任期先更新当前任期，再核对日志；之后即便因前缀不匹配被拒，
-	// 任期更新也保留。
-	if request.Term > s.currentTerm {
-		s.currentTerm = request.Term
+	// 至此字段合法且任期不低于当前任期。先在裁决中确定处理后的任期：较高
+	// 任期即使随后被拒绝也必须保留，其余情况沿用当前任期。
+	term := s.currentTerm
+	if request.Term > term {
+		term = request.Term
 	}
 
-	// 规则 5：前一条日志必须存在且任期相同。索引 0 始终只与任期 0 匹配。
+	// 规则 4：前一条日志必须存在且任期相同。索引 0 始终只与任期 0 匹配。
 	// 只有这种拒绝附带重发建议，且建议按此时（未因本请求改变）的本地日志生成。
 	prevTerm, ok := s.termAt(request.PrevLogIndex)
 	if !ok || prevTerm != request.PrevLogTerm {
-		return false, ReasonPrevLogMismatch, s.conflictFor(request.PrevLogIndex)
+		return s.rejectKeepingTerm(term, ReasonPrevLogMismatch, s.conflictFor(request.PrevLogIndex))
 	}
 
-	// 规则 6：把待追加条目与现有位置逐一比对——全部检查通过后才落笔，
-	// 保证“即使前面已发现可追加内容，也不能留下部分变更”。第一个任期冲突
-	// 位置之后的旧日志都会被整段替换，因此只需在冲突位置之前检查命令冲突。
-	// matched 是请求条目中与现有位置完全相同（同任期同命令）的连续前缀长度；
-	// 超出本地日志长度的位置尚不存在，不属于已匹配，稍后追加。
-	start := request.PrevLogIndex // entries[k] 对应索引 start+1+k
-	cutAt := -1                   // 首个任期不同的现有位置（切片下标）
-	matched := 0
+	// 规则 5：在副本上规划日志合并。同任期不同命令、不同任期覆盖已提交条目
+	// 都在落笔前判定为拒绝；副本连同其中的中间修改一并丢弃，状态保持请求前
+	// 的值（任期除外，已在上面确定保留）。
+	mergedLog, reason := planMergedLog(s.log, request, s.committedIndex)
+	if reason != ReasonOK {
+		return s.rejectKeepingTerm(term, reason, nil)
+	}
+
+	// 规则 6：提交位置推进至 leaderCommit 与本次确认的最后索引的较小值；
+	// 是否只前进不后退由 commitDecision 统一保证。空条目请求的确认位置就是
+	// 前一条索引。
+	lastIndex := request.PrevLogIndex + len(request.Entries)
+	commitTo := request.LeaderCommit
+	if lastIndex < commitTo {
+		commitTo = lastIndex
+	}
+	return appendDecision{
+		accepted:   true,
+		reason:     ReasonOK,
+		termToKeep: term,
+		mergedLog:  mergedLog,
+		commitTo:   commitTo,
+	}
+}
+
+// reject 构造“状态完全不变”的拒绝裁决：任期保持请求前的当前任期。字段非法
+// 与低任期拒绝共用这一边界。
+func (s *replicateState) reject(reason string, conflict *ConflictHint) appendDecision {
+	return s.rejectKeepingTerm(s.currentTerm, reason, conflict)
+}
+
+// rejectKeepingTerm 构造拒绝裁决并显式给出处理后保留的任期；conflict 仅在
+// 实际因前置日志不匹配而拒绝时非空。
+func (s *replicateState) rejectKeepingTerm(term int, reason string, conflict *ConflictHint) appendDecision {
+	return appendDecision{
+		accepted:   false,
+		reason:     reason,
+		conflict:   conflict,
+		termToKeep: term,
+	}
+}
+
+// planMergedLog 在前一条日志已匹配的前提下计算合并后的完整日志。它只读取
+// state 日志、不修改入参切片：比对中产生的截断发生在本地副本上，任何拒绝
+// 都不会改动调用方日志。
+//
+// 合并语义（与原有行为保持一致）：
+//   - 同位置同任期同命令的已存在条目继续保留，重复请求不会产生重复条目；
+//   - 全部匹配的较短请求不能删除本地多出的尾部；
+//   - 在仍需比对的位置遇到同任期不同命令：拒绝（ReasonCommandConflictSameTerm）；
+//   - 未提交位置首次出现不同任期：从该位置起的旧后缀由本次条目替换，其后
+//     的旧命令不再成为同任期命令冲突的依据（检查在首个任期分界处即停止）；
+//   - 不同任期条目将覆盖已提交位置：拒绝（ReasonWouldOverwriteCommitted），
+//     不返回部分结果。
+//
+// 超出本地日志长度的位置尚不存在，无需比对，随本次条目整体追加。
+func planMergedLog(state []LogEntry, request AppendRequest, committedIndex int) ([]LogEntry, string) {
+	start := request.PrevLogIndex // entries[k] 对应日志索引 start+1+k
+	cutAt := -1                   // 首个不同任期的现有位置（切片下标）
+	matched := 0                  // 与现有位置完全相同（同任期同命令）的连续前缀长度
 	for offset, incoming := range request.Entries {
 		idx := start + 1 + offset
-		if idx > len(s.log) {
+		if idx > len(state) {
 			break // 该位置及之后都不存在：稍后整体追加
 		}
-		existing := s.log[idx-1]
+		existing := state[idx-1]
 		switch {
 		case existing.Term == incoming.Term && existing.Command == incoming.Command:
-			// 完全相同：保留，重复请求不会产生重复条目。
 			matched++
 		case existing.Term == incoming.Term:
-			// 同索引同任期却命令不同：拒绝，日志与提交位置保持原样。
-			return false, ReasonCommandConflictSameTerm, nil
-		case idx <= s.committedIndex:
+			// 同索引同任期却命令不同：拒绝，不留下任何日志修改。
+			return nil, ReasonCommandConflictSameTerm
+		case idx <= committedIndex:
 			// 不同任期意味着要覆盖该处及其后缀；已提交条目不可覆盖。
-			return false, ReasonWouldOverwriteCommitted, nil
+			return nil, ReasonWouldOverwriteCommitted
 		default:
-			// 未提交位置上的任期冲突：截断到此处再追加，其后旧日志整段丢弃。
+			// 未提交位置上的任期分界：截断到此处再追加，其后旧日志整段丢弃，
+			// 被替换后缀里的旧命令不再参与后续比对。
 			cutAt = idx - 1
 		}
 		if cutAt >= 0 {
@@ -317,27 +411,17 @@ func (s *replicateState) tryApply(request AppendRequest) (bool, string, *Conflic
 		}
 	}
 
-	// 规则 7：合并日志。全部匹配的短请求（matched == len(entries)）不删除
-	// 本地多出的尾部；任期冲突时截断冲突位置及其后缀；其余缺失位置追加。
-	if cutAt >= 0 {
-		matched = cutAt - start
-		s.log = append([]LogEntry(nil), s.log[:cutAt]...)
+	// 全部匹配的短请求（无任期分界且 matched == len(entries)）原样保留本地
+	// 多出的尾部；出现任期分界时，保留分界之前的部分（其中此前完全相同的
+	// 匹配前缀继续保留），再整体追加分界起的本次条目。
+	if cutAt < 0 {
+		if matched == len(request.Entries) {
+			return state, ReasonOK
+		}
+		return append(append([]LogEntry(nil), state...), request.Entries[matched:]...), ReasonOK
 	}
-	if matched < len(request.Entries) {
-		s.log = append(s.log, request.Entries[matched:]...)
-	}
-
-	// 规则 8：提交位置推进至 leaderCommit 与本次确认的最后索引的较小值，
-	// 且不会后退。空条目请求的确认位置就是前一条索引。
-	lastIndex := request.PrevLogIndex + len(request.Entries)
-	newCommit := request.LeaderCommit
-	if lastIndex < newCommit {
-		newCommit = lastIndex
-	}
-	if newCommit > s.committedIndex {
-		s.committedIndex = newCommit
-	}
-	return true, ReasonOK, nil
+	merged := append([]LogEntry(nil), state[:cutAt]...)
+	return append(merged, request.Entries[cutAt-start:]...), ReasonOK
 }
 
 func validateRequest(request AppendRequest) string {
@@ -355,7 +439,7 @@ func validateRequest(request AppendRequest) string {
 	}
 	// 条目必须从前一条索引加 1 开始连续排列；任期为正、沿请求条目自身
 	// 不下降，且不得超过请求（领导者）任期。与 prevLogTerm 的衔接在
-	// tryApply 中单独检查。
+	// decide 中单独检查。
 	switch rule, _ := checkEntryRules(request.Entries, request.PrevLogIndex, request.Term); rule {
 	case entryRuleIndexGap:
 		return ReasonEntryIndexGap
