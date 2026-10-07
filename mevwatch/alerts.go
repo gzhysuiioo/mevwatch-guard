@@ -580,6 +580,40 @@ func AlertHistory(dir, chainID, channel string, startHeight, endHeight uint64) (
 // been processed yet: historical alerts are never rewritten as suppressed,
 // and suppressed records are not re-alerted when a condition's range ends.
 // The registration document cannot set revoked state.
+//
+// A registration commits by rewriting the archive, so before the new
+// condition is appended, an idempotent retry is recognized or a content
+// conflict is reported, every archived report's saved version declaration is
+// re-validated from its raw bytes with the exact integrity proof a report
+// query enforces — a non-empty version identifier, both the sandwich and
+// displacement rules each with a boolean enabled and an integer severity
+// 1-5, and a displacement multiplier 2-100. A missing or null field or rule
+// object, a wrong type, an out-of-range number, an unknown field or rule, or
+// a field declared twice in one object (an exact repeat, an escaped spelling
+// or a case-only spelling naming the same field, even with identical values)
+// makes the saved declaration corrupt; an explicit enabled:false is a legal
+// off state but the disabled rule still has to carry complete, in-range
+// parameters. Only an old-format record with no "version" key at all keeps
+// the built-in interpretation: a written null, an empty object or a partial
+// declaration is corruption, and an id of "builtin" is validated like every
+// other id rather than bypassing the check. The proof opens every report in
+// the archive — a report on another chain, outside the new condition's
+// pool/height coverage or carrying no conclusions is never skipped — and a
+// legal declaration is used exactly as saved, never completed from
+// defaults, the currently enabled or a same-id registered version, and its
+// id need not still be registered.
+//
+// On corruption the whole registration fails with ErrCorruptVersion naming
+// the damaged report's chain and block, the readable saved version id and
+// the offending rule or field: no result is produced, no condition is added
+// and the archive is rewritten by nothing, so the declaration's written
+// null, missing field or repeated key is left byte for byte in place
+// instead of being normalized into the legacy no-version shape the next
+// report query would explain as the built-in rules. The archive is decoded
+// with each record kept as its raw stored document, the same shape a
+// revocation and a replay read and write, so even a successful registration
+// preserves every report's exact bytes rather than re-encoding them; the
+// only change on success is the one appended condition.
 func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, err error) {
 	s, err = ParseSuppression(raw)
 	if err != nil {
@@ -594,9 +628,42 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
-	if err != nil {
-		return Suppression{}, false, err
+	// Decode with every stored record kept as its raw stored document, the
+	// same shape a revocation and a replay read and write. Decoding the
+	// embedded declarations into structs would let the save below rewrite
+	// history: a written null would resurface as a wholly absent version key
+	// — the one legacy shape — and a partial declaration as silently zeroed
+	// parameters. Kept raw, a successful registration writes every report
+	// back byte for byte, and each one is judged from its own bytes below.
+	archiveRaw, rerr := readArchiveBytes(dir)
+	if rerr != nil {
+		return Suppression{}, false, rerr
+	}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
+	if archiveRaw != nil {
+		if err := json.Unmarshal(archiveRaw, &data); err != nil {
+			return Suppression{}, false, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	// Prove every archived report's saved declaration before the new
+	// condition is added, an idempotent retry is recognized or a conflict is
+	// reported: the commit rewrites the archive, and without this proof a
+	// legal new condition could rewrite a damaged report's null or partial
+	// declaration into a shape a later report query explains under the
+	// built-in rules, masking the corruption. Every report is opened — one on
+	// another chain, outside the condition's pool/height coverage or without
+	// conclusions is not skipped. A wholly absent version key is the only
+	// legacy shape and means builtin; anything actually saved must stand on
+	// its own, and a corrupt one fails the whole registration here, before
+	// anything is written.
+	for i, rawRec := range data.Records {
+		var rec queryRecord
+		if err := json.Unmarshal(rawRec, &rec); err != nil {
+			return Suppression{}, false, fmt.Errorf("archive is corrupted: record %d: %w", i, err)
+		}
+		if _, verr := archivedReportVersion(rec.Version); verr != nil {
+			return Suppression{}, false, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
+		}
 	}
 	for _, existing := range data.Suppressions {
 		if existing.ID == s.ID {
