@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/gzhysuiioo/mevwatch-guard/mevwatch"
@@ -17,9 +19,11 @@ import (
 // 后者生效。encoding/json 把重复出现的数组解到同一个非 nil 切片时，只会按下标
 // 覆盖既有元素：后一份数组较短时尾部残留旧元素，元素省略的字段（command、
 // index、term）也会从相同位置的旧元素继承，等于让用户给出的后一份日志借用了
-// 前一份的内容。因此这三个数组都用整体替换的包装类型（replicateInputLog 等）
-// 解码：每一次出现都解进一份全新的切片并整体替换，最后一份数组是什么就保留
-// 什么，元素省略的数值按默认 0、省略的命令按空字符串解释。
+// 前一份的内容。因此这三个数组都用整体替换解码：根上的 log（replicateInputLog）
+// 与请求内的 entries（经 replicateInputRequest.UnmarshalJSON 解进
+// replicateInputEntries）每一次出现都解进一份全新切片并整体替换；requests 元素
+// 直接复用库类型 mevwatch.AppendRequest（见 replicateInputRequests）。最后一份
+// 数组是什么就保留什么，元素省略的数值按默认 0、省略的命令按空字符串解释。
 type replicateInput struct {
 	CurrentTerm    int                    `json:"currentTerm"`
 	CommittedIndex int                    `json:"committedIndex"`
@@ -35,22 +39,61 @@ func (l *replicateInputLog) UnmarshalJSON(data []byte) error {
 	return unmarshalLastWinsArray(data, (*[]mevwatch.LogEntry)(l))
 }
 
-// replicateInputRequest 与 mevwatch.AppendRequest 字段相同，区别只是 entries
-// 也走整体替换解码。
-type replicateInputRequest struct {
-	Term         int                   `json:"term"`
-	PrevLogIndex int                   `json:"prevLogIndex"`
-	PrevLogTerm  int                   `json:"prevLogTerm"`
-	Entries      replicateInputEntries `json:"entries"`
-	LeaderCommit int                   `json:"leaderCommit"`
+// replicateInputRequest 是读取阶段的复制请求：它以库类型
+// mevwatch.AppendRequest 为底层类型另行定义，底层布局逐字段一致，请求字段
+// 只在 mevwatch 包定义一次，CLI 不再平行维护整套同名字段。单独留这一层类型
+// 只为挂载输入特有的解码规则——entries 在同一请求对象里重复出现时必须整体
+// 替换（见 UnmarshalJSON）。读完后整个值可直接转换回 mevwatch.AppendRequest，
+// 无须逐字段搬运。
+type replicateInputRequest mevwatch.AppendRequest
+
+// requestUnmarshalShape 是单个请求对象的解码形状：内嵌的
+// mevwatch.AppendRequest 提供全部请求字段（term、prevLogIndex、prevLogTerm、
+// leaderCommit），外层同名字段 entries 按 encoding/json 的字段遮蔽规则压过内嵌
+// 的 Entries，于是 entries 只解进带整体替换规则的 replicateInputEntries，其余
+// 字段仍直接落在库类型上。它只是 UnmarshalJSON 内的一个局部解码形状，不构成
+// 第二套请求字段，也不会出现在任何错误信息里（见 normalizeRequestJSONError）。
+type requestUnmarshalShape struct {
+	mevwatch.AppendRequest
+	Entries replicateInputEntries `json:"entries"`
+}
+
+// UnmarshalJSON 按整体替换规则解码一个请求：entries 的每一次出现都解进全新
+// 切片并整体替换，其余请求字段与库共用同一套定义。解完把整体替换后的 entries
+// 放回内嵌的库请求，再把整个值转换成本类型，全程没有逐字段重新组装。内嵌解码
+// 产出的 JSON 类型错误经 normalizeRequestJSONError 改写成整理前的稳定文本。
+func (r *replicateInputRequest) UnmarshalJSON(data []byte) error {
+	var shape requestUnmarshalShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return normalizeRequestJSONError(err)
+	}
+	shape.AppendRequest.Entries = []mevwatch.LogEntry(shape.Entries)
+	*r = replicateInputRequest(shape.AppendRequest)
+	return nil
 }
 
 // replicateInputRequests 是根对象的 requests 字段：重复出现时最后一份数组
-// 整体替换，而不是把后一份请求按下标并进前一份。
-type replicateInputRequests []replicateInputRequest
+// 整体替换，而不是把后一份请求按下标并进前一份。它的底层类型直接就是
+// []mevwatch.AppendRequest：每一份数组整体解进全新的 []replicateInputRequest
+// （元素与库类型布局一致、仅差一层不带方法的定义类型），转换后即可整份交给
+// 复制处理，既没有平行请求字段，也不需要逐请求、逐字段重新组装。
+type replicateInputRequests []mevwatch.AppendRequest
 
 func (r *replicateInputRequests) UnmarshalJSON(data []byte) error {
-	return unmarshalLastWinsArray(data, (*[]replicateInputRequest)(r))
+	// 仍须先解进局部切片再整体替换：与 unmarshalLastWinsArray 同理，直接解到
+	// r 会让重复出现的 requests 只按下标覆盖，短数组尾部与省略字段都残留上一
+	// 份请求的内容。元素经整体值转换直接成为库类型（两边底层布局逐字段一致），
+	// 转换不出现任何请求字段名：请求含义只在 mevwatch.AppendRequest 一处定义。
+	var next []replicateInputRequest
+	if err := json.Unmarshal(data, &next); err != nil {
+		return err
+	}
+	requests := make([]mevwatch.AppendRequest, len(next))
+	for i := range next {
+		requests[i] = mevwatch.AppendRequest(next[i])
+	}
+	*r = requests
+	return nil
 }
 
 // replicateInputEntries 是单个请求内的 entries 字段：同一请求对象里重复
@@ -59,6 +102,26 @@ type replicateInputEntries []mevwatch.LogEntry
 
 func (e *replicateInputEntries) UnmarshalJSON(data []byte) error {
 	return unmarshalLastWinsArray(data, (*[]mevwatch.LogEntry)(e))
+}
+
+// normalizeRequestJSONError 把请求对象内嵌解码产出的 JSON 类型错误改写成整理
+// 前的稳定文本。requestUnmarshalShape 为遮蔽内嵌 Entries 而内嵌了
+// AppendRequest：encoding/json 会 (1) 在内嵌字段的字段路径里插入中间匿名段
+// "AppendRequest"，(2) 在整个请求值类型错误（如数组元素不是对象）时把匿名
+// shape 结构体写进类型名。这些都是实现细节，整理前的文本分别使用请求字段的
+// 直接路径（requests.term）与类型名 replicateInputRequest，这里统一改回。
+// 非类型错误（语法错误等）原样返回。
+func normalizeRequestJSONError(err error) error {
+	var te *json.UnmarshalTypeError
+	if !errors.As(err, &te) {
+		return err
+	}
+	fixed := *te
+	fixed.Field = strings.TrimPrefix(fixed.Field, "AppendRequest.")
+	if fixed.Type == reflect.TypeOf(requestUnmarshalShape{}) {
+		fixed.Type = reflect.TypeOf(replicateInputRequest{})
+	}
+	return &fixed
 }
 
 // unmarshalLastWinsArray 把一次数组字段出现解进一份全新的切片，并用它整体
@@ -121,19 +184,12 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "replicate: parse input JSON: %v\n", err)
 		return 1
 	}
-	// 三个数组经整体替换解码后再逐元素转成库类型：转换只按最后一份数组的实际
-	// 内容进行，不携带任何同名前序数组的条目字段。
+	// 三个数组经整体替换解码后直接就是库类型，不再逐请求、逐字段重新组装：
+	// log 与 requests 各做一次整切片拷贝（log 顺带从命名类型转换），转换只按
+	// 最后一份数组的实际内容进行，不携带任何同名前序数组的条目字段。requests
+	// 的底层类型即为 []mevwatch.AppendRequest，拷贝后整份交给复制处理。
 	initialLog := append([]mevwatch.LogEntry(nil), input.Log...)
-	requests := make([]mevwatch.AppendRequest, len(input.Requests))
-	for i, req := range input.Requests {
-		requests[i] = mevwatch.AppendRequest{
-			Term:         req.Term,
-			PrevLogIndex: req.PrevLogIndex,
-			PrevLogTerm:  req.PrevLogTerm,
-			Entries:      append([]mevwatch.LogEntry(nil), req.Entries...),
-			LeaderCommit: req.LeaderCommit,
-		}
-	}
+	requests := append([]mevwatch.AppendRequest(nil), input.Requests...)
 	output, err := mevwatch.ReplicateWithOptions(mevwatch.InitialState{
 		CurrentTerm:    input.CurrentTerm,
 		CommittedIndex: input.CommittedIndex,
