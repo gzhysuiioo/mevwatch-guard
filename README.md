@@ -32,7 +32,8 @@ JSON（每条请求的接收结果、处理后的任期与已提交索引、最�
 
 1. **日志已经复制**：对应请求的 `accepted` 为 `true`、`reason` 为 `"ok"`，
    且命令出现在 `finalLog` 中。这只表示跟随者收下了日志条目；被拒绝的请求
-   `accepted` 为 `false` 并带有具体 `reason`（如任期更低、前置日志不匹配），
+   `accepted` 为 `false` 并带有具体 `reason`（如任期更低、前置日志不匹配、
+   非空 `entries` 的首条任期低于声明的 `prevLogTerm`），
    日志与提交位置保持原样。实际因前置日志不匹配而拒绝时，结果还带有
    `conflict` 对象（`{"index", "term"}`），按本次请求检查时的本地日志给出
    建议的重发起点与冲突位置的本地任期：`prevLogIndex` 越过日志末尾时为
@@ -399,6 +400,101 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
 时才改值；未提交的 incr 不会提前改值或暴露数值错误；重复复制同一条日志
 或提交位置未前进的心跳不会重复累加。`applyKV` 省略或为 `false` 时，
 `incr` 仍只是普通日志字符串，输出中没有任何应用字段。
+
+### 首条日志任期不得低于声明的前置任期
+
+请求内各条日志的任期沿批次自身不下降只是要求之一：在**其他字段合法且请求
+任期不低于节点当前任期**时，非空 `entries` 的**首条**日志任期还不能低于请求
+声明的 `prevLogTerm`。首条任期与 `prevLogTerm` **相等合法**，条目也无需都
+采用领导者的当前任期（旧任期条目可以接在同任期的前置之后）。
+
+这条限制在处理顺序中的边界需要特别注意：
+
+- **比较的是请求声明的 `prevLogTerm`**：即使它同时与本地日志不匹配，首条
+  任期下降仍按字段错误拒绝，原因固定为 `invalid request: entry terms are
+  not non-decreasing`——**不保留较高任期，也不提供 `conflict` 重发提示**。
+- **请求任期过低时，仍优先报告既有的低任期拒绝**（`stale term: ...`），
+  不会改报首条任期下降。
+- **`entries` 为空时没有首条日志**，不适用这条限制，继续按已有的前置日志
+  匹配规则处理：前置不匹配就带 `conflict` 拒绝并保留较高任期，匹配则是
+  正常的空条目心跳。
+
+下面这份输入开启 `applyKV`：初始任期为 2，日志索引 1、2 的任期分别为 1、2，
+命令分别为 `set count=10`、`set count=20`，只有索引 1 已提交。因此键值表里
+`count` 已是字符串 `"10"`，索引 2 虽在日志中却尚未生效。
+
+```bash
+cat > /tmp/replicate-termbridge.json <<'EOF'
+{
+  "currentTerm": 2,
+  "committedIndex": 1,
+  "log": [
+    {"index": 1, "term": 1, "command": "set count=10"},
+    {"index": 2, "term": 2, "command": "set count=20"}
+  ],
+  "applyKV": true,
+  "requests": [
+    {"term": 7, "prevLogIndex": 2, "prevLogTerm": 2, "leaderCommit": 3,
+     "entries": [{"index": 3, "term": 1, "command": "incr count=5"}]},
+    {"term": 3, "prevLogIndex": 2, "prevLogTerm": 2, "leaderCommit": 3,
+     "entries": [{"index": 3, "term": 2, "command": "incr count=5"}]}
+  ]
+}
+EOF
+go run ./cmd/mevwatch replicate < /tmp/replicate-termbridge.json
+```
+
+第一条请求任期为 7、前置索引为 2、前置任期为 2，携带索引 3、**任期 1** 的
+`incr count=5` 并要求提交到 3。首条任期 1 低于声明的前置任期 2：
+
+- 该请求被拒绝，`reason` 为 `invalid request: entry terms are not
+  non-decreasing`，结果中**不出现 `conflict`**；
+- 这属于字段错误，**任期 7 不会留下**：当前任期仍为 2，日志与提交位置保持
+  原样，应用位置仍为 1，`count` 仍是字符串 `"10"`——未提交的索引 2 与被拒
+  的增量命令都没有生效，`applyError` 为 `null`。
+
+第二条请求任期为 3、前置条件相同，但索引 3 的条目任期为 **2**（与前置任期
+相等，衔接合法），并提交到 3，这次被接受：索引 2 的 `set count=20` 与索引 3
+的 `incr count=5` 按序生效。最终任期为 3，提交与应用位置都为 3，`count` 为
+字符串 `"25"`。正因为前一个请求没有抬高节点任期，后一个任期 3 的请求才不会
+因任期较低而被拒绝——拒绝之后处理照常继续。
+
+完整输出如下：
+
+```json
+{
+  "results": [
+    {
+      "accepted": false,
+      "reason": "invalid request: entry terms are not non-decreasing",
+      "term": 2,
+      "committedIndex": 1,
+      "appliedIndex": 1,
+      "applyError": null
+    },
+    {
+      "accepted": true,
+      "reason": "ok",
+      "term": 3,
+      "committedIndex": 3,
+      "appliedIndex": 3,
+      "applyError": null
+    }
+  ],
+  "finalTerm": 3,
+  "finalCommittedIndex": 3,
+  "finalLog": [
+    {"index": 1, "term": 1, "command": "set count=10"},
+    {"index": 2, "term": 2, "command": "set count=20"},
+    {"index": 3, "term": 2, "command": "incr count=5"}
+  ],
+  "finalAppliedIndex": 3,
+  "finalKV": {
+    "count": "25"
+  },
+  "finalApplyError": null
+}
+```
 
 ### 应用错误不等于调用失败
 

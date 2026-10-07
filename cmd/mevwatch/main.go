@@ -87,13 +87,31 @@ Request fields:
   entries       array   entries to append, may be empty; when non-empty
                         the entry indexes must be positive, consecutive
                         from prevLogIndex+1, and every position must fit
-                        the platform integer range
+                        the platform integer range; their terms must be
+                        positive, non-decreasing within the batch and no
+                        greater than the request term, and the first
+                        entry's term must be no lower than prevLogTerm
+                        (see Processing rules)
   leaderCommit  number  leader's committed index
 
 Processing rules:
-  - A request with a lower term is rejected and changes nothing.
-  - A request with a higher term first updates currentTerm, then the log is
-    checked; the term update survives a later prefix-mismatch rejection.
+  - A request with a lower term is rejected and changes nothing. This
+    stale-term rejection takes precedence: a request whose term is below
+    the current term is rejected as stale even when its first entry's
+    term is also below prevLogTerm.
+  - When the request term is at least the current term and every other
+    field is valid, a non-empty entries batch must also have its first
+    entry's term no lower than the request's declared prevLogTerm. Equal
+    is legal, and entries need not carry the leader's current term. The
+    comparison uses the declared prevLogTerm alone: even when that term
+    also mismatches the local log, a first entry below it is rejected as
+    "invalid request: entry terms are not non-decreasing", keeps no
+    higher term and carries no conflict hint. Empty entries have no first
+    entry, so this restriction does not apply and the request proceeds
+    with the ordinary prev-log matching rules below.
+  - A valid request with a higher term first updates currentTerm, then
+    the prev-log and log merge are checked; the term update survives a
+    later prefix-mismatch rejection.
   - A missing prevLogIndex or a differing prevLogTerm rejects the request
     without touching the log or committed index. Index 0 only matches term 0.
     The rejection carries a conflict hint (see results[].conflict below).
