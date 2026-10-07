@@ -613,6 +613,26 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 	return s, true, nil
 }
 
+// revokeArchiveDoc mirrors the archive file the way a revocation reads and
+// writes it: reports, registered versions, processing records and reviews
+// are all kept as their raw stored documents and only the suppression
+// conditions are decoded. Decoding the records into structs would silently
+// rewrite history on save: a report whose version declaration decayed to an
+// explicit null would lose its "version" key to omitempty and come back as
+// the legacy pre-version shape, laundering a corrupt declaration — one a
+// report query must refuse — into the built-in interpretation. Keeping the
+// bytes verbatim means a successful revocation changes the target
+// condition's revoked flag and nothing else: reports, swap evidence, other
+// conditions, processing records and reviews come back byte for byte.
+type revokeArchiveDoc struct {
+	Records        []json.RawMessage `json:"records"`
+	Versions       []json.RawMessage `json:"versions,omitempty"`
+	EnabledVersion string            `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression     `json:"suppressions,omitempty"`
+	AlertRecords   []json.RawMessage `json:"alerts,omitempty"`
+	Reviews        []json.RawMessage `json:"reviews,omitempty"`
+}
+
 // RevokeSuppression withdraws the condition with the given exact ID. The
 // first successful revocation returns changed=true and the full condition
 // with Revoked set; revoking the same ID again succeeds with changed=false.
@@ -622,10 +642,34 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 // processed from now on; it cannot be revived, a fresh ID is required to
 // suppress again.
 //
+// Before the new state is saved, every archived report's stored version
+// declaration must still satisfy exactly the integrity proof a report query
+// enforces — re-validated from the raw stored document: a non-empty id,
+// sandwich and displacement each declaring a boolean enabled and an integer
+// severity 1-5, and a displacement multiplier 2-100; a missing or null
+// field or rule object, a wrong type, an out-of-range number, an unknown
+// field or rule, or a field declared twice in one object (an exact repeat,
+// an escaped spelling or a case-only spelling naming the same field, even
+// with identical values) makes the declaration corrupt. An explicit
+// enabled:false is a legal off state, but the disabled rule still has to
+// carry complete, in-range parameters. Only an old-format record with no
+// "version" key at all keeps the built-in interpretation: a written null,
+// an empty object or an incomplete declaration is corruption, and an id of
+// "builtin" is validated like any other. Every report is judged — one on
+// another chain, one the condition never covered and one without findings
+// alike — because the save rewrites the archive they live in; a single
+// corrupt declaration fails the whole revocation with ErrCorruptVersion
+// naming the chain, the block, the readable saved version id and the
+// offending rule or field. A legal declaration is used exactly as saved:
+// parameters are never completed from the enabled or a registered version,
+// and the id need not still be registered.
+//
 // The revocation is committed atomically under the archive lock: a busy
-// archive, a corrupted one or a failed save leaves every condition, report
-// and processing record untouched. One generation run always sees either
-// the pre- or the post-revocation condition set in full.
+// archive, a corrupted one, a corrupt saved declaration or a failed save
+// leaves every condition, report and processing record untouched — no
+// condition changes its revoked state and no report is rewritten. One
+// generation run always sees either the pre- or the post-revocation
+// condition set in full.
 func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) {
 	if strings.TrimSpace(id) == "" {
 		return Suppression{}, false, errors.New("suppression id must be a non-empty string")
@@ -639,9 +683,20 @@ func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) 
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with every report, registered version, processing record and
+	// review kept as its raw stored document: the save below writes them
+	// back byte for byte, so revoking a condition can never rewrite history
+	// — in particular a decayed "version":null declaration cannot lose its
+	// key to omitempty and reappear as the legacy built-in shape.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return Suppression{}, false, err
+	}
+	data := revokeArchiveDoc{Records: []json.RawMessage{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return Suppression{}, false, fmt.Errorf("archive is corrupted: %w", err)
+		}
 	}
 	for i := range data.Suppressions {
 		if data.Suppressions[i].ID != id {
@@ -649,6 +704,21 @@ func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) 
 		}
 		if data.Suppressions[i].Revoked {
 			return data.Suppressions[i], false, nil
+		}
+		// The save rewrites the archive every report lives in, so each
+		// report's stored declaration is proved intact first — from its raw
+		// bytes, by exactly the standard a report query enforces. A report
+		// on another chain, one the condition never covered and one without
+		// findings is judged all the same; one corrupt declaration fails
+		// the whole revocation before anything is written.
+		for _, rawRec := range data.Records {
+			var rec queryRecord
+			if err := json.Unmarshal(rawRec, &rec); err != nil {
+				return Suppression{}, false, fmt.Errorf("archive is corrupted: %w", err)
+			}
+			if _, err := archivedReportVersion(rec.Version); err != nil {
+				return Suppression{}, false, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, err)
+			}
 		}
 		data.Suppressions[i].Revoked = true
 		if err := writeArchiveAtomic(dir, data); err != nil {
