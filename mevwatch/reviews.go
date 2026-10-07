@@ -389,6 +389,34 @@ type SubmitReviewResult struct {
 	Revision  ReviewRevision `json:"revision"`
 }
 
+// reviewSubmitArchiveDoc mirrors the archive file the way a review
+// submission reads and writes it: every stored record and every registered
+// version is kept as its raw stored document — the same shape a replay, a
+// report query and a comparison read — and the whole alerts section is kept
+// as its raw stored document too. A submission only ever appends to the
+// review stream, so decoding the saved processing records into structs
+// would let the commit rewrite evidence it must never alter: a written
+// "version":null would resurface as an object full of zero-valued
+// parameters, an incomplete declaration would be silently zero-filled, and
+// a field declared twice would collapse into whichever value the decoder
+// kept — turning a declaration the alert-history query must keep judging
+// corrupt into a repaired or differently shaped one, or borrowing content
+// the record never carried. Kept raw, every existing processing record's
+// detection-version declaration is written back byte for byte in content:
+// missing fields stay missing, written nulls stay null, and repeated
+// declarations keep their order and their individual values, whatever the
+// block's report, the enabled version or a same-id registered version
+// declares. Suppressions and reviews carry no version declarations and are
+// decoded fully; reviews is the section the submission appends to.
+type reviewSubmitArchiveDoc struct {
+	Records        []json.RawMessage `json:"records"`
+	Versions       []json.RawMessage `json:"versions,omitempty"`
+	EnabledVersion string            `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression     `json:"suppressions,omitempty"`
+	AlertRecords   json.RawMessage   `json:"alerts,omitempty"`
+	Reviews        []ReviewObject    `json:"reviews,omitempty"`
+}
+
 // SubmitReview validates and stores one review revision. The target
 // conclusion must exist in the archive, and the report that carries it must
 // still carry an intact version declaration: once the conclusion is found,
@@ -453,12 +481,18 @@ func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) 
 	// or explained as the built-in rules from a written null, and so a
 	// successful commit writes every stored record and version back
 	// byte-for-byte in content instead of re-encoding the declaration this
-	// judgment must never alter.
+	// judgment must never alter. The alerts section is kept raw for the
+	// same reason: a submission appends a review revision and must leave
+	// every existing processing record's detection-version declaration —
+	// a written null, a missing field, a wrong-typed value or a repeated
+	// declaration included — exactly as it was saved, never completed,
+	// replaced, dropped or merged from the block's report, the enabled
+	// version or a same-id registered version.
 	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return SubmitReviewResult{}, err
 	}
-	data := replayArchiveDoc{Records: []json.RawMessage{}}
+	data := reviewSubmitArchiveDoc{Records: []json.RawMessage{}}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return SubmitReviewResult{}, fmt.Errorf("archive is corrupted: %w", err)
