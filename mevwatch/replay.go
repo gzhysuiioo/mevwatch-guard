@@ -322,6 +322,36 @@ func archivedReportVersion(raw json.RawMessage) (RuleVersion, error) {
 	return ParseRuleVersion(raw)
 }
 
+// proveAllReportsIntact re-validates every archived report's embedded
+// version declaration from that record's raw stored bytes with exactly the
+// integrity proof a report query enforces (archivedReportVersion plus
+// corruptReportError). It is the shared gate every operation that rewrites
+// an archive must pass while holding its write lock — suppression
+// registration and revocation alike. A wholly absent "version" key is the
+// one legacy shape and means the built-in rules; anything actually saved —
+// null, an empty object, an incomplete declaration, a wrong type, an
+// out-of-range number, an unknown rule or field, or a field repeated in one
+// object, the case-folded and escaped spellings included — fails as
+// ErrCorruptVersion naming the report's chain and block, the readable saved
+// version id and the offending rule or field. Every record is opened: a
+// report on another chain, outside the operation's coverage, or carrying no
+// conclusions is never skipped, and a legal declaration is used exactly as
+// saved, never completed from defaults, the currently enabled or a same-id
+// registered version. A record whose bytes are not even a JSON object is
+// whole-archive corruption rather than one report's damaged declaration.
+func proveAllReportsIntact(data replayArchiveDoc) error {
+	for j, rawRec := range data.Records {
+		var rec queryRecord
+		if err := json.Unmarshal(rawRec, &rec); err != nil {
+			return fmt.Errorf("archive is corrupted: record %d: %w", j, err)
+		}
+		if _, verr := archivedReportVersion(rec.Version); verr != nil {
+			return corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
+		}
+	}
+	return nil
+}
+
 // corruptReportError names the chain and block a failed report query
 // targets, the saved version identifier when the document still carries a
 // readable one (so corruption is not mistaken for an unregistered

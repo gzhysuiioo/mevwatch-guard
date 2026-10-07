@@ -580,6 +580,45 @@ func AlertHistory(dir, chainID, channel string, startHeight, endHeight uint64) (
 // been processed yet: historical alerts are never rewritten as suppressed,
 // and suppressed records are not re-alerted when a condition's range ends.
 // The registration document cannot set revoked state.
+//
+// Before any judgment about the submitted condition — and therefore before
+// a new condition is appended, an identical retry is reported or a conflict
+// returned — every archived report's saved version declaration is
+// re-validated from its raw bytes with the exact integrity proof a report
+// query enforces: a non-empty version identifier, both the sandwich and
+// displacement rules each with a boolean enabled and an integer severity
+// 1-5, and a displacement multiplier 2-100. A missing or null field or rule
+// object, a wrong type, an out-of-range number, an unknown field or rule, or
+// a field declared twice in one object (an exact repeat, an escaped spelling
+// or a case-only spelling naming the same field, even with identical values)
+// makes the saved declaration corrupt; an explicit enabled:false is a legal
+// off state but the disabled rule still has to carry complete, in-range
+// parameters. Only an old-format record with no "version" key at all keeps
+// the built-in interpretation: a written null, an empty object or a partial
+// declaration is corruption, and an id of "builtin" is validated like every
+// other id rather than bypassing the check. The proof covers every report
+// in the archive, not just ones on the new condition's chain, pool or height
+// range, and a report without conclusions is opened too; a legal
+// declaration is used exactly as saved, never completed from defaults, the
+// currently enabled or a same-id registered version, and its id need not
+// still be registered.
+//
+// The reason the proof gates registration is that a successful registration
+// rewrites the archive: decoding the embedded declarations into structs
+// would let that save change history. A written null would resurface as a
+// wholly absent version key — the one legacy shape a later report query
+// explains with the built-in rules, masking what should read as corruption
+// — and a partial declaration as silently zeroed parameters. Records are
+// therefore kept as their raw stored documents and written back byte for
+// byte, and any corrupt report fails the whole registration with
+// ErrCorruptVersion naming the chain and block of the damaged report, the
+// readable saved version id and the offending rule or field. On failure no
+// condition is added and the archive — the original nulls, missing fields
+// and repeated declarations included — is left exactly as it was. A
+// successful registration only appends the one condition: report
+// conclusions, swap evidence, the versions registry, other conditions,
+// existing processing records and review history are written back
+// unchanged.
 func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, err error) {
 	s, err = ParseSuppression(raw)
 	if err != nil {
@@ -594,8 +633,30 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
-	if err != nil {
+	// Decode with every stored record and registered version kept as its
+	// raw stored document, the same shape a revocation and a replay read and
+	// write. Decoding the embedded declarations into structs would let the
+	// save below rewrite history: a written null would resurface as a
+	// wholly absent version key — the one legacy shape — and a partial
+	// declaration as silently zeroed parameters. Kept raw, every report is
+	// written back byte for byte and judged from its own bytes first.
+	archiveRaw, rerr := readArchiveBytes(dir)
+	if rerr != nil {
+		return Suppression{}, false, rerr
+	}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
+	if archiveRaw != nil {
+		if err := json.Unmarshal(archiveRaw, &data); err != nil {
+			return Suppression{}, false, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	// Prove every archived report before anything is decided about the
+	// submitted condition: a corrupt report fails the whole registration
+	// here, before an append, an identical-retry no-op or a conflict
+	// judgment, and nothing is written. Every report is opened — one on
+	// another chain, outside the condition's coverage or without
+	// conclusions is not skipped.
+	if err := proveAllReportsIntact(data); err != nil {
 		return Suppression{}, false, err
 	}
 	for _, existing := range data.Suppressions {
@@ -703,14 +764,8 @@ func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) 
 		// builtin; anything actually saved must stand on its own, and a
 		// corrupt one fails the whole revocation here, before anything is
 		// written.
-		for j, rawRec := range data.Records {
-			var rec queryRecord
-			if err := json.Unmarshal(rawRec, &rec); err != nil {
-				return Suppression{}, false, fmt.Errorf("archive is corrupted: record %d: %w", j, err)
-			}
-			if _, verr := archivedReportVersion(rec.Version); verr != nil {
-				return Suppression{}, false, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
-			}
+		if err := proveAllReportsIntact(data); err != nil {
+			return Suppression{}, false, err
 		}
 		if data.Suppressions[i].Revoked {
 			return data.Suppressions[i], false, nil
