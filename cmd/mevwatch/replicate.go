@@ -35,14 +35,13 @@ func (l *replicateInputLog) UnmarshalJSON(data []byte) error {
 	return unmarshalLastWinsArray(data, (*[]mevwatch.LogEntry)(l))
 }
 
-// replicateInputRequest 与 mevwatch.AppendRequest 字段相同，区别只是 entries
-// 也走整体替换解码。
+// replicateInputRequest 内嵌 mevwatch.AppendRequest，请求的字段定义与 JSON
+// 解码直接复用库类型，不再在命令行单独维护一套同名字段；唯一的差异是外层
+// 同名 Entries 遮住内嵌字段，让 entries 走整体替换解码。读取后内嵌的
+// AppendRequest 即可直接交给复制处理，无须逐字段搬运。
 type replicateInputRequest struct {
-	Term         int                   `json:"term"`
-	PrevLogIndex int                   `json:"prevLogIndex"`
-	PrevLogTerm  int                   `json:"prevLogTerm"`
-	Entries      replicateInputEntries `json:"entries"`
-	LeaderCommit int                   `json:"leaderCommit"`
+	mevwatch.AppendRequest
+	Entries replicateInputEntries `json:"entries"`
 }
 
 // replicateInputRequests 是根对象的 requests 字段：重复出现时最后一份数组
@@ -121,18 +120,15 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "replicate: parse input JSON: %v\n", err)
 		return 1
 	}
-	// 三个数组经整体替换解码后再逐元素转成库类型：转换只按最后一份数组的实际
-	// 内容进行，不携带任何同名前序数组的条目字段。
+	// 三个数组经整体替换解码后再交给库处理：requests 的标量字段已直接解进
+	// 内嵌的 AppendRequest，这里只把遮住用的 entries 切片写回内嵌字段；转换
+	// 只按最后一份数组的实际内容进行，不携带任何同名前序数组的条目字段。
 	initialLog := append([]mevwatch.LogEntry(nil), input.Log...)
 	requests := make([]mevwatch.AppendRequest, len(input.Requests))
-	for i, req := range input.Requests {
-		requests[i] = mevwatch.AppendRequest{
-			Term:         req.Term,
-			PrevLogIndex: req.PrevLogIndex,
-			PrevLogTerm:  req.PrevLogTerm,
-			Entries:      append([]mevwatch.LogEntry(nil), req.Entries...),
-			LeaderCommit: req.LeaderCommit,
-		}
+	for i := range input.Requests {
+		req := input.Requests[i]
+		req.AppendRequest.Entries = append([]mevwatch.LogEntry(nil), req.Entries...)
+		requests[i] = req.AppendRequest
 	}
 	output, err := mevwatch.ReplicateWithOptions(mevwatch.InitialState{
 		CurrentTerm:    input.CurrentTerm,
