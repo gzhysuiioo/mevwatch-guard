@@ -12,12 +12,66 @@ import (
 )
 
 // replicateInput 是 replicate 子命令从标准输入读取的 JSON。
+//
+// log、requests 以及请求内 entries 是允许在同一对象中重复出现的数组字段，约定
+// 后者生效。encoding/json 把重复出现的数组解到同一个非 nil 切片时，只会按下标
+// 覆盖既有元素：后一份数组较短时尾部残留旧元素，元素省略的字段（command、
+// index、term）也会从相同位置的旧元素继承，等于让用户给出的后一份日志借用了
+// 前一份的内容。因此这三个数组都用整体替换的包装类型（replicateInputLog 等）
+// 解码：每一次出现都解进一份全新的切片并整体替换，最后一份数组是什么就保留
+// 什么，元素省略的数值按默认 0、省略的命令按空字符串解释。
 type replicateInput struct {
-	CurrentTerm    int                      `json:"currentTerm"`
-	CommittedIndex int                      `json:"committedIndex"`
-	Log            []mevwatch.LogEntry      `json:"log"`
-	ApplyKV        bool                     `json:"applyKV"`
-	Requests       []mevwatch.AppendRequest `json:"requests"`
+	CurrentTerm    int                    `json:"currentTerm"`
+	CommittedIndex int                    `json:"committedIndex"`
+	Log            replicateInputLog      `json:"log"`
+	ApplyKV        bool                   `json:"applyKV"`
+	Requests       replicateInputRequests `json:"requests"`
+}
+
+// replicateInputLog 是根对象的 log 字段：重复出现时最后一份数组整体替换。
+type replicateInputLog []mevwatch.LogEntry
+
+func (l *replicateInputLog) UnmarshalJSON(data []byte) error {
+	return unmarshalLastWinsArray(data, (*[]mevwatch.LogEntry)(l))
+}
+
+// replicateInputRequest 与 mevwatch.AppendRequest 字段相同，区别只是 entries
+// 也走整体替换解码。
+type replicateInputRequest struct {
+	Term         int                   `json:"term"`
+	PrevLogIndex int                   `json:"prevLogIndex"`
+	PrevLogTerm  int                   `json:"prevLogTerm"`
+	Entries      replicateInputEntries `json:"entries"`
+	LeaderCommit int                   `json:"leaderCommit"`
+}
+
+// replicateInputRequests 是根对象的 requests 字段：重复出现时最后一份数组
+// 整体替换，而不是把后一份请求按下标并进前一份。
+type replicateInputRequests []replicateInputRequest
+
+func (r *replicateInputRequests) UnmarshalJSON(data []byte) error {
+	return unmarshalLastWinsArray(data, (*[]replicateInputRequest)(r))
+}
+
+// replicateInputEntries 是单个请求内的 entries 字段：同一请求对象里重复
+// 出现时，最后一份条目数组整体替换。
+type replicateInputEntries []mevwatch.LogEntry
+
+func (e *replicateInputEntries) UnmarshalJSON(data []byte) error {
+	return unmarshalLastWinsArray(data, (*[]mevwatch.LogEntry)(e))
+}
+
+// unmarshalLastWinsArray 把一次数组字段出现解进一份全新的切片，并用它整体
+// 替换 dst。它必须先解进局部切片而不能直接解到 dst：encoding/json 对“非 nil
+// 现有切片 + 重复数组键”只做下标覆盖，短数组的尾部与元素内省略的字段都会
+// 残留上一次出现的内容。null 与既有行为一致，把目标置为空切片（nil）。
+func unmarshalLastWinsArray[T any](data []byte, dst *[]T) error {
+	var next []T
+	if err := json.Unmarshal(data, &next); err != nil {
+		return err
+	}
+	*dst = next
+	return nil
 }
 
 // runReplicate 从标准输入读取一份 JSON（初始状态 + 顺序到达的复制请求），
@@ -53,11 +107,24 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "replicate: parse input JSON: %v\n", err)
 		return 1
 	}
+	// 三个数组经整体替换解码后再逐元素转成库类型：转换只按最后一份数组的实际
+	// 内容进行，不携带任何同名前序数组的条目字段。
+	initialLog := append([]mevwatch.LogEntry(nil), input.Log...)
+	requests := make([]mevwatch.AppendRequest, len(input.Requests))
+	for i, req := range input.Requests {
+		requests[i] = mevwatch.AppendRequest{
+			Term:         req.Term,
+			PrevLogIndex: req.PrevLogIndex,
+			PrevLogTerm:  req.PrevLogTerm,
+			Entries:      append([]mevwatch.LogEntry(nil), req.Entries...),
+			LeaderCommit: req.LeaderCommit,
+		}
+	}
 	output, err := mevwatch.ReplicateWithOptions(mevwatch.InitialState{
 		CurrentTerm:    input.CurrentTerm,
 		CommittedIndex: input.CommittedIndex,
-		Log:            input.Log,
-	}, input.Requests, mevwatch.ReplicateOptions{ApplyKV: input.ApplyKV})
+		Log:            initialLog,
+	}, requests, mevwatch.ReplicateOptions{ApplyKV: input.ApplyKV})
 	if err != nil {
 		fmt.Fprintf(stderr, "replicate: %v\n", err)
 		return 1
