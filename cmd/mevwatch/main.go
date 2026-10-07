@@ -210,7 +210,12 @@ index, commit position, command or entries of the same-position earlier one, so
 a later initial-log element that omits index or term ends the run as an invalid
 initial state. Omitting a field that appears only once still applies its
 default, 0 keeps its ordinary meaning, and nulls in array fields themselves or
-in unknown keys are handled as before.
+in unknown keys are handled as before. Unrecognized fields are ignored
+wherever they appear (root, request, log entry, or nested inside each other),
+including numbers of any magnitude such as 1e400; they never take part in
+follower state and never appear in the output. The same oversized numbers
+written to a recognized numeric field are still rejected as a field type
+error.
 `)
 }
 

@@ -87,9 +87,23 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "replicate: read stdin: %v\n", err)
 		return 1
 	}
+	// 语法检查用 UseNumber 流式解码而不是解进 interface{}：后者把每个数字
+	// 都转成 float64，未知字段里 1e400 这类超出浮点范围但完全合法的 JSON
+	// 数字会让整份输入在解析阶段被误判为输入错误。未知字段不参与跟随者
+	// 状态计算，其数值大小不应决定输入能否解析；UseNumber 把数字保留为
+	// 原始字面量，只校验语法不做范围转换。已识别数值字段上的同类大数仍由
+	// 随后的类型化解码按既有整数范围限制拒绝。
+	syntaxDec := json.NewDecoder(bytes.NewReader(data))
+	syntaxDec.UseNumber()
 	var syntaxCheck interface{}
-	if err := json.Unmarshal(data, &syntaxCheck); err != nil {
+	if err := syntaxDec.Decode(&syntaxCheck); err != nil {
 		fmt.Fprintf(stderr, "replicate: parse input JSON: %v\n", err)
+		return 1
+	}
+	// 与 json.Unmarshal 一致：一份完整文档之后不允许再跟另一份 JSON 或
+	// 其他内容。
+	if syntaxDec.More() {
+		fmt.Fprintf(stderr, "replicate: parse input JSON: unexpected data after top-level JSON value\n")
 		return 1
 	}
 	// 已识别的数值字段被显式写成 null 时，类型化解码会静默当成零值继续
@@ -209,6 +223,11 @@ func (s *objectSchema) arrayField(key string) (arrayField, bool) {
 // 检查范围内，扫描时只按结构识别已知字段，不进入其他对象与数组。
 func nullNumericFieldPath(data []byte) string {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	// 数字一律按原始字面量（json.Number）读取：默认的 Token 行为会把数字
+	// 转成 float64，未知字段里 1e400 这类超出浮点范围的合法数字会让扫描
+	// 中途出错返回，从而遮住排在其后的真实数值 null。这里只关心结构，
+	// 不需要任何数值转换。
+	dec.UseNumber()
 
 	// 取根对象的第一个 token；输入不是对象或 JSON 非法时没有可报告的数值
 	// 字段位置，交由随后的类型化解码产出既有的解析错误。
