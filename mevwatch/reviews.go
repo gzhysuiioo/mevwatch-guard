@@ -390,10 +390,44 @@ type SubmitReviewResult struct {
 }
 
 // SubmitReview validates and stores one review revision. The target
-// conclusion must exist in the archive. The first submission for an object
-// must carry expectedVersion 0; every later one must carry the object's
-// current version, otherwise the submission is rejected without touching
-// stored data. Rejudgments and withdrawals append; older revisions stay.
+// conclusion must exist in the archive, and the report that carries it must
+// still carry an intact version declaration: once the conclusion is found,
+// its report's saved declaration is re-validated from its raw bytes with
+// the exact integrity proof a report query, a comparison, alert generation
+// and the review history/evaluation paths enforce — a non-empty version
+// identifier, both the sandwich and displacement rules each with a boolean
+// enabled and an integer severity 1-5, and a displacement multiplier
+// 2-100 — before the submission is accepted in any way. A missing or null
+// field or rule object, a wrong type, an out-of-range number, an unknown
+// field or rule, or a field declared twice in one object (an exact repeat,
+// an escaped spelling or a case-only spelling naming the same field, even
+// with identical values) makes the saved declaration corrupt; an explicit
+// enabled:false is a legal off state but the disabled rule still has to
+// carry complete, in-range parameters. Only an old-format record with no
+// "version" key at all keeps the built-in interpretation: a written null,
+// an empty object or a partial declaration is corruption, and an id of
+// "builtin" is validated like every other id rather than bypassing the
+// check. A legal declaration is used exactly as saved, never completed from
+// defaults, the currently enabled or a same-id registered version, and the
+// saved id need not still be registered.
+//
+// On corruption the whole submission fails with ErrCorruptVersion naming
+// the target chain and block, the readable saved version id and the
+// offending rule or field — whether the submission is a first one, a
+// rejudgment, a withdrawal or an identical retry carrying a submissionId
+// already stored: the proof precedes submission-id reuse, version-conflict
+// and object-version handling, so no retry of the same submission id can
+// mask the damage, no result JSON is produced, no submission id is
+// consumed, no revision or object version changes, and the archive bytes —
+// the damaged declaration included — are rewritten by nothing. A target no
+// archived conclusion matches still fails as ErrUnknownConclusion, and an
+// identity the corrupt report does not carry never opens that report's
+// declaration.
+//
+// With the declaration proved, the first submission for an object must
+// carry expectedVersion 0; every later one must carry the object's current
+// version, otherwise the submission is rejected without touching stored
+// data. Rejudgments and withdrawals append; older revisions stay.
 // Identical retries (same archive-unique submission ID and identical
 // fields) return the original revision. The whole update is one atomic
 // commit under the archive lock, so concurrent submissions serialize and a
@@ -412,18 +446,60 @@ func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) 
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode with every stored record and registered version kept as its
+	// raw stored document, the same shape a replay, a report query and a
+	// comparison read, so the target report's declaration is re-validated
+	// from those bytes rather than decoded into silently zeroed parameters
+	// or explained as the built-in rules from a written null, and so a
+	// successful commit writes every stored record and version back
+	// byte-for-byte in content instead of re-encoding the declaration this
+	// judgment must never alter.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return SubmitReviewResult{}, err
 	}
-	if _, _, ok := findArchivedConclusion(data, sub.key()); !ok {
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return SubmitReviewResult{}, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
+	// Index the stored records by block identity with their decoded
+	// content; the embedded version stays raw until the matching
+	// conclusion's report has to be proved.
+	stored := make([]queryRecord, len(data.Records))
+	for i, rawRec := range data.Records {
+		var qr queryRecord
+		if err := json.Unmarshal(rawRec, &qr); err != nil {
+			return SubmitReviewResult{}, fmt.Errorf("archive is corrupted: record %d: %w", i, err)
+		}
+		stored[i] = qr
+	}
+	rec, _, ok := findHistoryConclusion(stored, sub.key())
+	if !ok {
 		return SubmitReviewResult{}, fmt.Errorf("%w: %s/%s tx %s %s",
 			ErrUnknownConclusion, sub.ChainID, sub.BlockHash, sub.TxHash, sub.Kind)
+	}
+	// A matching conclusion pins its report: prove the declaration the
+	// conclusion was produced under before the submission can be accepted,
+	// retried or rejected on any later rule. A wholly absent version key is
+	// the one legacy shape and means builtin; a written null, an empty
+	// object, a partial or wrong-typed declaration, an out-of-range number,
+	// an unknown or repeated field — a "builtin" id included — fails the
+	// whole submission here, before submission-id reuse and version
+	// handling, so neither an identical retry nor any other submission can
+	// mask existing damage. Nothing is borrowed from the enabled or a
+	// same-id registered version and nothing is re-detected.
+	if _, verr := archivedReportVersion(rec.Version); verr != nil {
+		return SubmitReviewResult{}, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
 	}
 
 	// Submission IDs are unique archive-wide. An ID reuse with identical
 	// content is an idempotent retry of the original revision; it must
 	// succeed (and append nothing) even when the object has since moved on.
+	// The target's declaration has already been proved, so retrying a
+	// submission stored against a since-decayed report fails above as
+	// corruption rather than quietly returning the old revision.
 	for i := range data.Reviews {
 		obj := &data.Reviews[i]
 		for _, rev := range obj.Revisions {
@@ -674,21 +750,6 @@ func findHistoryConclusion(records []queryRecord, key conclusionKey) (*queryReco
 		}
 	}
 	return nil, ReportFinding{}, false
-}
-
-// findArchivedConclusion locates the record and the finding for an identity.
-func findArchivedConclusion(data archiveData, key conclusionKey) (record, ReportFinding, bool) {
-	for _, rec := range data.Records {
-		if rec.ChainID != key.chainID || rec.BlockHash != key.blockHash {
-			continue
-		}
-		for _, f := range rec.Findings {
-			if f.TxHash == key.txHash && f.Kind == key.kind {
-				return rec, f, true
-			}
-		}
-	}
-	return record{}, ReportFinding{}, false
 }
 
 // ReviewConclusion pairs a conclusion with the rule version whose
