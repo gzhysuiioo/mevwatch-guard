@@ -114,6 +114,20 @@ Processing rules:
     as non-consecutive entries. Empty entries require no next position, and a
     non-empty request whose last entry lands exactly on the maximum is legal;
     such requests are still subject to the ordinary prev-log mismatch rules.
+  - Entry terms must be positive, non-decreasing along the request's own
+    entries, and no greater than the request term. That alone is not enough:
+    when the other fields are valid and the request term is not lower than
+    the current term, a non-empty entries array also requires its first
+    entry's term to be no lower than the declared prevLogTerm, otherwise the
+    whole request is rejected as the same field error ("invalid request:
+    entry terms are not non-decreasing"). Equal terms are fine — entries
+    need not all carry the leader's current term. The comparison is against
+    the declared prevLogTerm: even when that term also mismatches the local
+    log, a first-entry term drop is still rejected as this field error,
+    keeping no higher term from the request and carrying no conflict hint.
+    A request whose term is lower than the current term is still reported
+    as a stale term first. Empty entries have no first entry, so this rule
+    does not apply and the ordinary prev-log matching rules decide.
 
 Key/value application (only when applyKV is true):
   - The table starts empty for this invocation. The committed prefix of the

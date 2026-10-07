@@ -400,6 +400,97 @@ go run ./cmd/mevwatch replicate < /tmp/replicate-kv.json
 或提交位置未前进的心跳不会重复累加。`applyKV` 省略或为 `false` 时，
 `incr` 仍只是普通日志字符串，输出中没有任何应用字段。
 
+### 首条日志任期不得低于前置任期
+
+请求内各条日志的任期沿条目自身不下降（且为正、不超过请求任期）还不够：
+在其他字段合法、请求任期不低于节点当前任期的前提下，非空 `entries` 的
+**首条**日志任期还不能低于请求声明的 `prevLogTerm`，否则整份请求按字段
+错误拒绝（`invalid request: entry terms are not non-decreasing`）。相等
+是合法的——条目无需都采用领导者的当前任期。
+
+- 比较的对象是请求**声明的** `prevLogTerm`，与本地日志无关：即使这个前置
+  任期同时与本地日志不匹配，首条任期下降仍按上述字段错误拒绝——不保留请求
+  携带的较高任期，也不提供 `conflict` 重发提示（`conflict` 只在实际因前置
+  日志不匹配而拒绝时出现）。
+- 请求任期低于节点当前任期时，仍优先报告既有的低任期拒绝
+  （`stale term: leader term is lower than current term`），不检查首条任期。
+- `entries` 为空时没有首条日志，不适用这条限制，继续按既有的前置日志匹配
+  规则处理。
+
+下面这份输入开启 `applyKV`，初始任期为 2，日志索引 1、2 的任期分别为
+1、2，命令分别为 `set count=10`、`set count=20`，只有索引 1 已提交（因此
+`count` 已应用为 `"10"`）。随后两条请求演示这条规则：
+
+```bash
+cat > /tmp/replicate-term-drop.json <<'EOF'
+{
+  "currentTerm": 2,
+  "committedIndex": 1,
+  "applyKV": true,
+  "log": [
+    {"index": 1, "term": 1, "command": "set count=10"},
+    {"index": 2, "term": 2, "command": "set count=20"}
+  ],
+  "requests": [
+    {"term": 7, "prevLogIndex": 2, "prevLogTerm": 2, "leaderCommit": 3,
+     "entries": [{"index": 3, "term": 1, "command": "incr count=5"}]},
+    {"term": 3, "prevLogIndex": 2, "prevLogTerm": 2, "leaderCommit": 3,
+     "entries": [{"index": 3, "term": 2, "command": "incr count=5"}]}
+  ]
+}
+EOF
+go run ./cmd/mevwatch replicate < /tmp/replicate-term-drop.json
+```
+
+第一条请求任期 7，前置索引 2、前置任期 2 都与本地日志匹配，但携带的索引 3
+任期只有 1，低于声明的前置任期 2：请求被拒绝，`reason` 为
+`invalid request: entry terms are not non-decreasing`，结果中**没有**
+`conflict`；当前任期仍为 2（字段非法的请求不留下任期更新），日志与提交位置
+保持原样，应用位置仍为 1，`count` 仍为 `"10"`。
+
+第二条请求任期 3，前置条件相同，携带索引 3、任期 2 的同一增量命令并要求
+提交到 3：首条任期与前置任期相等，合法，请求被接受。任期升到 3，提交与
+应用位置都推进到 3：索引 2 的 `set count=20` 与索引 3 的 `incr count=5`
+依次生效，`count` 最终为 `"25"`。注意前一个任期 7 的请求**没有**抬高节点
+任期，所以这条任期 3 的请求不会因低于当前任期而被拒绝。
+
+完整输出如下：
+
+```json
+{
+  "results": [
+    {
+      "accepted": false,
+      "reason": "invalid request: entry terms are not non-decreasing",
+      "term": 2,
+      "committedIndex": 1,
+      "appliedIndex": 1,
+      "applyError": null
+    },
+    {
+      "accepted": true,
+      "reason": "ok",
+      "term": 3,
+      "committedIndex": 3,
+      "appliedIndex": 3,
+      "applyError": null
+    }
+  ],
+  "finalTerm": 3,
+  "finalCommittedIndex": 3,
+  "finalLog": [
+    {"index": 1, "term": 1, "command": "set count=10"},
+    {"index": 2, "term": 2, "command": "set count=20"},
+    {"index": 3, "term": 2, "command": "incr count=5"}
+  ],
+  "finalAppliedIndex": 3,
+  "finalKV": {
+    "count": "25"
+  },
+  "finalApplyError": null
+}
+```
+
 ### 应用错误不等于调用失败
 
 - `applyError` / `finalApplyError` 出现在**正常的输出 JSON** 中，进程退出码
