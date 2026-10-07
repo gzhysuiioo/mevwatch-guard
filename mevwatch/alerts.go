@@ -622,6 +622,37 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 // processed from now on; it cannot be revived, a fresh ID is required to
 // suppress again.
 //
+// Once the condition is found, every archived report's saved version
+// declaration is re-validated from its raw bytes with the exact integrity
+// proof a report query enforces — a non-empty version identifier, both the
+// sandwich and displacement rules each with a boolean enabled and an
+// integer severity 1-5, and a displacement multiplier 2-100 — before the
+// revocation is committed or an already-revoked state is reported. A
+// missing or null field or rule object, a wrong type, an out-of-range
+// number, an unknown field or rule, or a field declared twice in one object
+// (an exact repeat, an escaped spelling or a case-only spelling naming the
+// same field, even with identical values) makes the saved declaration
+// corrupt; an explicit enabled:false is a legal off state but the disabled
+// rule still has to carry complete, in-range parameters. Only an old-format
+// record with no "version" key at all keeps the built-in interpretation: a
+// written null, an empty object or a partial declaration is corruption, and
+// an id of "builtin" is validated like every other id rather than bypassing
+// the check. The proof covers every report in the archive — a report on
+// another chain, outside the condition's coverage or carrying no
+// conclusions is never skipped — and a legal declaration is used exactly as
+// saved, never completed from defaults, the currently enabled or a same-id
+// registered version.
+//
+// On corruption the whole revocation fails with ErrCorruptVersion naming
+// the chain and block of the damaged report, the readable saved version id
+// and the offending rule or field: no result is produced and the archive —
+// every condition's revoked state included — is left byte for byte
+// untouched, so a written null can never be dropped into a missing version
+// key by the save. A failed revocation rewrites nothing, and a successful
+// one changes only the target condition's state: reports, swap evidence,
+// other conditions, existing processing records and review history are
+// written back unchanged.
+//
 // The revocation is committed atomically under the archive lock: a busy
 // archive, a corrupted one or a failed save leaves every condition, report
 // and processing record untouched. One generation run always sees either
@@ -639,13 +670,47 @@ func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) 
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
-	if err != nil {
-		return Suppression{}, false, err
+	// Decode with every stored record and registered version kept as its
+	// raw stored document, the same shape a replay or a review submission
+	// reads and writes. Decoding the embedded declarations into structs
+	// would let the save below rewrite history: a written null would
+	// resurface as a wholly absent version key — the one legacy shape —
+	// and a partial declaration as silently zeroed parameters. Kept raw,
+	// every report is written back byte for byte and judged from its own
+	// bytes instead.
+	raw, rerr := readArchiveBytes(dir)
+	if rerr != nil {
+		return Suppression{}, false, rerr
+	}
+	data := replayArchiveDoc{Records: []json.RawMessage{}}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return Suppression{}, false, fmt.Errorf("archive is corrupted: %w", err)
+		}
 	}
 	for i := range data.Suppressions {
 		if data.Suppressions[i].ID != id {
 			continue
+		}
+		// The condition is registered: prove every archived report's saved
+		// declaration before the revocation is committed or an
+		// already-revoked state is reported, so the state change never
+		// rewrites — and thereby repairs or further decays — a damaged
+		// report, and an idempotent re-revoke cannot mask existing damage.
+		// Every report is opened: one on another chain, outside the
+		// condition's coverage or without conclusions is not skipped. A
+		// wholly absent version key is the only legacy shape and means
+		// builtin; anything actually saved must stand on its own, and a
+		// corrupt one fails the whole revocation here, before anything is
+		// written.
+		for j, rawRec := range data.Records {
+			var rec queryRecord
+			if err := json.Unmarshal(rawRec, &rec); err != nil {
+				return Suppression{}, false, fmt.Errorf("archive is corrupted: record %d: %w", j, err)
+			}
+			if _, verr := archivedReportVersion(rec.Version); verr != nil {
+				return Suppression{}, false, corruptReportError(rec.ChainID, rec.BlockHash, rec.Version, verr)
+			}
 		}
 		if data.Suppressions[i].Revoked {
 			return data.Suppressions[i], false, nil
