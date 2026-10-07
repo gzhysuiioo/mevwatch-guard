@@ -389,6 +389,32 @@ type SubmitReviewResult struct {
 	Revision  ReviewRevision `json:"revision"`
 }
 
+// submitArchiveDoc mirrors the archive file the way a review submission
+// reads and writes it: every stored record, every registered version and
+// every alert processing record is kept as its raw stored document, while
+// suppressions and reviews are fully decoded. A processing record's saved
+// detection-version declaration is the alerting evidence of its time: the
+// decoded struct cannot tell a missing field, an explicit null or a
+// wrong-typed value from a real one, and duplicate declarations collapse,
+// so decoding it would let the commit below rewrite unrelated alert
+// history — a written null would resurface as an object full of zero
+// values, a partial declaration as silently zeroed parameters, and a
+// repeated field as whichever value won. Kept raw, every processing record
+// is written back byte for byte in content — missing fields stay missing,
+// written nulls stay null, and repeated fields keep their order and
+// values — whether or not its declaration would pass a history query's
+// integrity proof; a review submission never repairs, completes, merges or
+// drops another record's declaration, and never borrows parameters from
+// the block's report, the enabled version or a same-id registered version.
+type submitArchiveDoc struct {
+	Records        []json.RawMessage `json:"records"`
+	Versions       []json.RawMessage `json:"versions,omitempty"`
+	EnabledVersion string            `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression     `json:"suppressions,omitempty"`
+	AlertRecords   []json.RawMessage `json:"alerts,omitempty"`
+	Reviews        []ReviewObject    `json:"reviews,omitempty"`
+}
+
 // SubmitReview validates and stores one review revision. The target
 // conclusion must exist in the archive, and the report that carries it must
 // still carry an intact version declaration: once the conclusion is found,
@@ -433,6 +459,17 @@ type SubmitReviewResult struct {
 // commit under the archive lock, so concurrent submissions serialize and a
 // stale concurrent submission can never overwrite another operator's
 // revision.
+//
+// Appending the revision rewrites the archive, but the commit touches
+// nothing but the review stream: every stored report, registered version
+// and alert processing record is kept as its raw stored document and
+// written back byte for byte in content. A processing record's saved
+// detection-version declaration in particular is never completed,
+// replaced, dropped or merged — a written null stays null, a missing
+// field stays missing, and a repeated field keeps its order and values —
+// and no parameter is borrowed from the block's report, the currently
+// enabled version or a same-id registered version, whatever a history
+// query would make of that declaration.
 func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) {
 	if v := validateReviewSubmission(sub); v != nil {
 		return SubmitReviewResult{}, v.submitError()
@@ -446,19 +483,19 @@ func SubmitReview(dir string, sub ReviewSubmission) (SubmitReviewResult, error) 
 	}
 	defer lock.Close()
 
-	// Decode with every stored record and registered version kept as its
-	// raw stored document, the same shape a replay, a report query and a
-	// comparison read, so the target report's declaration is re-validated
-	// from those bytes rather than decoded into silently zeroed parameters
-	// or explained as the built-in rules from a written null, and so a
-	// successful commit writes every stored record and version back
-	// byte-for-byte in content instead of re-encoding the declaration this
-	// judgment must never alter.
+	// Decode with every stored record, registered version and alert
+	// processing record kept as its raw stored document, the same shape a
+	// replay, a report query and a comparison read, so the target report's
+	// declaration is re-validated from those bytes rather than decoded into
+	// silently zeroed parameters or explained as the built-in rules from a
+	// written null, and so a successful commit writes every stored record,
+	// version and processing record back byte-for-byte in content instead of
+	// re-encoding declarations this judgment must never alter.
 	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return SubmitReviewResult{}, err
 	}
-	data := replayArchiveDoc{Records: []json.RawMessage{}}
+	data := submitArchiveDoc{Records: []json.RawMessage{}}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return SubmitReviewResult{}, fmt.Errorf("archive is corrupted: %w", err)
