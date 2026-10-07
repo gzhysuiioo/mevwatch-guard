@@ -87,7 +87,11 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "replicate: read stdin: %v\n", err)
 		return 1
 	}
-	var syntaxCheck interface{}
+	// 语法检查解进 json.RawMessage 而不是 interface{}：RawMessage 只校验整份
+	// 文档的语法（含“一份文档后又跟另一份 JSON”的尾随数据），不把数字转成
+	// float64。未知字段里 1e400 这类超出浮点范围的合法 JSON 数字因此不再
+	// 让整份输入在解析阶段失败；它们是否参与状态计算由后面的类型化解码决定。
+	var syntaxCheck json.RawMessage
 	if err := json.Unmarshal(data, &syntaxCheck); err != nil {
 		fmt.Fprintf(stderr, "replicate: parse input JSON: %v\n", err)
 		return 1
@@ -209,6 +213,10 @@ func (s *objectSchema) arrayField(key string) (arrayField, bool) {
 // 检查范围内，扫描时只按结构识别已知字段，不进入其他对象与数组。
 func nullNumericFieldPath(data []byte) string {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	// 数字 token 按 json.Number 原样读出而不是转成 float64：未知字段（含其
+	// 嵌套对象与数组）里 1e400 这类超出浮点范围的合法数字只是被跳过，不能
+	// 让 token 读取自身报错而遮住其后真实数值字段上的 null。
+	dec.UseNumber()
 
 	// 取根对象的第一个 token；输入不是对象或 JSON 非法时没有可报告的数值
 	// 字段位置，交由随后的类型化解码产出既有的解析错误。
