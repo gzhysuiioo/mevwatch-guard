@@ -356,7 +356,8 @@ func runReplicateIO(stdin io.Reader, stdout, stderr io.Writer) int {
 // 必须拒绝整份输入的数值字段（标准拼写），arrays 是元素为对象的数组字段及其
 // 元素层次。字段名识别与 encoding/json 一致，只改变字母大小写的写法同样命中；
 // 错误位置始终使用这里的标准拼写而不是输入里的大小写变体。根状态、复制请求
-// 与日志条目共用同一套扫描逻辑，区别只在下面三份 schema。
+// 与日志条目共用同一套扫描逻辑，各层次的 schema 不再手工罗列，而是由
+// inputObjectSchema 从输入实际解码使用的字段定义推导（见 rootObjectSchema）。
 type objectSchema struct {
 	numerics []string
 	arrays   []arrayField
@@ -369,23 +370,64 @@ type arrayField struct {
 	elem *objectSchema
 }
 
-var (
-	// 日志条目层次：log[i] 与 requests[r].entries[i] 是同一种对象。
-	entryObjectSchema = &objectSchema{numerics: []string{"index", "term"}}
-	// 复制请求层次：数值字段外还嵌套 entries 条目数组。
-	requestObjectSchema = &objectSchema{
-		numerics: []string{"term", "prevLogIndex", "prevLogTerm", "leaderCommit"},
-		arrays:   []arrayField{{name: "entries", elem: entryObjectSchema}},
+// rootObjectSchema 是整份输入的字段层次，从读取阶段实际解码的类型
+// replicateInput 出发递归推导：根状态的数值字段（currentTerm、committedIndex）
+// 与 log、requests 两个数组来自 replicateInput 自身的字段定义；requests 元素
+// 层次来自其元素类型 mevwatch.AppendRequest（term、prevLogIndex、prevLogTerm、
+// leaderCommit 与 entries 数组，与 replicateInputRequest 共用的正是这套库字段）；
+// 条目层次来自 mevwatch.LogEntry（index、term）。数值字段名与所在层次因此只
+// 依据输入实际接受的字段定义识别，不再平行维护一份手工清单。
+var rootObjectSchema = inputObjectSchema(reflect.TypeOf(replicateInput{}))
+
+// inputObjectSchema 从输入解码使用的结构类型 t 推导该层次的已识别字段：整数
+// 字段是数值字段，元素为结构体的切片字段是对象数组字段（元素层次递归推导）；
+// 字符串、布尔等其余字段不参与数值 null 检查。字段名取 json 标签的名字部分，
+// 与解码时 encoding/json 接受的拼写一致。
+func inputObjectSchema(t reflect.Type) *objectSchema {
+	schema := &objectSchema{}
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.PkgPath != "" {
+			continue // 未导出字段不参与 JSON 解码
+		}
+		name, ok := fieldJSONName(field)
+		if !ok {
+			continue
+		}
+		switch {
+		case isIntKind(field.Type.Kind()):
+			schema.numerics = append(schema.numerics, name)
+		case field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() == reflect.Struct:
+			schema.arrays = append(schema.arrays, arrayField{name: name, elem: inputObjectSchema(field.Type.Elem())})
+		}
 	}
-	// 根输入层次：初始状态的数值字段外还嵌套 log 与 requests 两个数组。
-	rootObjectSchema = &objectSchema{
-		numerics: []string{"currentTerm", "committedIndex"},
-		arrays: []arrayField{
-			{name: "log", elem: entryObjectSchema},
-			{name: "requests", elem: requestObjectSchema},
-		},
+	return schema
+}
+
+// fieldJSONName 返回字段在 JSON 输入里的标准名：json 标签的名字部分；标签
+// 为 "-" 时该字段不参与解码，ok 为 false。
+func fieldJSONName(field reflect.StructField) (name string, ok bool) {
+	tag := field.Tag.Get("json")
+	if tag == "-" {
+		return "", false
 	}
-)
+	if i := strings.IndexByte(tag, ','); i >= 0 {
+		tag = tag[:i]
+	}
+	if tag == "" {
+		return "", false
+	}
+	return tag, true
+}
+
+// isIntKind 报告 kind 是否为整数类型（输入的数值字段都是 int）。
+func isIntKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return true
+	}
+	return false
+}
 
 // numericName 在 key 命中本层次某个已识别数值字段时返回它的标准拼写。
 func (s *objectSchema) numericName(key string) (string, bool) {
