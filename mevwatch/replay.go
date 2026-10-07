@@ -456,24 +456,31 @@ func readArchive(dir string) (archiveData, error) {
 }
 
 // replayArchiveDoc mirrors the archive file the way a replay reads and
-// writes it: every record and every registered version is kept as its raw
-// stored document, while suppressions, alert records and reviews are fully
-// decoded. A corrupt document — a wrong-typed field, say — then cannot
-// break the read or masquerade as whole-archive corruption; the version
-// this run selects is judged on its own by intactVersion, and an already
-// archived block whose content matches the input is judged on its own from
-// its record's raw bytes exactly the way a report query proves it, rather
-// than decoded into silently zeroed parameters or a null-explained
-// built-in report. Entries the run does not touch are written back byte
-// for byte: a replay never repairs, completes or drops a stored record or
-// version, not even a corrupt one.
+// writes it: every record, every registered version and every alert
+// processing record is kept as its raw stored document, while suppressions
+// and reviews are fully decoded. A corrupt document — a wrong-typed field,
+// say — then cannot break the read or masquerade as whole-archive
+// corruption; the version this run selects is judged on its own by
+// intactVersion, and an already archived block whose content matches the
+// input is judged on its own from its record's raw bytes exactly the way a
+// report query proves it, rather than decoded into silently zeroed
+// parameters or a null-explained built-in report. A processing record's
+// saved detection-version declaration in particular is the alerting
+// evidence of its time and must survive every unrelated rewrite: decoding
+// it into the struct would let a replay, a suppression registration or
+// revocation, a version registration or an enable re-encode a written null
+// as an object full of zero values, complete a partial declaration, drop a
+// missing field or collapse a repeated one. Entries the run does not touch
+// are written back byte for byte in content (indentation may change): a
+// replay never repairs, completes or drops a stored record, version or
+// processing record, not even a corrupt one.
 type replayArchiveDoc struct {
-	Records        []json.RawMessage  `json:"records"`
-	Versions       []json.RawMessage  `json:"versions,omitempty"`
-	EnabledVersion string             `json:"enabledVersion,omitempty"`
-	Suppressions   []Suppression      `json:"suppressions,omitempty"`
-	AlertRecords   []ProcessingRecord `json:"alerts,omitempty"`
-	Reviews        []ReviewObject     `json:"reviews,omitempty"`
+	Records        []json.RawMessage `json:"records"`
+	Versions       []json.RawMessage `json:"versions,omitempty"`
+	EnabledVersion string            `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression     `json:"suppressions,omitempty"`
+	AlertRecords   []json.RawMessage `json:"alerts,omitempty"`
+	Reviews        []ReviewObject    `json:"reviews,omitempty"`
 }
 
 // writeArchiveAtomic replaces the archive file in one rename, so a crash

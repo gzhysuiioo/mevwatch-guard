@@ -395,6 +395,21 @@ type storedAlertRecord struct {
 	Suppressions []SuppressionHit `json:"suppressions"`
 }
 
+// identityKey decodes only the five fields that make a processing record's
+// deduplication identity (chain, block hash, victim tx hash, conclusion kind
+// and channel). Generation uses it to skip an already-processed conclusion
+// while keeping the record's raw stored bytes — and therefore its saved
+// detection-version declaration — untouched.
+func (r storedAlertRecord) identityKey() alertKey {
+	return alertKey{
+		chainID:   r.ChainID,
+		blockHash: r.BlockHash,
+		txHash:    r.Finding.TxHash,
+		kind:      r.Finding.Kind,
+		channel:   r.Channel,
+	}
+}
+
 // toProcessingRecord decodes the proven raw declaration and assembles the
 // processing record the way it was saved; its conclusion, evidence,
 // threshold, status and suppression hits are reused verbatim, never
@@ -415,18 +430,30 @@ func (r storedAlertRecord) toProcessingRecord(version RuleVersion) ProcessingRec
 }
 
 // alertArchiveDoc mirrors the archive file the way alert generation reads
-// and writes it: records keep their embedded version declarations as raw
-// stored documents, and registered versions are kept raw too — generation
-// never consults the registry, so a corrupt registered version is that
-// version's damage, not whole-archive corruption, and is written back byte
-// for byte. Suppressions, processing records and reviews are decoded fully.
+// and writes it: block reports keep their embedded version declarations as
+// raw stored documents, registered versions are kept raw too, and every
+// existing processing record is kept as its raw stored document —
+// generation only appends, so a record it did not create this run is never
+// re-encoded. The decoded struct cannot tell a record's missing version
+// field, an explicit null or a wrong-typed value from a real one, and it
+// collapses repeated fields; decoding existing records into the struct
+// would let the commit below rewrite the alerting evidence of an earlier
+// run — a written null would come back as an object full of zero values,
+// a partial declaration as silently zeroed parameters, a missing key as an
+// explicitly present one, and a repeated field as whichever value won.
+// Kept raw, every earlier record is written back byte for byte in content
+// (indentation may change), whatever a history query would make of its
+// declaration: generation never repairs, completes, merges or drops
+// another record, and never borrows parameters from the block's report,
+// the enabled version or a same-id registered version. Suppressions and
+// reviews are decoded fully.
 type alertArchiveDoc struct {
-	Records        []alertRecord      `json:"records"`
-	Versions       []json.RawMessage  `json:"versions,omitempty"`
-	EnabledVersion string             `json:"enabledVersion,omitempty"`
-	Suppressions   []Suppression      `json:"suppressions,omitempty"`
-	AlertRecords   []ProcessingRecord `json:"alerts,omitempty"`
-	Reviews        []ReviewObject     `json:"reviews,omitempty"`
+	Records        []alertRecord     `json:"records"`
+	Versions       []json.RawMessage `json:"versions,omitempty"`
+	EnabledVersion string            `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression     `json:"suppressions,omitempty"`
+	AlertRecords   []json.RawMessage `json:"alerts,omitempty"`
+	Reviews        []ReviewObject    `json:"reviews,omitempty"`
 }
 
 // GenerateAlerts turns archived conclusions in the inclusive range
@@ -482,10 +509,17 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 	}
 	defer lock.Close()
 
-	// Decode with each record's embedded version declaration kept as its
-	// raw stored document, the same shape a report query uses: a decayed
-	// declaration is that report's corruption, judged on its own below,
-	// rather than whole-archive corruption or silently zeroed parameters.
+	// Decode with each block report's embedded version declaration and each
+	// registered version kept as its raw stored document, the same shape a
+	// report query uses: a decayed declaration is that report's corruption,
+	// judged on its own below, rather than whole-archive corruption or
+	// silently zeroed parameters. Existing processing records are kept raw
+	// for the same reason: only their identity fields are decoded here, and
+	// every one of them is written back byte for byte in content — a written
+	// null must never resurface as a zero-filled object, a partial
+	// declaration gain defaults, a missing key reappear, or a repeated field
+	// collapse — whether or not its declaration would still pass a history
+	// query. Generation only ever appends the records this run creates.
 	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, err
@@ -497,8 +531,16 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 		}
 	}
 	processed := make(map[alertKey]struct{}, len(data.AlertRecords))
-	for _, r := range data.AlertRecords {
-		processed[r.identity()] = struct{}{}
+	for _, rawRecord := range data.AlertRecords {
+		// Only the identity fields are needed to skip an already-processed
+		// conclusion; the record's own raw bytes stay untouched below and are
+		// never decoded into a ProcessingRecord that the commit would
+		// re-encode.
+		var existing storedAlertRecord
+		if err := json.Unmarshal(rawRecord, &existing); err != nil {
+			return nil, fmt.Errorf("archive is corrupted: alert processing record: %w", err)
+		}
+		processed[existing.identityKey()] = struct{}{}
 	}
 
 	created := []ProcessingRecord{}
@@ -564,7 +606,18 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 	}
 	sortRecords(created)
 	if len(created) > 0 {
-		data.AlertRecords = append(data.AlertRecords, created...)
+		// Append the new records as freshly marshalled documents next to the
+		// earlier records' raw stored bytes: only this run's records are
+		// re-encoded, every existing one is written back exactly as read.
+		newRecords := make([]json.RawMessage, len(created))
+		for i, rec := range created {
+			rawRec, merr := json.Marshal(rec)
+			if merr != nil {
+				return nil, merr
+			}
+			newRecords[i] = rawRec
+		}
+		data.AlertRecords = append(data.AlertRecords, newRecords...)
 		if err := writeArchiveAtomic(dir, data); err != nil {
 			return nil, err
 		}
@@ -741,17 +794,29 @@ func corruptAlertRecordError(r storedAlertRecord, cause error) error {
 // would let that save change history. A written null would resurface as a
 // wholly absent version key — the one legacy shape a later report query
 // explains with the built-in rules, masking what should read as corruption
-// — and a partial declaration as silently zeroed parameters. Records are
-// therefore kept as their raw stored documents and written back byte for
-// byte, and any corrupt report fails the whole registration with
+// — and a partial declaration as silently zeroed parameters. Report
+// records are therefore kept as their raw stored documents and written back
+// byte for byte, and any corrupt report fails the whole registration with
 // ErrCorruptVersion naming the chain and block of the damaged report, the
-// readable saved version id and the offending rule or field. On failure no
+// readable saved version id and the offending rule or field. Processing
+// records are kept raw for the same reason and are never judged here at
+// all: unlike block reports, a processing record's saved detection-version
+// declaration has no legacy shape and is proved only when an alerts-history
+// query actually returns the record, so a registration over a record with
+// a missing version key, a written null, an incomplete declaration or a
+// repeated field (a case-folded or escaped spelling included) still
+// succeeds and writes that declaration back exactly as stored — null stays
+// null, the gap stays open, and the repeated fields keep their names,
+// values and order — never completing it from the block's report, the
+// currently enabled version or a same-id registered version. On failure no
 // condition is added and the archive — the original nulls, missing fields
 // and repeated declarations included — is left exactly as it was. A
 // successful registration only appends the one condition: report
 // conclusions, swap evidence, the versions registry, other conditions,
-// existing processing records and review history are written back
-// unchanged.
+// existing processing records (their conclusion, evidence, threshold,
+// status and the suppression hits recorded at the time included, in their
+// stored order) and review history are written back unchanged; a new
+// condition affects only conclusions processed afterwards.
 func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, err error) {
 	s, err = ParseSuppression(raw)
 	if err != nil {
@@ -766,13 +831,18 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 	}
 	defer lock.Close()
 
-	// Decode with every stored record and registered version kept as its
-	// raw stored document, the same shape a revocation and a replay read and
-	// write. Decoding the embedded declarations into structs would let the
-	// save below rewrite history: a written null would resurface as a
-	// wholly absent version key — the one legacy shape — and a partial
-	// declaration as silently zeroed parameters. Kept raw, every report is
-	// written back byte for byte and judged from its own bytes first.
+	// Decode with every stored report, registered version and processing
+	// record kept as its raw stored document, the same shape a revocation and
+	// a replay read and write. Decoding the embedded declarations into
+	// structs would let the save below rewrite history: a written null would
+	// resurface as a wholly absent version key — the one report legacy
+	// shape — or, on a processing record, as an object full of zero values,
+	// and a partial declaration as silently zeroed parameters with repeated
+	// fields collapsed. Kept raw, every report is judged from its own bytes
+	// first, and every processing record is written back byte for byte in
+	// content without ever being proved — a registration never masks a
+	// damaged alert record, it leaves that damage for a history query to
+	// find.
 	archiveRaw, rerr := readArchiveBytes(dir)
 	if rerr != nil {
 		return Suppression{}, false, rerr
@@ -864,14 +934,17 @@ func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) 
 	}
 	defer lock.Close()
 
-	// Decode with every stored record and registered version kept as its
-	// raw stored document, the same shape a replay or a review submission
-	// reads and writes. Decoding the embedded declarations into structs
-	// would let the save below rewrite history: a written null would
-	// resurface as a wholly absent version key — the one legacy shape —
-	// and a partial declaration as silently zeroed parameters. Kept raw,
-	// every report is written back byte for byte and judged from its own
-	// bytes instead.
+	// Decode with every stored report, registered version and processing
+	// record kept as its raw stored document, the same shape a replay or a
+	// review submission reads and writes. Decoding the embedded declarations
+	// into structs would let the save below rewrite history: a written null
+	// would resurface as a wholly absent version key on a report or a
+	// zero-filled object on a processing record, a partial declaration as
+	// silently zeroed parameters and a repeated field as whichever value
+	// won. Kept raw, every report is judged from its own bytes and every
+	// processing record is written back byte for byte in content — a
+	// revocation never repairs, completes, merges or drops the declaration a
+	// history query would otherwise judge.
 	raw, rerr := readArchiveBytes(dir)
 	if rerr != nil {
 		return Suppression{}, false, rerr
