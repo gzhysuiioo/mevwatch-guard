@@ -766,13 +766,18 @@ func RegisterSuppression(dir string, raw []byte) (s Suppression, created bool, e
 	}
 	defer lock.Close()
 
-	// Decode with every stored record and registered version kept as its
-	// raw stored document, the same shape a revocation and a replay read and
-	// write. Decoding the embedded declarations into structs would let the
-	// save below rewrite history: a written null would resurface as a
-	// wholly absent version key — the one legacy shape — and a partial
-	// declaration as silently zeroed parameters. Kept raw, every report is
-	// written back byte for byte and judged from its own bytes first.
+	// Decode with every stored record, registered version and alert
+	// processing record kept as its raw stored document, the same shape a
+	// revocation and a replay read and write. Decoding the embedded
+	// declarations into structs would let the save below rewrite history: a
+	// written null would resurface as a wholly absent version key — the one
+	// legacy shape — on a report, and as an object full of zero values on a
+	// processing record; a partial declaration as silently zeroed
+	// parameters; a repeated field as whichever value won. Kept raw, every
+	// report and every processing record is written back byte for byte in
+	// content — missing fields stay missing, written nulls stay null, and
+	// repeated fields keep their order and values — and every report is
+	// judged from its own bytes first.
 	archiveRaw, rerr := readArchiveBytes(dir)
 	if rerr != nil {
 		return Suppression{}, false, rerr
@@ -864,14 +869,16 @@ func RevokeSuppression(dir, id string) (s Suppression, changed bool, err error) 
 	}
 	defer lock.Close()
 
-	// Decode with every stored record and registered version kept as its
-	// raw stored document, the same shape a replay or a review submission
-	// reads and writes. Decoding the embedded declarations into structs
-	// would let the save below rewrite history: a written null would
-	// resurface as a wholly absent version key — the one legacy shape —
-	// and a partial declaration as silently zeroed parameters. Kept raw,
-	// every report is written back byte for byte and judged from its own
-	// bytes instead.
+	// Decode with every stored record, registered version and alert
+	// processing record kept as its raw stored document, the same shape a
+	// replay or a review submission reads and writes. Decoding the embedded
+	// declarations into structs would let the save below rewrite history: a
+	// written null would resurface as a wholly absent version key — the one
+	// legacy shape — on a report, and as an object full of zero values on a
+	// processing record; a partial declaration as silently zeroed
+	// parameters; a repeated field as whichever value won. Kept raw, every
+	// report and every processing record is written back byte for byte in
+	// content, and every report is judged from its own bytes instead.
 	raw, rerr := readArchiveBytes(dir)
 	if rerr != nil {
 		return Suppression{}, false, rerr

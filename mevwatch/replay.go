@@ -456,24 +456,37 @@ func readArchive(dir string) (archiveData, error) {
 }
 
 // replayArchiveDoc mirrors the archive file the way a replay reads and
-// writes it: every record and every registered version is kept as its raw
-// stored document, while suppressions, alert records and reviews are fully
-// decoded. A corrupt document — a wrong-typed field, say — then cannot
-// break the read or masquerade as whole-archive corruption; the version
-// this run selects is judged on its own by intactVersion, and an already
-// archived block whose content matches the input is judged on its own from
-// its record's raw bytes exactly the way a report query proves it, rather
-// than decoded into silently zeroed parameters or a null-explained
-// built-in report. Entries the run does not touch are written back byte
-// for byte: a replay never repairs, completes or drops a stored record or
-// version, not even a corrupt one.
+// writes it: every record, every registered version and every alert
+// processing record is kept as its raw stored document, while suppressions
+// and reviews are fully decoded. A corrupt document — a wrong-typed field,
+// say — then cannot break the read or masquerade as whole-archive
+// corruption; the version this run selects is judged on its own by
+// intactVersion, and an already archived block whose content matches the
+// input is judged on its own from its record's raw bytes exactly the way a
+// report query proves it, rather than decoded into silently zeroed
+// parameters or a null-explained built-in report. A processing record's
+// saved detection-version declaration is the alerting evidence of its
+// generation time: the decoded struct cannot tell a missing field, an
+// explicit null or a wrong-typed value from a real one, and duplicate
+// declarations collapse, so decoding it would let the save rewrite alert
+// history — a written null would resurface as an object full of zero
+// values, a partial declaration as silently zeroed parameters, and a
+// repeated field as whichever value won. Kept raw, every entry the run
+// does not touch is written back byte for byte in content — missing fields
+// stay missing, written nulls stay null, and repeated fields keep their
+// order and values — whether or not its declaration would pass a history
+// query's integrity proof: a replay, registration, revocation, version
+// registration or enable never repairs, completes, merges or drops a
+// stored record, version or processing record, not even a corrupt one, and
+// never borrows parameters from the block's report, the enabled version or
+// a same-id registered version.
 type replayArchiveDoc struct {
-	Records        []json.RawMessage  `json:"records"`
-	Versions       []json.RawMessage  `json:"versions,omitempty"`
-	EnabledVersion string             `json:"enabledVersion,omitempty"`
-	Suppressions   []Suppression      `json:"suppressions,omitempty"`
-	AlertRecords   []ProcessingRecord `json:"alerts,omitempty"`
-	Reviews        []ReviewObject     `json:"reviews,omitempty"`
+	Records        []json.RawMessage `json:"records"`
+	Versions       []json.RawMessage `json:"versions,omitempty"`
+	EnabledVersion string            `json:"enabledVersion,omitempty"`
+	Suppressions   []Suppression     `json:"suppressions,omitempty"`
+	AlertRecords   []json.RawMessage `json:"alerts,omitempty"`
+	Reviews        []ReviewObject    `json:"reviews,omitempty"`
 }
 
 // writeArchiveAtomic replaces the archive file in one rename, so a crash
