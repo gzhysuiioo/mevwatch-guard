@@ -322,6 +322,24 @@ func archivedReportVersion(raw json.RawMessage) (RuleVersion, error) {
 	return ParseRuleVersion(raw)
 }
 
+// archivedAlertVersion proves the version declaration a processing record
+// saved for itself still satisfies every registration rule, re-validating
+// the raw document the way archivedReportVersion does an archived report.
+// The difference is the legacy carve-out: a processing record is always
+// produced with a resolved version, so a wholly absent "version" key is not
+// the pre-version built-in shape a block report is allowed to carry — it is
+// the record's own corruption and must never be explained as the built-in
+// rules. Anything actually saved (null, an empty object, an incomplete
+// declaration, a wrong type, an out-of-range number, an unknown or
+// duplicated field, an id of "builtin" included) is judged exactly the way
+// a report declaration would be.
+func archivedAlertVersion(raw json.RawMessage) (RuleVersion, error) {
+	if len(raw) == 0 {
+		return RuleVersion{}, errors.New("version is required (non-empty saved rule-version declaration)")
+	}
+	return ParseRuleVersion(raw)
+}
+
 // proveAllReportsIntact re-validates every archived report's embedded
 // version declaration from that record's raw stored bytes with exactly the
 // integrity proof a report query enforces (archivedReportVersion plus

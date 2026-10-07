@@ -529,9 +529,94 @@ func GenerateAlerts(dir, chainID, channel string, startHeight, endHeight uint64,
 	return created, nil
 }
 
+// rawAlertRecord mirrors one stored processing record the way an alert
+// history query reads it: every business field is decoded normally, but the
+// detection-version declaration the record saved for itself is kept as its
+// raw stored document — the same shape a report query and alert generation
+// keep the archived report's declaration in. The decoded struct cannot tell
+// a missing field, an explicit null or a wrong-typed value from a real one:
+// decoding the version into the struct would show a decayed record under
+// silently zeroed parameters (enabled false, severity 0, a zero
+// displacement multiplier) or explain a null declaration as the built-in
+// rules. Unlike an archived block report, a processing record is always
+// produced with a resolved version, so a present-but-decayed or absent
+// version key is the record's own corruption rather than the pre-version
+// legacy shape; the raw bytes are re-validated before the record is shown.
+type rawAlertRecord struct {
+	ChainID      string           `json:"chainId"`
+	BlockHash    string           `json:"blockHash"`
+	BlockNumber  uint64           `json:"blockNumber"`
+	Pool         string           `json:"pool"`
+	Channel      string           `json:"channel"`
+	Finding      ReportFinding    `json:"finding"`
+	Version      json.RawMessage  `json:"version"`
+	MinSeverity  int              `json:"minSeverity"`
+	Status       string           `json:"status"`
+	Suppressions []SuppressionHit `json:"suppressions"`
+}
+
+// alertHistoryArchiveDoc mirrors the archive file the way an alert history
+// query reads it: only the processing records the query scans are decoded,
+// and each one keeps its embedded version declaration as its raw stored
+// document so it can be proved from those bytes before being shown. Every
+// other section is irrelevant to a read-only history and left untouched.
+type alertHistoryArchiveDoc struct {
+	AlertRecords []rawAlertRecord `json:"alerts"`
+}
+
+// corruptAlertError names the full identity of the processing record whose
+// saved version declaration failed the history integrity proof — chain,
+// block hash, victim tx hash, conclusion kind and channel — plus the
+// readable saved version id (when the document still carries one, so
+// corruption is never mistaken for an unregistered version) and the
+// offending rule or field from the validation failure. It wraps both
+// ErrCorruptVersion and the underlying cause (for example
+// ErrDuplicateField).
+func corruptAlertError(rec rawAlertRecord, cause error) error {
+	identity := fmt.Sprintf("processing record for chain %s block %s tx %s %s on channel %s",
+		rec.ChainID, rec.BlockHash, rec.Finding.TxHash, rec.Finding.Kind, rec.Channel)
+	if id := identifiableVersionID(rec.Version); id != "unidentifiable version" {
+		return fmt.Errorf("%w: %s uses version %q: %w", ErrCorruptVersion, identity, id, cause)
+	}
+	return fmt.Errorf("%w: %s: %w", ErrCorruptVersion, identity, cause)
+}
+
 // AlertHistory returns stored processing records on chainID for channel in
 // the inclusive range [startHeight, endHeight]. It only reads the archive;
 // suppressions registered afterwards cannot alter the stored content.
+//
+// Before an alert or suppression result is shown, the detection-version
+// declaration the matching processing record saved for itself is
+// re-validated from its raw bytes with the exact integrity proof a report
+// query enforces: a non-empty version identifier, both the sandwich and
+// displacement rules each with a boolean enabled and an integer severity
+// 1-5, and a displacement multiplier 2-100. A missing or null field or rule
+// object, a wrong type, an out-of-range number, an unknown field or rule, or
+// a field declared twice in one object (an exact repeat, an escaped spelling
+// or a case-only spelling naming the same field, even with identical
+// values) makes that record's saved declaration corrupt; an explicit
+// enabled:false is a legal off state but the disabled rule still has to
+// carry complete, in-range parameters, and an id of "builtin" is validated
+// like every other id rather than bypassing the check.
+//
+// A processing record is always written with a resolved version, so a
+// declaration that is absent as well as one written null, as an empty
+// object, only in part, with a wrong type or an out-of-range number is that
+// record's own corruption — the pre-version legacy carve-out that lets a
+// block report without a version key mean the built-in rules does not apply
+// to processing records. One corrupt record the query actually hits fails
+// the whole history with ErrCorruptVersion naming the record's chain, block
+// hash, victim tx hash, conclusion kind and channel, the readable saved
+// version id and the offending rule or field: no history JSON and no
+// partial history are returned. Parameters are never zero-filled,
+// re-detected or taken from the currently enabled version, a same-id
+// registered version or the block's report, and the saved id need not still
+// be registered. Damage confined to another chain or channel, a record
+// outside the height range, a block report's declaration or the registered
+// versions section never blocks the query. A legacy archive with no alert
+// data, or a range no record matches, stays an empty list. Success or
+// failure rewrites nothing; a wholly unreadable archive still fails as
+// archive corruption.
 func AlertHistory(dir, chainID, channel string, startHeight, endHeight uint64) ([]ProcessingRecord, error) {
 	if strings.TrimSpace(chainID) == "" {
 		return nil, errors.New("chainId must be a non-empty string")
@@ -554,19 +639,54 @@ func AlertHistory(dir, chainID, channel string, startHeight, endHeight uint64) (
 	}
 	defer lock.Close()
 
-	data, err := readArchive(dir)
+	// Decode only the processing records, each one keeping its embedded
+	// version declaration as the raw stored document — the same shape a
+	// report query keeps a block report's declaration in — so a decayed
+	// declaration is judged from its own bytes below rather than decoded
+	// into silently zeroed parameters or explained as the built-in rules.
+	// A wrong-typed field elsewhere in the archive still fails the read as
+	// whole-archive corruption.
+	raw, err := readArchiveBytes(dir)
 	if err != nil {
 		return nil, err
 	}
+	var doc alertHistoryArchiveDoc
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, fmt.Errorf("archive is corrupted: %w", err)
+		}
+	}
 	out := []ProcessingRecord{}
-	for _, r := range data.AlertRecords {
-		if r.ChainID != chainID || r.Channel != channel {
+	for _, rr := range doc.AlertRecords {
+		if rr.ChainID != chainID || rr.Channel != channel {
 			continue
 		}
-		if r.BlockNumber < startHeight || r.BlockNumber > endHeight {
+		if rr.BlockNumber < startHeight || rr.BlockNumber > endHeight {
 			continue
 		}
-		out = append(out, r)
+		// Prove the declaration this record saved for itself before its
+		// alert or suppression result is shown. Unlike an archived block
+		// report, a processing record has no pre-version legacy shape:
+		// archivedReportVersion's absent-key/builtin carve-out never
+		// applies, so an absent key is judged exactly like a written null.
+		// The block report's declaration, the enabled marker and the
+		// versions registry are never consulted.
+		version, verr := archivedAlertVersion(rr.Version)
+		if verr != nil {
+			return nil, corruptAlertError(rr, verr)
+		}
+		out = append(out, ProcessingRecord{
+			ChainID:      rr.ChainID,
+			BlockHash:    rr.BlockHash,
+			BlockNumber:  rr.BlockNumber,
+			Pool:         rr.Pool,
+			Channel:      rr.Channel,
+			Finding:      rr.Finding,
+			Version:      version,
+			MinSeverity:  rr.MinSeverity,
+			Status:       rr.Status,
+			Suppressions: rr.Suppressions,
+		})
 	}
 	sortRecords(out)
 	return out, nil
